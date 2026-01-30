@@ -87,8 +87,12 @@ app.use('*', async (c, next) => {
 });
 
 // ============================================
-// NOTE: Authentication is handled by Cloudflare Access at the edge.
-// Requests only reach this worker if already authenticated.
+// SECURITY: This worker has no built-in authentication.
+// For production, protect with Cloudflare Access:
+//   1. Create Access Application for this worker's domain
+//   2. Create Service Token for machine-to-machine access (e.g., n8n)
+//   3. Clients must send CF-Access-Client-Id and CF-Access-Client-Secret headers
+// See: https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/
 // ============================================
 
 // ============================================

@@ -1,5 +1,9 @@
 # Pantainos Memory - Zettelkasten Knowledge Graph
 #
+# SECURITY: This worker has no built-in authentication.
+# Protect with Cloudflare Access before exposing to the internet.
+# See: https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/
+#
 # Environments:
 #   Local:      pnpm dev (uses dev resources with --remote flag)
 #   Dev:        wrangler deploy --env dev
