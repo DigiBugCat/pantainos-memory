@@ -63,11 +63,6 @@ binding = "AI"
 binding = "ANALYTICS"
 dataset = "pantainos_memory_prod"
 
-# OAuth KV namespace
-[[kv_namespaces]]
-binding = "OAUTH_KV"
-id = "TODO"
-
 # Detection Queue
 [[queues.producers]]
 queue = "pantainos-memory-prod-detection"
@@ -86,9 +81,6 @@ DEDUP_THRESHOLD = "0.85"
 DEDUP_LOWER_THRESHOLD = "0.70"
 DEDUP_CONFIDENCE_THRESHOLD = "0.8"
 RESOLVER_TYPE = "none"
-# ISSUER_URL = "https://pantainos-memory.your-subdomain.workers.dev"
-# CF_ACCESS_TEAM = ""
-# CF_ACCESS_AUD = ""
 
 # ============================================
 # Dev Environment
@@ -144,10 +136,6 @@ index_name = "pantainos-memory-dev-invalidates"
 [[env.dev.vectorize]]
 binding = "CONFIRMS_VECTORS"
 index_name = "pantainos-memory-dev-confirms"
-
-[[env.dev.kv_namespaces]]
-binding = "OAUTH_KV"
-id = "TODO"
 
 [[env.dev.queues.producers]]
 queue = "pantainos-memory-dev-detection"

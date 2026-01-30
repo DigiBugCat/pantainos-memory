@@ -37,34 +37,19 @@ wrangler delete --name pantainos-memory-dev --force 2>/dev/null || echo "Worker 
 echo "Deleting D1 database..."
 echo "y" | wrangler d1 delete pantainos-memory-dev 2>/dev/null || echo "D1 not found or already deleted"
 
-# Step 5: Delete KV namespace (need to find ID first)
-echo "Deleting KV namespace..."
-KV_ID=$(wrangler kv namespace list 2>/dev/null | grep -A1 "dev-OAUTH_KV" | grep "│" | head -1 | awk -F'│' '{print $2}' | tr -d ' ' || true)
-if [ -n "$KV_ID" ]; then
-  echo "y" | wrangler kv namespace delete --namespace-id "$KV_ID" 2>/dev/null || echo "KV delete failed"
-else
-  echo "KV namespace not found or already deleted"
-fi
-
-# Step 6: Delete Vectorize indexes
+# Step 5: Delete Vectorize indexes
 echo "Deleting Vectorize indexes..."
 echo "y" | wrangler vectorize delete pantainos-memory-dev-vectors 2>/dev/null || echo "Vectorize vectors not found"
 echo "y" | wrangler vectorize delete pantainos-memory-dev-invalidates 2>/dev/null || echo "Vectorize invalidates not found"
 echo "y" | wrangler vectorize delete pantainos-memory-dev-confirms 2>/dev/null || echo "Vectorize confirms not found"
 
-# Step 7: Reset wrangler.toml IDs to TODO
+# Step 6: Reset wrangler.toml IDs to TODO
 echo "Resetting wrangler.toml resource IDs..."
 if [[ "$OSTYPE" == "darwin"* ]]; then
-  # macOS - reset dev environment IDs
   sed -i '' 's/database_id = "[a-f0-9-]*"/database_id = "TODO"/' wrangler.toml
-  # Only reset the dev KV ID (second occurrence after env.dev section)
-  # This is tricky, so we'll just note it needs manual reset if needed
 else
   sed -i 's/database_id = "[a-f0-9-]*"/database_id = "TODO"/' wrangler.toml
 fi
 
 echo ""
 echo "==> Dev environment torn down!"
-echo ""
-echo "Note: You may need to manually reset the KV namespace ID in wrangler.toml"
-echo "      under [env.dev] section to 'TODO' if you plan to recreate."

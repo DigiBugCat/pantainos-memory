@@ -57,8 +57,8 @@ export async function corsMiddleware(c: Context, next: Next): Promise<Response |
   if (c.req.method === 'OPTIONS') {
     const headers: Record<string, string> = {
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, Mcp-Session-Id',
-      'Access-Control-Expose-Headers': 'Mcp-Session-Id',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Session-Id, X-Request-Id',
+      'Access-Control-Expose-Headers': 'X-Request-Id',
       'Access-Control-Max-Age': '86400',
     };
 

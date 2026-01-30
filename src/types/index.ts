@@ -22,12 +22,6 @@ export interface Env {
   AI: Ai;
   ANALYTICS?: AnalyticsEngineDataset;
 
-  // OAuth for MCP authentication
-  OAUTH_KV: KVNamespace;
-  ISSUER_URL?: string;
-  CF_ACCESS_TEAM?: string;
-  CF_ACCESS_AUD?: string;
-
   // Vectorize Indexes (Three-table architecture, 768 dimensions, embeddinggemma-300m)
   // Memory content embeddings - for finding observations when checking new claims
   MEMORY_VECTORS: VectorizeIndex;

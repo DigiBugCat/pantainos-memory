@@ -1,18 +1,17 @@
 /**
  * Internal API Routes for pantainos-memory
  *
- * These routes are called by the MCP worker via service binding.
- * They expose the same functionality as MCP tools but as simple HTTP endpoints.
+ * These routes are called via service binding (e.g., from n8n).
+ * They expose memory operations as simple HTTP endpoints.
  *
- * No authentication is required here - the MCP worker handles auth,
- * and service bindings are trusted internal connections.
+ * No authentication required - service bindings are trusted internal connections.
  *
  * All routes return JSON responses with consistent error handling.
  */
 
 import { Hono } from 'hono';
 import type { LoggingEnv } from '../lib/shared/hono/index.js';
-import type { Env as BaseEnv, MemoryRow, ScoredMemory, RecordAccessParams, HistoryEntityType } from '../types/index.js';
+import type { Env as BaseEnv, MemoryRow, ScoredMemory, RecordAccessParams } from '../types/index.js';
 import type { Config } from '../lib/config.js';
 import type { ExposureCheckJob } from '../lib/shared/types/index.js';
 
