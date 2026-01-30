@@ -104,15 +104,10 @@ DEDUP_MODEL = "@cf/openai/gpt-oss-20b"
 DEDUP_CONFIDENCE_THRESHOLD = "0.8"
 
 # Resolver configuration (for agentic dispatch)
-# RESOLVER_TYPE: 'github' (default) | 'webhook' | 'none'
-RESOLVER_TYPE = "github"
+# RESOLVER_TYPE: 'webhook' | 'none' (default)
+RESOLVER_TYPE = "none"
 # RESOLVER_WEBHOOK_URL = "https://..." (for webhook resolver)
 # RESOLVER_WEBHOOK_TOKEN = "..." (set via: wrangler secret put RESOLVER_WEBHOOK_TOKEN)
-
-# GitHub dispatch (for github resolver - set GITHUB_TOKEN in secrets for production)
-# GITHUB_TOKEN = "your-token"
-GITHUB_OWNER = ""
-GITHUB_REPO = ""
 
 # OpenRouter API (for experiments with external models)
 # OPENROUTER_API_KEY = "sk-or-..." (set via: wrangler secret put OPENROUTER_API_KEY)

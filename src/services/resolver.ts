@@ -1,9 +1,7 @@
 /**
  * Resolver Service
  *
- * Generic dispatch endpoint for session batches. Supports multiple resolver
- * backends:
- * - 'github': Dispatch to GitHub Actions via repository_dispatch
+ * Generic dispatch endpoint for session batches. Supports resolver backends:
  * - 'webhook': POST to a configured webhook URL
  * - 'none': No-op (for testing or when resolver is disabled)
  *
@@ -69,56 +67,21 @@ export interface ResolverPayload {
   };
 }
 
-export type ResolverType = 'github' | 'webhook' | 'none';
-
-/**
- * Dispatch to GitHub via repository_dispatch event.
- * Inlined from @cassandra/shared to avoid external dependency.
- */
-async function dispatchToGitHub(params: {
-  owner: string;
-  repo: string;
-  token: string;
-  eventType: string;
-  clientPayload: Record<string, unknown>;
-}): Promise<void> {
-  const { owner, repo, token, eventType, clientPayload } = params;
-  const url = `https://api.github.com/repos/${owner}/${repo}/dispatches`;
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Authorization': `token ${token}`,
-      'Accept': 'application/vnd.github.v3+json',
-      'Content-Type': 'application/json',
-      'User-Agent': 'pantainos-memory',
-    },
-    body: JSON.stringify({
-      event_type: eventType,
-      client_payload: clientPayload,
-    }),
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`GitHub dispatch failed: ${response.status} - ${text}`);
-  }
-}
+export type ResolverType = 'webhook' | 'none';
 
 /**
  * Dispatch session batch to the configured resolver.
  *
  * The resolver backend is configured via RESOLVER_TYPE env var:
- * - 'github' (default): Uses repository_dispatch to trigger GitHub Actions
  * - 'webhook': POSTs to RESOLVER_WEBHOOK_URL with bearer token auth
- * - 'none': Logs and returns (for testing)
+ * - 'none' (default): Logs and returns (for testing)
  *
  * @param env - Worker environment with resolver configuration
  * @param payload - The session batch payload
  * @throws Error if resolver type is unknown or required config is missing
  */
 export async function dispatchToResolver(env: Env, payload: ResolverPayload): Promise<void> {
-  const resolverType = (env.RESOLVER_TYPE || 'github') as ResolverType;
+  const resolverType = (env.RESOLVER_TYPE || 'none') as ResolverType;
 
   getLog().info('dispatching', {
     batch_id: payload.batchId,
@@ -129,10 +92,6 @@ export async function dispatchToResolver(env: Env, payload: ResolverPayload): Pr
   });
 
   switch (resolverType) {
-    case 'github':
-      await dispatchViaGitHub(env, payload);
-      break;
-
     case 'webhook':
       await dispatchViaWebhook(env, payload);
       break;
@@ -144,25 +103,6 @@ export async function dispatchToResolver(env: Env, payload: ResolverPayload): Pr
     default:
       throw new Error(`Unknown resolver type: ${resolverType}`);
   }
-}
-
-/**
- * Dispatch via GitHub Actions repository_dispatch.
- */
-async function dispatchViaGitHub(env: Env, payload: ResolverPayload): Promise<void> {
-  if (!env.GITHUB_TOKEN || !env.GITHUB_OWNER || !env.GITHUB_REPO) {
-    throw new Error('GitHub resolver requires GITHUB_TOKEN, GITHUB_OWNER, and GITHUB_REPO');
-  }
-
-  await dispatchToGitHub({
-    owner: env.GITHUB_OWNER,
-    repo: env.GITHUB_REPO,
-    token: env.GITHUB_TOKEN,
-    eventType: 'memory:session-batch',
-    clientPayload: payload as unknown as Record<string, unknown>,
-  });
-
-  getLog().info('github_dispatched', { owner: env.GITHUB_OWNER, repo: env.GITHUB_REPO });
 }
 
 /**

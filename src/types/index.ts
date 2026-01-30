@@ -49,13 +49,8 @@ export interface Env {
   // API Key for authentication
   API_KEY?: string;
 
-  // GitHub dispatch config (for events)
-  GITHUB_TOKEN?: string;
-  GITHUB_OWNER?: string;
-  GITHUB_REPO?: string;
-
   // Resolver configuration (for agentic dispatch)
-  // RESOLVER_TYPE: 'github' (default) | 'webhook' | 'none'
+  // RESOLVER_TYPE: 'webhook' | 'none' (default)
   RESOLVER_TYPE?: string;
   RESOLVER_WEBHOOK_URL?: string;
   RESOLVER_WEBHOOK_TOKEN?: string;
