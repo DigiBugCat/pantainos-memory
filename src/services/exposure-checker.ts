@@ -96,11 +96,11 @@ interface AiGatewayOptions {
 
 /**
  * Build AI Gateway config for routing through gateway with metadata tags.
- * Throws if no gateway ID is configured - observability is required.
+ * Returns undefined if no gateway configured (graceful degradation for dev).
  */
 function getGatewayConfig(config: Config, options: AiGatewayOptions) {
   if (!config.aiGatewayId) {
-    throw new Error('AI_GATEWAY_ID is required - create a gateway in Cloudflare dashboard and configure the ID');
+    return undefined;
   }
 
   return {

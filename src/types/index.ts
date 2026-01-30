@@ -58,9 +58,9 @@ export interface Env {
   // OpenRouter API (for experiments with external models)
   OPENROUTER_API_KEY?: string;
 
-  // AI Gateway for observability (required for all AI calls)
-  CF_ACCOUNT_ID: string;
-  AI_GATEWAY_ID: string;
+  // AI Gateway for observability (optional - enables logging, metrics, cost tracking)
+  CF_ACCOUNT_ID?: string;
+  AI_GATEWAY_ID?: string;
 
   // Configurable via wrangler.toml [vars]
   EMBEDDING_MODEL?: string;

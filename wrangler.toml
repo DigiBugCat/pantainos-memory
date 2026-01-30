@@ -81,9 +81,9 @@ max_batch_timeout = 5
 
 # Configuration Variables
 [vars]
-# AI Gateway for observability (required - create in dashboard)
-CF_ACCOUNT_ID = ""
-AI_GATEWAY_ID = ""
+# AI Gateway for observability (optional - enables logging, metrics, cost tracking)
+# CF_ACCOUNT_ID = ""
+# AI_GATEWAY_ID = ""
 
 # OAuth/MCP Authentication (required for mcp-remote OAuth flow)
 # Set ISSUER_URL to your worker's public URL (e.g., https://pantainos-memory.yourdomain.com)
