@@ -130,7 +130,7 @@ class_name = "InactivityCron"
 [[env.dev.d1_databases]]
 binding = "DB"
 database_name = "pantainos-memory-dev"
-database_id = "e8da0f46-dc5a-44e3-ac41-38a87201e3b6"
+database_id = "TODO"
 migrations_dir = "migrations"
 
 [[env.dev.vectorize]]
@@ -147,7 +147,7 @@ index_name = "pantainos-memory-dev-confirms"
 
 [[env.dev.kv_namespaces]]
 binding = "OAUTH_KV"
-id = "448e52a582234c8783d995a816216cb3"
+id = "TODO"
 
 [[env.dev.queues.producers]]
 queue = "pantainos-memory-dev-detection"

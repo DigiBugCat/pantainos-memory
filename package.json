@@ -5,13 +5,16 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev --experimental-vectorize-bind-to-prod",
-    "build": "wrangler deploy --dry-run --outdir=dist",
+    "dev:up": "./scripts/dev-up.sh",
+    "dev:down": "./scripts/dev-down.sh",
     "deploy": "wrangler deploy",
+    "deploy:dev": "wrangler deploy --env dev",
+    "build": "wrangler deploy --dry-run --outdir=dist",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:integration": "vitest run --config vitest.integration.config.ts",
-    "test:integration:staging": "PANTAINOS_URL=https://staging-pantainos-memory.nekokeys.com vitest run --config vitest.integration.config.ts",
+    "test:integration:dev": "PANTAINOS_URL=https://pantainos-memory-dev.pantainos.workers.dev vitest run --config vitest.integration.config.ts",
     "test:integration:local": "PANTAINOS_URL=http://localhost:8794 vitest run --config vitest.integration.config.ts"
   },
   "dependencies": {
