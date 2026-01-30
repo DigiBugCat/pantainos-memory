@@ -1,0 +1,79 @@
+/**
+ * Data Transforms - Cognitive Loop Architecture (v3)
+ *
+ * Convert between database row types and API types.
+ */
+
+import type { Memory, MemoryRow, MemoryType, MemoryState, ObservationSource, ExposureCheckStatus } from './shared/types/index.js';
+
+/**
+ * Convert a MemoryRow from D1 to a Memory object for API responses.
+ */
+export function rowToMemory(row: MemoryRow): Memory {
+  return {
+    id: row.id,
+    memory_type: row.memory_type as MemoryType,
+    content: row.content,
+    source: (row.source as ObservationSource) || undefined,
+    assumes: row.assumes ? JSON.parse(row.assumes) : undefined,
+    invalidates_if: row.invalidates_if ? JSON.parse(row.invalidates_if) : undefined,
+    confirms_if: row.confirms_if ? JSON.parse(row.confirms_if) : undefined,
+    outcome_condition: row.outcome_condition || undefined,
+    resolves_by: row.resolves_by || undefined,
+    confirmations: row.confirmations,
+    exposures: row.exposures,
+    centrality: row.centrality,
+    state: (row.state as MemoryState) || 'active',
+    violations: row.violations ? JSON.parse(row.violations) : [],
+    retracted: Boolean(row.retracted),
+    retracted_at: row.retracted_at || undefined,
+    retraction_reason: row.retraction_reason || undefined,
+    tags: row.tags ? JSON.parse(row.tags) : undefined,
+    session_id: row.session_id || undefined,
+    created_at: row.created_at,
+    updated_at: row.updated_at || undefined,
+    // Exposure check tracking
+    exposure_check_status: (row.exposure_check_status as ExposureCheckStatus) || 'pending',
+    exposure_check_completed_at: row.exposure_check_completed_at || undefined,
+    // Cascade tracking
+    cascade_boosts: row.cascade_boosts || 0,
+    cascade_damages: row.cascade_damages || 0,
+    last_cascade_at: row.last_cascade_at || undefined,
+  };
+}
+
+/**
+ * Convert a Memory object to a MemoryRow for D1 storage.
+ */
+export function memoryToRow(memory: Memory): Partial<MemoryRow> {
+  return {
+    id: memory.id,
+    memory_type: memory.memory_type,
+    content: memory.content,
+    source: memory.source,
+    assumes: memory.assumes ? JSON.stringify(memory.assumes) : null,
+    invalidates_if: memory.invalidates_if ? JSON.stringify(memory.invalidates_if) : null,
+    confirms_if: memory.confirms_if ? JSON.stringify(memory.confirms_if) : null,
+    outcome_condition: memory.outcome_condition,
+    resolves_by: memory.resolves_by,
+    confirmations: memory.confirmations,
+    exposures: memory.exposures,
+    centrality: memory.centrality,
+    state: memory.state,
+    violations: memory.violations ? JSON.stringify(memory.violations) : '[]',
+    retracted: memory.retracted ? 1 : 0,
+    retracted_at: memory.retracted_at,
+    retraction_reason: memory.retraction_reason,
+    tags: memory.tags ? JSON.stringify(memory.tags) : null,
+    session_id: memory.session_id,
+    created_at: memory.created_at,
+    updated_at: memory.updated_at,
+    // Exposure check tracking
+    exposure_check_status: memory.exposure_check_status,
+    exposure_check_completed_at: memory.exposure_check_completed_at,
+    // Cascade tracking
+    cascade_boosts: memory.cascade_boosts,
+    cascade_damages: memory.cascade_damages,
+    last_cascade_at: memory.last_cascade_at,
+  };
+}

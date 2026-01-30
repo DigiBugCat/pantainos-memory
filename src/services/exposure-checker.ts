@@ -1,0 +1,1010 @@
+/**
+ * Exposure Checker Service - Cognitive Loop Architecture (v3)
+ *
+ * Handles intelligent vector-based exposure checking when new observations are created.
+ * Checks all three condition types:
+ *   - invalidates_if: Conditions that would damage a memory (violation)
+ *   - assumes: Underlying assumptions that if contradicted, damage the memory (violation)
+ *   - confirms_if: Conditions that would strengthen a prediction (auto-confirm)
+ *
+ * Uses configurable model (default: gpt-oss-120b) with JSON schema enforcement.
+ */
+
+import type {
+  MemoryRow,
+  Violation,
+  ExposureCheckResult,
+} from '../lib/shared/types/index.js';
+import { createStandaloneLogger } from '../lib/shared/logging/index.js';
+import { getDamageLevel } from './confidence.js';
+
+// Lazy logger - avoids crypto in global scope
+let _log: ReturnType<typeof createStandaloneLogger> | null = null;
+function getLog() {
+  if (!_log) {
+    _log = createStandaloneLogger({
+      component: 'ExposureChecker',
+      requestId: 'exposure-check-init',
+    });
+  }
+  return _log;
+}
+import { generateId } from '../lib/id.js';
+import { withRetry } from '../lib/retry.js';
+import { getConfig, type Config } from '../lib/config.js';
+import { generateEmbedding } from '../lib/embeddings.js';
+import {
+  searchInvalidatesConditions,
+  searchConfirmsConditions,
+  searchObservationsForViolation,
+} from './embedding-tables.js';
+import { propagateResolution } from './cascade.js';
+import type { Env } from '../types/index.js';
+
+// ============================================
+// Configuration
+// ============================================
+
+/** Default confidence threshold for violation detection */
+const VIOLATION_CONFIDENCE_THRESHOLD = 0.7;
+
+/** Confidence threshold for auto-confirmation */
+const CONFIRM_CONFIDENCE_THRESHOLD = 0.75;
+
+/** Maximum candidates to check from Vectorize */
+const MAX_CANDIDATES = 20;
+
+/** Similarity threshold for candidate selection */
+const MIN_SIMILARITY = 0.5;
+
+// ============================================
+// Types
+// ============================================
+
+/** Condition type being checked */
+type ConditionType = 'invalidates_if' | 'assumes' | 'confirms_if';
+
+interface ConditionMatch {
+  matches: boolean;
+  confidence: number;
+  reasoning?: string;
+  relevantButNotViolation?: boolean;
+}
+
+
+/** JSON schema for condition check response */
+const CONDITION_CHECK_SCHEMA = {
+  type: 'object',
+  properties: {
+    matches: { type: 'boolean' },
+    confidence: { type: 'number' },
+    reasoning: { type: 'string' },
+    relevantButNotViolation: { type: 'boolean' },
+  },
+  required: ['matches', 'confidence'],
+};
+
+// ============================================
+// AI Gateway Configuration
+// ============================================
+
+interface AiGatewayOptions {
+  operation: string;
+  conditionType?: ConditionType;
+  memoryId?: string;
+}
+
+/**
+ * Build AI Gateway config for routing through gateway with metadata tags.
+ * Throws if no gateway ID is configured - observability is required.
+ */
+function getGatewayConfig(config: Config, options: AiGatewayOptions) {
+  if (!config.aiGatewayId) {
+    throw new Error('AI_GATEWAY_ID is required - create a gateway in Cloudflare dashboard and configure the ID');
+  }
+
+  return {
+    gateway: {
+      id: config.aiGatewayId,
+      metadata: {
+        service: 'pantainos-memory',
+        operation: options.operation,
+        model: config.reasoningModel,
+        ...(options.conditionType && { condition_type: options.conditionType }),
+        ...(options.memoryId && { memory_id: options.memoryId }),
+      },
+    },
+  };
+}
+
+// ============================================
+// AI Response Parsing
+// ============================================
+
+/**
+ * Extract response content from various model output formats.
+ * Handles gpt-oss (Responses API) and llama (chat completion) formats.
+ */
+function extractContent(response: unknown): string {
+  const r = response as {
+    output?: Array<{
+      type: string;
+      content?: Array<{ text?: string }>;
+    }>;
+    response?: string;
+  };
+
+  // GPT-OSS Responses API format
+  if (r?.output && Array.isArray(r.output)) {
+    const msg = r.output.find((o) => o.type === 'message');
+    if (msg?.content?.[0]?.text) return msg.content[0].text;
+  }
+
+  // Standard chat completion format
+  if (r?.response) return r.response;
+
+  // Raw string
+  if (typeof response === 'string') return response;
+
+  return JSON.stringify(response);
+}
+
+/**
+ * Parse AI response with JSON schema enforcement and regex fallback.
+ * Tries structured output first, falls back to regex extraction.
+ */
+function parseConditionResponse(responseText: string): ConditionMatch {
+  try {
+    // Try direct JSON parse first (structured output)
+    const parsed = JSON.parse(responseText);
+    if (typeof parsed.matches === 'boolean') {
+      return {
+        matches: parsed.matches,
+        confidence: Number(parsed.confidence) || 0,
+        reasoning: parsed.reasoning,
+        relevantButNotViolation: Boolean(parsed.relevantButNotViolation),
+      };
+    }
+  } catch {
+    // Not valid JSON, try regex extraction
+  }
+
+  // Fallback: Extract JSON from response text
+  const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[0]);
+      return {
+        matches: Boolean(parsed.matches),
+        confidence: Number(parsed.confidence) || 0,
+        reasoning: parsed.reasoning,
+        relevantButNotViolation: Boolean(parsed.relevantButNotViolation),
+      };
+    } catch {
+      // JSON extraction failed
+    }
+  }
+
+  // Conservative fallback: don't match if we can't parse
+  getLog().warn('parse_failed', { response_preview: responseText.slice(0, 200) });
+  return { matches: false, confidence: 0 };
+}
+
+// ============================================
+// Prompt Builders
+// ============================================
+
+/**
+ * Build prompt for invalidates_if condition check.
+ * Checks if observation indicates the invalidation condition is TRUE.
+ */
+function buildInvalidatesIfPrompt(
+  observationContent: string,
+  condition: string,
+  memoryContent: string
+): string {
+  return `You are checking if an observation matches a condition that would invalidate a belief.
+
+MEMORY: "${memoryContent}"
+
+INVALIDATION CONDITION: "${condition}"
+
+OBSERVATION: "${observationContent}"
+
+Does this observation indicate that the invalidation condition is TRUE?
+
+Consider:
+1. Does the observation directly state or strongly imply the condition is met?
+2. Is the observation merely related but doesn't actually satisfy the condition?
+3. How confident are you in this assessment?
+
+Respond with JSON only:
+{
+  "matches": boolean,
+  "confidence": number (0-1),
+  "reasoning": "brief explanation",
+  "relevantButNotViolation": boolean (true if related but doesn't invalidate)
+}`;
+}
+
+/**
+ * Build prompt for assumes condition check.
+ * Checks if observation CONTRADICTS the underlying assumption.
+ */
+function buildAssumesPrompt(
+  observationContent: string,
+  assumption: string,
+  memoryContent: string
+): string {
+  return `You are checking if an observation contradicts an underlying assumption.
+
+MEMORY: "${memoryContent}"
+
+ASSUMPTION: The memory assumes "${assumption}"
+
+OBSERVATION: "${observationContent}"
+
+Does this observation CONTRADICT or NEGATE this assumption?
+
+Important: Only return matches=true if the observation clearly contradicts the assumption.
+A lack of confirmation is NOT a contradiction.
+
+Respond with JSON only:
+{
+  "matches": boolean,
+  "confidence": number (0-1),
+  "reasoning": "brief explanation",
+  "relevantButNotViolation": boolean (true if related but doesn't contradict)
+}`;
+}
+
+/**
+ * Build prompt for confirms_if condition check.
+ * Checks if observation indicates the confirmation condition is TRUE.
+ */
+function buildConfirmsIfPrompt(
+  observationContent: string,
+  condition: string,
+  memoryContent: string
+): string {
+  return `You are checking if an observation confirms a prediction.
+
+PREDICTION: "${memoryContent}"
+
+CONFIRMATION CONDITION: "${condition}"
+
+OBSERVATION: "${observationContent}"
+
+Does this observation indicate that the confirmation condition is TRUE, thereby confirming the prediction?
+
+Consider:
+1. Does the observation directly satisfy the confirmation condition?
+2. Is it merely related but not conclusive?
+3. How confident are you?
+
+Respond with JSON only:
+{
+  "matches": boolean,
+  "confidence": number (0-1),
+  "reasoning": "brief explanation"
+}`;
+}
+
+// ============================================
+// Core Exposure Checking
+// ============================================
+
+/**
+ * Check exposures for a new observation (Three-Table Architecture).
+ *
+ * When an observation is created:
+ * 1. Search INVALIDATES_VECTORS to find conditions this observation might match
+ * 2. Search CONFIRMS_VECTORS to find conditions this observation might support
+ * 3. LLM-judge each match
+ *
+ * This is the main entry point called when an observation is created.
+ */
+export async function checkExposures(
+  env: Env,
+  observationId: string,
+  observationContent: string,
+  embedding: number[]
+): Promise<ExposureCheckResult> {
+  const config = getConfig(env as unknown as Record<string, string | undefined>);
+
+  const result: ExposureCheckResult = {
+    violations: [],
+    confirmations: [],
+    autoConfirmed: [],
+  };
+
+  // Track which memories we've already processed to avoid duplicates
+  const processedMemories = new Set<string>();
+
+  // 1. Search INVALIDATES_VECTORS for conditions this observation might match
+  const invalidatesCandidates = await searchInvalidatesConditions(
+    env,
+    embedding,
+    MAX_CANDIDATES,
+    MIN_SIMILARITY
+  );
+
+  getLog().debug('invalidates_candidates', { count: invalidatesCandidates.length });
+
+  // 2. Process invalidation candidates
+  for (const candidate of invalidatesCandidates) {
+    if (processedMemories.has(candidate.memory_id)) continue;
+
+    // Get full memory details
+    const memory = await getMemoryById(env.DB, candidate.memory_id);
+    if (!memory) continue;
+
+    // LLM-judge this specific condition
+    const match = await checkConditionMatch(
+      env,
+      config,
+      observationContent,
+      candidate.condition_text,
+      'invalidates_if',
+      memory.content
+    );
+
+    if (match.matches && match.confidence >= VIOLATION_CONFIDENCE_THRESHOLD) {
+      const damageLevel = getDamageLevel(memory.centrality);
+      result.violations.push({
+        memory_id: candidate.memory_id,
+        condition: candidate.condition_text,
+        confidence: match.confidence,
+        damage_level: damageLevel,
+        condition_type: 'invalidates_if',
+      });
+
+      await recordViolation(env.DB, candidate.memory_id, {
+        condition: candidate.condition_text,
+        timestamp: Date.now(),
+        obs_id: observationId,
+        damage_level: damageLevel,
+        source_type: 'direct',
+      });
+
+      await createEdge(env.DB, observationId, candidate.memory_id, 'violated_by');
+
+      // Propagate cascade for all violations
+      // - Core damage: resolved as incorrect → cascade 'incorrect' (damage_confidence)
+      // - Non-core damage: not resolved, just violated → cascade 'void' (review)
+      try {
+        const cascadeOutcome = damageLevel === 'core' ? 'incorrect' : 'void';
+        await propagateResolution(env, candidate.memory_id, cascadeOutcome);
+      } catch (cascadeError) {
+        getLog().warn('cascade_failed', {
+          memory_id: candidate.memory_id,
+          error: cascadeError instanceof Error ? cascadeError.message : String(cascadeError),
+        });
+      }
+
+      processedMemories.add(candidate.memory_id);
+    } else if (match.relevantButNotViolation) {
+      // Related but not a violation = confirmation
+      result.confirmations.push({
+        memory_id: candidate.memory_id,
+        similarity: candidate.similarity,
+      });
+      await recordConfirmation(env.DB, candidate.memory_id);
+      await createEdge(env.DB, observationId, candidate.memory_id, 'confirmed_by');
+      processedMemories.add(candidate.memory_id);
+    }
+  }
+
+  // 3. Search CONFIRMS_VECTORS for conditions this observation might support
+  const confirmsCandidates = await searchConfirmsConditions(
+    env,
+    embedding,
+    MAX_CANDIDATES,
+    MIN_SIMILARITY
+  );
+
+  getLog().debug('confirms_candidates', { count: confirmsCandidates.length });
+
+  // 4. Process confirmation candidates (predictions only)
+  for (const candidate of confirmsCandidates) {
+    if (processedMemories.has(candidate.memory_id)) continue;
+
+    // Get full memory details
+    const memory = await getMemoryById(env.DB, candidate.memory_id);
+    if (!memory || memory.memory_type !== 'pred') continue;
+
+    // LLM-judge this specific condition
+    const match = await checkConditionMatch(
+      env,
+      config,
+      observationContent,
+      candidate.condition_text,
+      'confirms_if',
+      memory.content
+    );
+
+    if (match.matches && match.confidence >= CONFIRM_CONFIDENCE_THRESHOLD) {
+      result.autoConfirmed.push({
+        memory_id: candidate.memory_id,
+        condition: candidate.condition_text,
+        confidence: match.confidence,
+      });
+
+      await autoConfirmAssumption(env.DB, candidate.memory_id, observationId);
+
+      // Propagate resolution to related memories (mark for review, don't auto-modify)
+      try {
+        await propagateResolution(env, candidate.memory_id, 'correct');
+      } catch (cascadeError) {
+        // Log but don't fail the main operation
+        getLog().warn('cascade_failed', {
+          memory_id: candidate.memory_id,
+          error: cascadeError instanceof Error ? cascadeError.message : String(cascadeError),
+        });
+      }
+
+      processedMemories.add(candidate.memory_id);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Check exposures for a new assumption (Bi-directional Architecture).
+ *
+ * When an assumption is created with invalidates_if conditions:
+ * 1. Generate embeddings for each invalidates_if condition
+ * 2. Search MEMORY_VECTORS (obs only) for existing observations that might match
+ * 3. LLM-judge each match
+ *
+ * This catches violations from observations that already exist in the system.
+ *
+ * @param timeBound - Whether this is a time-bound assumption (has resolves_by)
+ */
+export async function checkExposuresForNewAssumption(
+  env: Env,
+  memoryId: string,
+  memoryContent: string,
+  invalidatesIf: string[],
+  confirmsIf: string[],
+  timeBound: boolean = false
+): Promise<ExposureCheckResult> {
+  const config = getConfig(env as unknown as Record<string, string | undefined>);
+
+  const result: ExposureCheckResult = {
+    violations: [],
+    confirmations: [],
+    autoConfirmed: [],
+  };
+
+  if (invalidatesIf.length === 0 && confirmsIf.length === 0) {
+    return result;
+  }
+
+  // Get memory details for centrality
+  const memory = await getMemoryById(env.DB, memoryId);
+  if (!memory) return result;
+
+  // Track processed observations
+  const processedObs = new Set<string>();
+
+  // 1. For each invalidates_if condition, search for matching observations
+  for (const condition of invalidatesIf) {
+    // Generate embedding for this condition
+    const conditionEmbedding = await generateEmbedding(
+      env.AI,
+      condition,
+      config
+    );
+
+    // Search MEMORY_VECTORS for observations that might match this condition
+    const obsCandidates = await searchObservationsForViolation(
+      env,
+      conditionEmbedding,
+      MAX_CANDIDATES,
+      MIN_SIMILARITY
+    );
+
+    getLog().debug('obs_candidates_for_condition', {
+      condition_preview: condition.slice(0, 50),
+      count: obsCandidates.length,
+    });
+
+    // LLM-judge each observation against this condition
+    for (const obsCandidate of obsCandidates) {
+      if (processedObs.has(obsCandidate.id)) continue;
+
+      // Get observation content
+      const obs = await getMemoryById(env.DB, obsCandidate.id);
+      if (!obs) continue;
+
+      const match = await checkConditionMatch(
+        env,
+        config,
+        obs.content,
+        condition,
+        'invalidates_if',
+        memoryContent
+      );
+
+      if (match.matches && match.confidence >= VIOLATION_CONFIDENCE_THRESHOLD) {
+        const damageLevel = getDamageLevel(memory.centrality);
+        result.violations.push({
+          memory_id: memoryId,
+          condition,
+          confidence: match.confidence,
+          damage_level: damageLevel,
+          condition_type: 'invalidates_if',
+        });
+
+        await recordViolation(env.DB, memoryId, {
+          condition,
+          timestamp: Date.now(),
+          obs_id: obsCandidate.id,
+          damage_level: damageLevel,
+          source_type: 'direct',
+        });
+
+        await createEdge(env.DB, obsCandidate.id, memoryId, 'violated_by');
+        processedObs.add(obsCandidate.id);
+        break; // One violation per condition
+      } else if (match.relevantButNotViolation) {
+        result.confirmations.push({
+          memory_id: memoryId,
+          similarity: obsCandidate.similarity,
+        });
+        await recordConfirmation(env.DB, memoryId);
+        await createEdge(env.DB, obsCandidate.id, memoryId, 'confirmed_by');
+        processedObs.add(obsCandidate.id);
+        break;
+      }
+    }
+  }
+
+  // 2. For time-bound assumptions with confirms_if, check if existing observations confirm them
+  if (timeBound && confirmsIf.length > 0) {
+    for (const condition of confirmsIf) {
+      const conditionEmbedding = await generateEmbedding(
+        env.AI,
+        condition,
+        config
+      );
+
+      const obsCandidates = await searchObservationsForViolation(
+        env,
+        conditionEmbedding,
+        MAX_CANDIDATES,
+        MIN_SIMILARITY
+      );
+
+      for (const obsCandidate of obsCandidates) {
+        if (processedObs.has(obsCandidate.id)) continue;
+
+        const obs = await getMemoryById(env.DB, obsCandidate.id);
+        if (!obs) continue;
+
+        const match = await checkConditionMatch(
+          env,
+          config,
+          obs.content,
+          condition,
+          'confirms_if',
+          memoryContent
+        );
+
+        if (match.matches && match.confidence >= CONFIRM_CONFIDENCE_THRESHOLD) {
+          result.autoConfirmed.push({
+            memory_id: memoryId,
+            condition,
+            confidence: match.confidence,
+          });
+
+          await autoConfirmAssumption(env.DB, memoryId, obsCandidate.id);
+          processedObs.add(obsCandidate.id);
+          break;
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * @deprecated Use checkExposuresForNewAssumption - kept for migration compatibility
+ */
+export async function checkExposuresForNewPrediction(
+  env: Env,
+  memoryId: string,
+  memoryType: 'infer' | 'pred',
+  memoryContent: string,
+  invalidatesIf: string[],
+  confirmsIf: string[]
+): Promise<ExposureCheckResult> {
+  const timeBound = memoryType === 'pred';
+  return checkExposuresForNewAssumption(env, memoryId, memoryContent, invalidatesIf, confirmsIf, timeBound);
+}
+
+/**
+ * Get a memory by ID from D1.
+ */
+async function getMemoryById(
+  db: D1Database,
+  memoryId: string
+): Promise<MemoryRow | null> {
+  const row = await db
+    .prepare(
+      `SELECT id, content, memory_type, invalidates_if, assumes, confirms_if, centrality
+       FROM memories WHERE id = ? AND retracted = 0`
+    )
+    .bind(memoryId)
+    .first<MemoryRow>();
+
+  return row;
+}
+
+
+/**
+ * Use LLM to check if an observation matches a condition.
+ * Uses configurable model with JSON schema enforcement.
+ */
+async function checkConditionMatch(
+  env: Env,
+  config: Config,
+  observationContent: string,
+  condition: string,
+  conditionType: ConditionType,
+  memoryContent: string
+): Promise<ConditionMatch> {
+  // Build prompt based on condition type
+  let prompt: string;
+  switch (conditionType) {
+    case 'invalidates_if':
+      prompt = buildInvalidatesIfPrompt(observationContent, condition, memoryContent);
+      break;
+    case 'assumes':
+      prompt = buildAssumesPrompt(observationContent, condition, memoryContent);
+      break;
+    case 'confirms_if':
+      prompt = buildConfirmsIfPrompt(observationContent, condition, memoryContent);
+      break;
+  }
+
+  try {
+    const response = await withRetry(
+      async () => {
+        const model = config.reasoningModel;
+        const isGptOss = model.includes('gpt-oss');
+
+        // AI Gateway config for observability (optional - gracefully falls back if not configured)
+        const gatewayConfig = getGatewayConfig(config, {
+          operation: 'condition_check',
+          conditionType,
+        });
+
+        if (isGptOss) {
+          // GPT-OSS uses Responses API format with structured output
+          return await env.AI.run(
+            model as Parameters<typeof env.AI.run>[0],
+            {
+              input: prompt,
+              instructions: 'Return only valid JSON matching the schema',
+              response_format: {
+                type: 'json_schema',
+                json_schema: {
+                  name: 'condition_check',
+                  strict: true,
+                  schema: CONDITION_CHECK_SCHEMA,
+                },
+              },
+            } as Parameters<typeof env.AI.run>[1],
+            gatewayConfig
+          );
+        } else {
+          // Chat completion format for other models
+          return await env.AI.run(
+            model as Parameters<typeof env.AI.run>[0],
+            {
+              messages: [{ role: 'user', content: prompt }],
+              max_tokens: 200,
+            } as Parameters<typeof env.AI.run>[1],
+            gatewayConfig
+          );
+        }
+      },
+      { retries: 2, delay: 100 }
+    );
+
+    const responseText = extractContent(response);
+    return parseConditionResponse(responseText);
+  } catch (error) {
+    getLog().error('condition_check_failed', { error: error instanceof Error ? error.message : String(error) });
+    return { matches: false, confidence: 0 };
+  }
+}
+
+// ============================================
+// Database Operations
+// ============================================
+
+/**
+ * Record a violation for a memory.
+ * Updates: violations array, exposures count.
+ * If damage_level is 'core', auto-resolves the memory as incorrect.
+ */
+async function recordViolation(
+  db: D1Database,
+  memoryId: string,
+  violation: Violation
+): Promise<void> {
+  // Get current violations
+  const row = await db
+    .prepare('SELECT violations, exposures FROM memories WHERE id = ?')
+    .bind(memoryId)
+    .first<{ violations: string; exposures: number }>();
+
+  if (!row) {
+    return;
+  }
+
+  const violations: Violation[] = JSON.parse(row.violations || '[]');
+  violations.push(violation);
+
+  const now = Date.now();
+
+  // If core damage, auto-resolve as incorrect
+  if (violation.damage_level === 'core') {
+    await db
+      .prepare(
+        `
+      UPDATE memories
+      SET violations = ?,
+          exposures = exposures + 1,
+          state = 'resolved',
+          outcome = 'incorrect',
+          resolved_at = ?,
+          updated_at = ?
+      WHERE id = ?
+      `
+      )
+      .bind(JSON.stringify(violations), now, now, memoryId)
+      .run();
+  } else {
+    // Non-core violations don't auto-resolve
+    await db
+      .prepare(
+        `
+      UPDATE memories
+      SET violations = ?,
+          exposures = exposures + 1,
+          state = 'violated',
+          updated_at = ?
+      WHERE id = ?
+      `
+      )
+      .bind(JSON.stringify(violations), now, memoryId)
+      .run();
+  }
+}
+
+/**
+ * Record a confirmation for a memory.
+ * Updates: confirmations count, exposures count
+ */
+async function recordConfirmation(
+  db: D1Database,
+  memoryId: string
+): Promise<void> {
+  await db
+    .prepare(
+      `
+    UPDATE memories
+    SET confirmations = confirmations + 1, exposures = exposures + 1, updated_at = ?
+    WHERE id = ?
+    `
+    )
+    .bind(Date.now(), memoryId)
+    .run();
+}
+
+/**
+ * Auto-confirm a time-bound assumption when confirms_if condition matches.
+ * Creates edge, updates stats, and resolves the assumption as correct.
+ */
+async function autoConfirmAssumption(
+  db: D1Database,
+  assumptionId: string,
+  observationId: string
+): Promise<void> {
+  const now = Date.now();
+
+  await db
+    .prepare(
+      `
+    UPDATE memories
+    SET confirmations = confirmations + 1,
+        exposures = exposures + 1,
+        state = 'resolved',
+        outcome = 'correct',
+        resolved_at = ?,
+        updated_at = ?
+    WHERE id = ?
+    `
+    )
+    .bind(now, now, assumptionId)
+    .run();
+
+  await createEdge(db, observationId, assumptionId, 'confirmed_by');
+}
+
+/**
+ * Create an edge between observation and memory.
+ */
+async function createEdge(
+  db: D1Database,
+  sourceId: string,
+  targetId: string,
+  edgeType: 'derived_from' | 'violated_by' | 'confirmed_by'
+): Promise<void> {
+  const id = generateId('edge');
+  await db
+    .prepare(
+      `
+    INSERT INTO edges (id, source_id, target_id, edge_type, strength, created_at)
+    VALUES (?, ?, ?, ?, 1.0, ?)
+    `
+    )
+    .bind(id, sourceId, targetId, edgeType, Date.now())
+    .run();
+}
+
+// ============================================
+// Manual Exposure Operations
+// ============================================
+
+/**
+ * Manually confirm a memory (increase confidence).
+ * Called from /api/confirm/:id endpoint.
+ */
+export async function manualConfirm(
+  db: D1Database,
+  memoryId: string,
+  observationId?: string
+): Promise<void> {
+  await db
+    .prepare(
+      `
+    UPDATE memories
+    SET confirmations = confirmations + 1, exposures = exposures + 1, updated_at = ?
+    WHERE id = ?
+    `
+    )
+    .bind(Date.now(), memoryId)
+    .run();
+
+  // Create edge if observation provided
+  if (observationId) {
+    await createEdge(db, observationId, memoryId, 'confirmed_by');
+  }
+}
+
+/**
+ * Manually violate a memory (add to violations).
+ * Called from /api/violate/:id endpoint.
+ * If damage_level is 'core', auto-resolves as incorrect.
+ */
+export async function manualViolate(
+  db: D1Database,
+  memoryId: string,
+  condition: string,
+  observationId?: string
+): Promise<Violation> {
+  // Get memory to determine damage level
+  const row = await db
+    .prepare('SELECT centrality, violations FROM memories WHERE id = ?')
+    .bind(memoryId)
+    .first<{ centrality: number; violations: string }>();
+
+  if (!row) {
+    throw new Error(`Memory not found: ${memoryId}`);
+  }
+
+  const now = Date.now();
+  const damageLevel = getDamageLevel(row.centrality);
+
+  const violation: Violation = {
+    condition,
+    timestamp: now,
+    obs_id: observationId || 'manual',
+    damage_level: damageLevel,
+    source_type: 'direct',
+  };
+
+  const violations: Violation[] = JSON.parse(row.violations || '[]');
+  violations.push(violation);
+
+  // If core damage, auto-resolve as incorrect
+  if (damageLevel === 'core') {
+    await db
+      .prepare(
+        `
+      UPDATE memories
+      SET violations = ?,
+          exposures = exposures + 1,
+          state = 'resolved',
+          outcome = 'incorrect',
+          resolved_at = ?,
+          updated_at = ?
+      WHERE id = ?
+      `
+      )
+      .bind(JSON.stringify(violations), now, now, memoryId)
+      .run();
+  } else {
+    // Non-core violations don't auto-resolve
+    await db
+      .prepare(
+        `
+      UPDATE memories
+      SET violations = ?,
+          exposures = exposures + 1,
+          state = 'violated',
+          updated_at = ?
+      WHERE id = ?
+      `
+      )
+      .bind(JSON.stringify(violations), now, memoryId)
+      .run();
+  }
+
+  // Create edge if observation provided
+  if (observationId) {
+    await createEdge(db, observationId, memoryId, 'violated_by');
+  }
+
+  return violation;
+}
+
+// ============================================
+// Centrality Management
+// ============================================
+
+/**
+ * Increment centrality when an edge is created TO a memory.
+ * Call this when creating derived_from edges.
+ */
+export async function incrementCentrality(
+  db: D1Database,
+  targetId: string
+): Promise<void> {
+  await db
+    .prepare(
+      `
+    UPDATE memories
+    SET centrality = centrality + 1, updated_at = ?
+    WHERE id = ?
+    `
+    )
+    .bind(Date.now(), targetId)
+    .run();
+}
+
+/**
+ * Decrement centrality when an edge is deleted.
+ */
+export async function decrementCentrality(
+  db: D1Database,
+  targetId: string
+): Promise<void> {
+  await db
+    .prepare(
+      `
+    UPDATE memories
+    SET centrality = MAX(0, centrality - 1), updated_at = ?
+    WHERE id = ?
+    `
+    )
+    .bind(Date.now(), targetId)
+    .run();
+}

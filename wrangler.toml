@@ -1,0 +1,167 @@
+# Pantains Memory - Zettelkasten Knowledge Graph
+# Deploy with: wrangler deploy (or wrangler deploy --env staging)
+name = "pantainos-memory"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Scheduled Jobs (Cron Triggers)
+# - Every minute: InactivityCron finds sessions with 30s+ inactivity and triggers dispatch
+# - Daily at 3:00 AM UTC: Maintenance tasks (prediction:due detection)
+[triggers]
+crons = ["* * * * *", "0 3 * * *"]
+
+# Workflows (observable event processing)
+[[workflows]]
+name = "exposure-check-workflow"
+binding = "EXPOSURE_CHECK"
+class_name = "ExposureCheckWorkflow"
+
+[[workflows]]
+name = "session-dispatch-workflow"
+binding = "SESSION_DISPATCH"
+class_name = "SessionDispatchWorkflow"
+
+[[workflows]]
+name = "inactivity-cron-workflow"
+binding = "INACTIVITY_CRON"
+class_name = "InactivityCron"
+
+# D1 Database
+[[d1_databases]]
+binding = "DB"
+database_name = "pantainos-memory-db"
+database_id = "placeholder-create-via-wrangler-d1-create"
+migrations_dir = "migrations"
+
+# Vectorize Indexes (Three-table architecture for semantic separation)
+# 1. Memory content embeddings - find observations when checking new claims
+[[vectorize]]
+binding = "MEMORY_VECTORS"
+index_name = "pantainos-memory-vectors"
+
+# 2. Invalidates_if condition embeddings - find predictions an observation might break
+[[vectorize]]
+binding = "INVALIDATES_VECTORS"
+index_name = "pantainos-memory-invalidates"
+
+# 3. Confirms_if condition embeddings - find predictions an observation might support
+[[vectorize]]
+binding = "CONFIRMS_VECTORS"
+index_name = "pantainos-memory-confirms"
+
+# Legacy binding (kept for backwards compatibility during migration)
+[[vectorize]]
+binding = "VECTORS"
+index_name = "pantainos-memory-vectors"
+
+# Workers AI
+[ai]
+binding = "AI"
+
+# Analytics Engine
+[[analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "pantainos_memory_analytics"
+
+# OAuth KV namespace (for MCP authentication state)
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "placeholder-create-via-wrangler-kv-namespace-create"
+
+# Detection Queue (push consumer for async violation/resolution detection)
+[[queues.producers]]
+queue = "pantainos-memory-detection"
+binding = "DETECTION_QUEUE"
+
+[[queues.consumers]]
+queue = "pantainos-memory-detection"
+max_batch_size = 10
+max_batch_timeout = 5
+
+# Configuration Variables
+[vars]
+# AI Gateway for observability (required - create in dashboard)
+CF_ACCOUNT_ID = ""
+AI_GATEWAY_ID = ""
+
+# OAuth/MCP Authentication (required for mcp-remote OAuth flow)
+# Set ISSUER_URL to your worker's public URL (e.g., https://pantainos-memory.yourdomain.com)
+ISSUER_URL = ""
+# CF Access team name (part of cloudflareaccess.com domain, e.g., "myteam" for myteam.cloudflareaccess.com)
+CF_ACCESS_TEAM = ""
+# CF Access Application Audience (AUD) tag (find in Access > Applications > your app > Overview)
+CF_ACCESS_AUD = ""
+
+# Reasoning model for condition checking (invalidates_if, assumes, confirms_if)
+# Options: @cf/openai/gpt-oss-120b (default, more accurate) or @cf/openai/gpt-oss-20b (faster)
+REASONING_MODEL = "@cf/openai/gpt-oss-120b"
+
+# Deduplication thresholds
+DEDUP_THRESHOLD = "0.85"
+DEDUP_LOWER_THRESHOLD = "0.70"
+DEDUP_MODEL = "@cf/openai/gpt-oss-20b"
+DEDUP_CONFIDENCE_THRESHOLD = "0.8"
+
+# Resolver configuration (for agentic dispatch)
+# RESOLVER_TYPE: 'github' (default) | 'webhook' | 'none'
+RESOLVER_TYPE = "github"
+# RESOLVER_WEBHOOK_URL = "https://..." (for webhook resolver)
+# RESOLVER_WEBHOOK_TOKEN = "..." (set via: wrangler secret put RESOLVER_WEBHOOK_TOKEN)
+
+# GitHub dispatch (for github resolver - set GITHUB_TOKEN in secrets for production)
+# GITHUB_TOKEN = "your-token"
+GITHUB_OWNER = ""
+GITHUB_REPO = ""
+
+# OpenRouter API (for experiments with external models)
+# OPENROUTER_API_KEY = "sk-or-..." (set via: wrangler secret put OPENROUTER_API_KEY)
+
+[dev]
+port = 8794
+local_protocol = "http"
+
+# ============================================
+# Staging Environment
+# ============================================
+[env.staging]
+name = "pantainos-memory-staging"
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "pantainos-memory-staging-db"
+database_id = "placeholder-staging"
+migrations_dir = "migrations"
+
+[[env.staging.vectorize]]
+binding = "MEMORY_VECTORS"
+index_name = "pantainos-memory-staging-vectors"
+
+[[env.staging.vectorize]]
+binding = "INVALIDATES_VECTORS"
+index_name = "pantainos-memory-staging-invalidates"
+
+[[env.staging.vectorize]]
+binding = "CONFIRMS_VECTORS"
+index_name = "pantainos-memory-staging-confirms"
+
+[[env.staging.vectorize]]
+binding = "VECTORS"
+index_name = "pantainos-memory-staging-vectors"
+
+[[env.staging.kv_namespaces]]
+binding = "OAUTH_KV"
+id = "placeholder-staging"
+
+[[env.staging.queues.producers]]
+queue = "pantainos-memory-detection-staging"
+binding = "DETECTION_QUEUE"
+
+[[env.staging.queues.consumers]]
+queue = "pantainos-memory-detection-staging"
+max_batch_size = 10
+max_batch_timeout = 5
+
+[[env.staging.analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "pantainos_memory_staging_analytics"
