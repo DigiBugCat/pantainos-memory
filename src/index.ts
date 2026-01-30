@@ -272,7 +272,7 @@ app.get('/health', async (c) => {
   }
 
   try {
-    await c.env.VECTORS.describe();
+    await c.env.MEMORY_VECTORS.describe();
     checks.vectorize = { status: 'healthy' };
   } catch (e) {
     checks.vectorize = { status: 'unhealthy', error: (e as Error).message };

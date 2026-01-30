@@ -73,7 +73,7 @@ export async function checkDuplicate(
   let results;
   try {
     results = await withRetry(
-      () => env.VECTORS.query(embedding, { topK: 1, returnMetadata: 'all' }),
+      () => env.MEMORY_VECTORS.query(embedding, { topK: 1, returnMetadata: 'all' }),
       { retries: 2, delay: 100, name: 'checkDuplicate', requestId }
     );
   } catch (error) {
@@ -214,7 +214,7 @@ export async function searchSimilar(
   let results;
   try {
     results = await withRetry(
-      () => env.VECTORS.query(embedding, { topK, returnMetadata: 'all' }),
+      () => env.MEMORY_VECTORS.query(embedding, { topK, returnMetadata: 'all' }),
       { retries: 2, delay: 100, name: 'searchSimilar', requestId }
     );
   } catch (error) {

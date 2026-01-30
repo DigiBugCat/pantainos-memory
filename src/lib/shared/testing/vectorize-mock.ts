@@ -202,7 +202,7 @@ export function createMockVectorize(
     }),
 
     describe: vi.fn().mockResolvedValue({
-      dimensions: 384, // Default for bge-base-en-v1.5
+      dimensions: 768, // Default for embeddinggemma-300m
       count: storage.size,
       description: 'Mock Vectorize Index',
     }),
@@ -236,10 +236,10 @@ export function createMockVectorize(
  * Generates a deterministic embedding based on the input text hash.
  *
  * @param text Text to generate embedding for
- * @param dimensions Number of dimensions (default: 384 for bge-base-en-v1.5)
+ * @param dimensions Number of dimensions (default: 768 for embeddinggemma-300m)
  * @returns A normalized vector of the specified dimensions
  */
-export function createTestEmbedding(text: string, dimensions: number = 384): number[] {
+export function createTestEmbedding(text: string, dimensions: number = 768): number[] {
   // Create deterministic values based on text hash
   const values: number[] = [];
   let hash = 0;

@@ -28,15 +28,13 @@ export interface Env {
   CF_ACCESS_TEAM?: string;
   CF_ACCESS_AUD?: string;
 
-  // Vectorize Indexes (Three-table architecture)
+  // Vectorize Indexes (Three-table architecture, 768 dimensions, embeddinggemma-300m)
   // Memory content embeddings - for finding observations when checking new claims
   MEMORY_VECTORS: VectorizeIndex;
   // Invalidates_if condition embeddings - for finding predictions an observation might break
   INVALIDATES_VECTORS: VectorizeIndex;
   // Confirms_if condition embeddings - for finding predictions an observation might support
   CONFIRMS_VECTORS: VectorizeIndex;
-  // Legacy binding (kept for backwards compatibility during migration)
-  VECTORS: VectorizeIndex;
 
   // Queue for async exposure checking
   DETECTION_QUEUE: Queue<ExposureCheckJob>;
@@ -54,9 +52,6 @@ export interface Env {
   RESOLVER_TYPE?: string;
   RESOLVER_WEBHOOK_URL?: string;
   RESOLVER_WEBHOOK_TOKEN?: string;
-
-  // OpenRouter API (for experiments with external models)
-  OPENROUTER_API_KEY?: string;
 
   // AI Gateway for observability (optional - enables logging, metrics, cost tracking)
   CF_ACCOUNT_ID?: string;

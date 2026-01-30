@@ -42,20 +42,30 @@ import { propagateResolution } from './cascade.js';
 import type { Env } from '../types/index.js';
 
 // ============================================
-// Configuration
+// Configuration (can be overridden via env vars)
 // ============================================
 
 /** Default confidence threshold for violation detection */
-const VIOLATION_CONFIDENCE_THRESHOLD = 0.7;
+const DEFAULT_VIOLATION_CONFIDENCE = 0.7;
 
 /** Confidence threshold for auto-confirmation */
-const CONFIRM_CONFIDENCE_THRESHOLD = 0.75;
+const DEFAULT_CONFIRM_CONFIDENCE = 0.75;
 
 /** Maximum candidates to check from Vectorize */
-const MAX_CANDIDATES = 20;
+const DEFAULT_MAX_CANDIDATES = 20;
 
 /** Similarity threshold for candidate selection */
-const MIN_SIMILARITY = 0.5;
+const DEFAULT_MIN_SIMILARITY = 0.4;
+
+/** Get configurable thresholds from env or use defaults */
+function getThresholds(env: Env) {
+  return {
+    violationConfidence: parseFloat((env as any).VIOLATION_CONFIDENCE_THRESHOLD) || DEFAULT_VIOLATION_CONFIDENCE,
+    confirmConfidence: parseFloat((env as any).CONFIRM_CONFIDENCE_THRESHOLD) || DEFAULT_CONFIRM_CONFIDENCE,
+    maxCandidates: parseInt((env as any).MAX_CANDIDATES) || DEFAULT_MAX_CANDIDATES,
+    minSimilarity: parseFloat((env as any).MIN_SIMILARITY) || DEFAULT_MIN_SIMILARITY,
+  };
+}
 
 // ============================================
 // Types
@@ -311,6 +321,7 @@ export async function checkExposures(
   embedding: number[]
 ): Promise<ExposureCheckResult> {
   const config = getConfig(env as unknown as Record<string, string | undefined>);
+  const thresholds = getThresholds(env);
 
   const result: ExposureCheckResult = {
     violations: [],
@@ -321,15 +332,28 @@ export async function checkExposures(
   // Track which memories we've already processed to avoid duplicates
   const processedMemories = new Set<string>();
 
+  getLog().info('exposure_check_start', {
+    observation_id: observationId,
+    observation_preview: observationContent.slice(0, 100),
+    thresholds,
+  });
+
   // 1. Search INVALIDATES_VECTORS for conditions this observation might match
   const invalidatesCandidates = await searchInvalidatesConditions(
     env,
     embedding,
-    MAX_CANDIDATES,
-    MIN_SIMILARITY
+    thresholds.maxCandidates,
+    thresholds.minSimilarity
   );
 
-  getLog().debug('invalidates_candidates', { count: invalidatesCandidates.length });
+  getLog().info('invalidates_candidates', {
+    count: invalidatesCandidates.length,
+    candidates: invalidatesCandidates.map(c => ({
+      condition: c.condition_text,
+      similarity: c.similarity,
+      memory_id: c.memory_id,
+    })),
+  });
 
   // 2. Process invalidation candidates
   for (const candidate of invalidatesCandidates) {
@@ -349,7 +373,16 @@ export async function checkExposures(
       memory.content
     );
 
-    if (match.matches && match.confidence >= VIOLATION_CONFIDENCE_THRESHOLD) {
+    getLog().info('llm_judge_result', {
+      memory_id: candidate.memory_id,
+      condition: candidate.condition_text,
+      matches: match.matches,
+      confidence: match.confidence,
+      reasoning: match.reasoning,
+      threshold: thresholds.violationConfidence,
+    });
+
+    if (match.matches && match.confidence >= thresholds.violationConfidence) {
       const damageLevel = getDamageLevel(memory.centrality);
       result.violations.push({
         memory_id: candidate.memory_id,
@@ -399,8 +432,8 @@ export async function checkExposures(
   const confirmsCandidates = await searchConfirmsConditions(
     env,
     embedding,
-    MAX_CANDIDATES,
-    MIN_SIMILARITY
+    thresholds.maxCandidates,
+    thresholds.minSimilarity
   );
 
   getLog().debug('confirms_candidates', { count: confirmsCandidates.length });
@@ -423,7 +456,7 @@ export async function checkExposures(
       memory.content
     );
 
-    if (match.matches && match.confidence >= CONFIRM_CONFIDENCE_THRESHOLD) {
+    if (match.matches && match.confidence >= thresholds.confirmConfidence) {
       result.autoConfirmed.push({
         memory_id: candidate.memory_id,
         condition: candidate.condition_text,
@@ -446,6 +479,13 @@ export async function checkExposures(
       processedMemories.add(candidate.memory_id);
     }
   }
+
+  getLog().info('exposure_check_complete', {
+    observation_id: observationId,
+    violations: result.violations.length,
+    confirmations: result.confirmations.length,
+    autoConfirmed: result.autoConfirmed.length,
+  });
 
   return result;
 }
@@ -471,6 +511,7 @@ export async function checkExposuresForNewAssumption(
   timeBound: boolean = false
 ): Promise<ExposureCheckResult> {
   const config = getConfig(env as unknown as Record<string, string | undefined>);
+  const thresholds = getThresholds(env);
 
   const result: ExposureCheckResult = {
     violations: [],
@@ -502,8 +543,8 @@ export async function checkExposuresForNewAssumption(
     const obsCandidates = await searchObservationsForViolation(
       env,
       conditionEmbedding,
-      MAX_CANDIDATES,
-      MIN_SIMILARITY
+      thresholds.maxCandidates,
+      thresholds.minSimilarity
     );
 
     getLog().debug('obs_candidates_for_condition', {
@@ -528,7 +569,7 @@ export async function checkExposuresForNewAssumption(
         memoryContent
       );
 
-      if (match.matches && match.confidence >= VIOLATION_CONFIDENCE_THRESHOLD) {
+      if (match.matches && match.confidence >= thresholds.violationConfidence) {
         const damageLevel = getDamageLevel(memory.centrality);
         result.violations.push({
           memory_id: memoryId,
@@ -574,8 +615,8 @@ export async function checkExposuresForNewAssumption(
       const obsCandidates = await searchObservationsForViolation(
         env,
         conditionEmbedding,
-        MAX_CANDIDATES,
-        MIN_SIMILARITY
+        thresholds.maxCandidates,
+        thresholds.minSimilarity
       );
 
       for (const obsCandidate of obsCandidates) {
@@ -593,7 +634,7 @@ export async function checkExposuresForNewAssumption(
           memoryContent
         );
 
-        if (match.matches && match.confidence >= CONFIRM_CONFIDENCE_THRESHOLD) {
+        if (match.matches && match.confidence >= thresholds.confirmConfidence) {
           result.autoConfirmed.push({
             memory_id: memoryId,
             condition,
