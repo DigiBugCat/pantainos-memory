@@ -22,14 +22,23 @@ wrangler vectorize create pantainos-memory-dev-confirms --dimensions=768 --metri
 echo "Creating Queue..."
 wrangler queues create pantainos-memory-dev-detection
 
+# Create KV namespace for OAuth
+echo "Creating KV namespace..."
+KV_OUTPUT=$(wrangler kv namespace create "OAUTH_KV" --env dev 2>&1)
+KV_ID=$(echo "$KV_OUTPUT" | grep "id = " | sed 's/.*id = "\([^"]*\)".*/\1/')
+echo "KV namespace ID: $KV_ID"
+
 # Update wrangler.toml with new IDs
 echo "Updating wrangler.toml with resource IDs..."
 if [[ "$OSTYPE" == "darwin"* ]]; then
-  # macOS - update the dev database_id (second occurrence)
+  # macOS
   sed -i '' "s/database_id = \"TODO\"/database_id = \"$D1_ID\"/" wrangler.toml
+  # Update KV ID in dev section (find the one after env.dev.kv_namespaces)
+  sed -i '' "/\[\[env.dev.kv_namespaces\]\]/,/^id = \"TODO\"$/{s/id = \"TODO\"/id = \"$KV_ID\"/;}" wrangler.toml
 else
   # Linux
   sed -i "s/database_id = \"TODO\"/database_id = \"$D1_ID\"/" wrangler.toml
+  sed -i "/\[\[env.dev.kv_namespaces\]\]/,/^id = \"TODO\"$/{s/id = \"TODO\"/id = \"$KV_ID\"/;}" wrangler.toml
 fi
 
 # Run migration
@@ -46,6 +55,7 @@ echo "URL: https://pantainos-memory-dev.pantainos.workers.dev"
 echo ""
 echo "Resources created:"
 echo "  D1:        $D1_ID"
+echo "  KV:        $KV_ID"
 echo "  Vectorize: pantainos-memory-dev-vectors (768d)"
 echo "  Vectorize: pantainos-memory-dev-invalidates (768d)"
 echo "  Vectorize: pantainos-memory-dev-confirms (768d)"

@@ -1,8 +1,7 @@
 # Pantainos Memory - Zettelkasten Knowledge Graph
 #
-# SECURITY: This worker has no built-in authentication.
-# Protect with Cloudflare Access before exposing to the internet.
-# See: https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/
+# Authentication: MCP OAuth 2.0 backed by Cloudflare Access
+# Configure CF_ACCESS_TEAM and CF_ACCESS_AUD for your Zero Trust application.
 #
 # Environments:
 #   Local:      pnpm dev (uses dev resources with --remote flag)
@@ -66,6 +65,11 @@ binding = "AI"
 [[analytics_engine_datasets]]
 binding = "ANALYTICS"
 dataset = "pantainos_memory_prod"
+
+# OAuth KV (for MCP authentication state)
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "TODO"
 
 # Detection Queue
 [[queues.producers]]
@@ -153,6 +157,11 @@ max_batch_timeout = 5
 [[env.dev.analytics_engine_datasets]]
 binding = "ANALYTICS"
 dataset = "pantainos_memory_dev"
+
+# OAuth KV (for MCP authentication state)
+[[env.dev.kv_namespaces]]
+binding = "OAUTH_KV"
+id = "TODO"
 
 # Local dev server
 [dev]

@@ -43,12 +43,25 @@ echo "y" | wrangler vectorize delete pantainos-memory-dev-vectors 2>/dev/null ||
 echo "y" | wrangler vectorize delete pantainos-memory-dev-invalidates 2>/dev/null || echo "Vectorize invalidates not found"
 echo "y" | wrangler vectorize delete pantainos-memory-dev-confirms 2>/dev/null || echo "Vectorize confirms not found"
 
-# Step 6: Reset wrangler.toml IDs to TODO
+# Step 6: Delete KV namespace
+echo "Deleting KV namespace..."
+# Get the KV ID from wrangler.toml
+KV_ID=$(grep -A2 '\[\[env.dev.kv_namespaces\]\]' wrangler.toml | grep 'id = ' | sed 's/.*id = "\([^"]*\)".*/\1/')
+if [[ -n "$KV_ID" && "$KV_ID" != "TODO" ]]; then
+  echo "y" | wrangler kv namespace delete --namespace-id="$KV_ID" 2>/dev/null || echo "KV not found or already deleted"
+else
+  echo "KV namespace ID not found in wrangler.toml"
+fi
+
+# Step 7: Reset wrangler.toml IDs to TODO
 echo "Resetting wrangler.toml resource IDs..."
 if [[ "$OSTYPE" == "darwin"* ]]; then
   sed -i '' 's/database_id = "[a-f0-9-]*"/database_id = "TODO"/' wrangler.toml
+  # Reset KV ID in dev section
+  sed -i '' '/\[\[env.dev.kv_namespaces\]\]/,/^id = "[a-f0-9-]*"$/{s/id = "[a-f0-9-]*"/id = "TODO"/;}' wrangler.toml
 else
   sed -i 's/database_id = "[a-f0-9-]*"/database_id = "TODO"/' wrangler.toml
+  sed -i '/\[\[env.dev.kv_namespaces\]\]/,/^id = "[a-f0-9-]*"$/{s/id = "[a-f0-9-]*"/id = "TODO"/;}' wrangler.toml
 fi
 
 echo ""

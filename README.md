@@ -8,9 +8,12 @@ Zettelkasten-style knowledge graph for AI agents. Cloudflare Worker with D1, Vec
 ┌─────────────────────────────────────────────────────────┐
 │                   Cloudflare Worker                      │
 │                                                          │
-│  /api/*        - Public API (observations, queries)     │
-│  /internal/*   - Service binding API (for n8n)          │
-│  /health       - Health check                           │
+│  POST /         - MCP Streamable HTTP (OAuth protected) │
+│  /mcp           - MCP JSON-RPC endpoint                 │
+│  /api/*         - REST API                              │
+│  /internal/*    - Service binding API                   │
+│  /authorize     - OAuth authorization                   │
+│  /token         - OAuth token exchange                  │
 │                                                          │
 │  Queue Consumer → Exposure Check Workflow               │
 │  Cron Triggers  → Inactivity Detection                  │
@@ -21,7 +24,12 @@ Zettelkasten-style knowledge graph for AI agents. Cloudflare Worker with D1, Vec
     │   D1   │    │ Vectorize │    │ Workers AI │
     │(SQLite)│    │ (768-dim) │    │ (Embeddings│
     └────────┘    └──────────┘    │  + Judge)  │
-                                   └───────────┘
+         │                         └───────────┘
+         │
+    ┌────────┐
+    │   KV   │
+    │(OAuth) │
+    └────────┘
 ```
 
 ## Concepts
@@ -32,15 +40,22 @@ Zettelkasten-style knowledge graph for AI agents. Cloudflare Worker with D1, Vec
 
 **Exposure checking:** When new observations arrive, the system checks if they violate or confirm existing assumptions using semantic similarity + LLM judge.
 
-## Security
+## Authentication
 
-**This worker has no built-in authentication.** Protect with Cloudflare Access before exposing to the internet.
+MCP OAuth 2.0 backed by Cloudflare Access. Configure these environment variables:
 
-1. Create Access Application for the worker domain
-2. Create Service Token for machine-to-machine access
-3. Clients send `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers
+| Variable | Description |
+|----------|-------------|
+| `CF_ACCESS_TEAM` | Your Cloudflare Access team name |
+| `CF_ACCESS_AUD` | Application Audience (AUD) tag from Access |
+| `ISSUER_URL` | (Optional) Override OAuth issuer URL |
 
-See: https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/
+OAuth endpoints:
+- `/.well-known/oauth-authorization-server` - Authorization server metadata
+- `/.well-known/oauth-protected-resource` - Protected resource metadata
+- `/register` - Dynamic client registration
+- `/authorize` - Authorization endpoint
+- `/token` - Token endpoint
 
 ## Development
 
@@ -48,7 +63,7 @@ See: https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/
 # Install dependencies
 pnpm install
 
-# Create dev environment (D1, Vectorize, Queue)
+# Create dev environment (D1, Vectorize, Queue, KV)
 pnpm dev:up
 
 # Run locally (connects to remote dev resources)
@@ -70,7 +85,23 @@ pnpm deploy
 
 ## API Endpoints
 
-### Internal API (for n8n via service binding)
+### MCP (Model Context Protocol)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/` | MCP Streamable HTTP transport (OAuth protected) |
+| POST | `/mcp` | MCP JSON-RPC endpoint |
+
+**MCP Tools exposed:**
+- `note` - Store a new memory
+- `recall` - Retrieve memory by ID
+- `find` - Semantic search
+- `connect` - Link memories
+- `reference` - Follow memory graph
+- `insights` - Memory statistics
+- ... and more
+
+### Internal API (for service bindings)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -80,7 +111,7 @@ pnpm deploy
 | POST | `/internal/recall` | Get memory by ID |
 | GET | `/internal/stats` | Memory statistics |
 
-### Public API
+### REST API
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -96,11 +127,14 @@ pnpm deploy
 | `MIN_SIMILARITY` | Vector search threshold | `0.35` |
 | `VIOLATION_CONFIDENCE_THRESHOLD` | LLM confidence for violations | `0.6` |
 | `CONFIRM_CONFIDENCE_THRESHOLD` | LLM confidence for confirmations | `0.7` |
+| `CF_ACCESS_TEAM` | Cloudflare Access team name | - |
+| `CF_ACCESS_AUD` | Access application AUD tag | - |
 
 ## Resources
 
 Each environment creates:
 - **D1 Database**: `pantainos-memory-{env}`
+- **KV Namespace**: OAuth state storage
 - **Vectorize Indexes** (768 dimensions, cosine):
   - `pantainos-memory-{env}-vectors` - Memory embeddings
   - `pantainos-memory-{env}-invalidates` - Invalidation conditions
