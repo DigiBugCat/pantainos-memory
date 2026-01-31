@@ -15,7 +15,7 @@ import { cors } from 'hono/cors';
 import type { Env as BaseEnv } from './types/index.js';
 import type { ExposureCheckJob } from './lib/shared/types/index.js';
 import { getConfig, type Config } from './lib/config.js';
-import { authorizeHandler, tokenHandler, registerHandler, validateAccessToken } from './auth/index.js';
+import { authorizeHandler, tokenHandler, registerHandler, validateAccessToken } from '@pantainos/mcp-core';
 
 // Route imports
 import flowRoutes from './routes/flow/index.js';

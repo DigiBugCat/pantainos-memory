@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "^0.2.2",
+    "@pantainos/mcp-core": "github:Pantainos-Toolkit/mcp-core",
     "hono": "^4.6.14",
     "nanoid": "^5.0.9"
   },

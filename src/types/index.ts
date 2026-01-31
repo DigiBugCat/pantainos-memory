@@ -15,18 +15,13 @@ export * from './history.js';
 // ============================================
 
 import type { ExposureCheckJob } from '../lib/shared/types/index.js';
+import type { MCPCoreEnv } from '@pantainos/mcp-core';
 
-export interface Env {
+export interface Env extends MCPCoreEnv {
   // Core bindings
   DB: D1Database;
   AI: Ai;
   ANALYTICS?: AnalyticsEngineDataset;
-
-  // OAuth for MCP authentication
-  OAUTH_KV: KVNamespace;
-  ISSUER_URL?: string;
-  CF_ACCESS_TEAM?: string;
-  CF_ACCESS_AUD?: string;
 
   // Vectorize Indexes (Three-table architecture, 768 dimensions, embeddinggemma-300m)
   // Memory content embeddings - for finding observations when checking new claims
