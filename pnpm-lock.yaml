@@ -13,7 +13,7 @@ importers:
         version: 0.2.2
       '@pantainos/mcp-core':
         specifier: github:Pantainos-Toolkit/mcp-core
-        version: git+https://git@github.com:Pantainos-Toolkit/mcp-core.git#1594c06a45533960416ad1c7d0fae069dac2aff8(@cloudflare/workers-types@4.20260130.0)
+        version: git+https://git@github.com:Pantainos-Toolkit/mcp-core.git#49af8071ea6b94eb119a96fc7b72c6120088e6d4(@cloudflare/workers-types@4.20260130.0)
       hono:
         specifier: ^4.6.14
         version: 4.11.7
@@ -603,8 +603,8 @@ packages:
   '@open-draft/until@2.1.0':
     resolution: {integrity: sha512-U69T3ItWHvLwGg5eJ0n3I62nWuE6ilHlmz7zM0npLBRvPRd7e6NYmg54vvRtP5mZG7kZqZCFVdsTWo7BPtBujg==}
 
-  '@pantainos/mcp-core@git+https://git@github.com:Pantainos-Toolkit/mcp-core.git#1594c06a45533960416ad1c7d0fae069dac2aff8':
-    resolution: {commit: 1594c06a45533960416ad1c7d0fae069dac2aff8, repo: git@github.com:Pantainos-Toolkit/mcp-core.git, type: git}
+  '@pantainos/mcp-core@git+https://git@github.com:Pantainos-Toolkit/mcp-core.git#49af8071ea6b94eb119a96fc7b72c6120088e6d4':
+    resolution: {commit: 49af8071ea6b94eb119a96fc7b72c6120088e6d4, repo: git@github.com:Pantainos-Toolkit/mcp-core.git, type: git}
     version: 0.1.0
     peerDependencies:
       '@cloudflare/workers-types': ^4.0.0
@@ -2025,12 +2025,13 @@ snapshots:
 
   '@open-draft/until@2.1.0': {}
 
-  '@pantainos/mcp-core@git+https://git@github.com:Pantainos-Toolkit/mcp-core.git#1594c06a45533960416ad1c7d0fae069dac2aff8(@cloudflare/workers-types@4.20260130.0)':
+  '@pantainos/mcp-core@git+https://git@github.com:Pantainos-Toolkit/mcp-core.git#49af8071ea6b94eb119a96fc7b72c6120088e6d4(@cloudflare/workers-types@4.20260130.0)':
     dependencies:
       '@cloudflare/workers-types': 4.20260130.0
       '@modelcontextprotocol/sdk': 1.25.3(hono@4.11.7)(zod@3.25.76)
       hono: 4.11.7
       zod: 3.25.76
+      zod-to-json-schema: 3.25.1(zod@3.25.76)
     transitivePeerDependencies:
       - '@cfworker/json-schema'
       - supports-color
