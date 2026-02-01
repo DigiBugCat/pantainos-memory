@@ -27,9 +27,9 @@ output "kv_namespace_id" {
   value       = cloudflare_workers_kv_namespace.oauth.id
 }
 
-output "queue_id" {
-  description = "Queue ID"
-  value       = cloudflare_queue.detection.id
+output "queue_name" {
+  description = "Queue name"
+  value       = local.queue_name
 }
 
 # CF Access
@@ -51,4 +51,16 @@ output "vectorize_indexes" {
     invalidates = local.vectorize_invalidates
     confirms    = local.vectorize_confirms
   }
+}
+
+# Service Token for MCP access
+output "mcp_service_token_id" {
+  description = "CF Access service token ID for MCP"
+  value       = cloudflare_zero_trust_access_service_token.mcp.client_id
+}
+
+output "mcp_service_token_secret" {
+  description = "CF Access service token secret for MCP"
+  value       = cloudflare_zero_trust_access_service_token.mcp.client_secret
+  sensitive   = true
 }

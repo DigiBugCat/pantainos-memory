@@ -27,7 +27,7 @@ import type { LoggingEnv } from '../lib/shared/hono/index.js';
 
 // Service imports for direct calls
 import { generateId } from '../lib/id.js';
-import { generateEmbedding, searchSimilar } from '../lib/embeddings.js';
+import { generateEmbedding, searchSimilar, checkDuplicate, checkDuplicateWithLLM } from '../lib/embeddings.js';
 import { storeObservationEmbeddings, storeAssumptionEmbeddings } from '../services/embedding-tables.js';
 import { recordVersion } from '../services/history-service.js';
 import { recordAccessBatch } from '../services/access-service.js';
@@ -47,6 +47,91 @@ type Variables = {
 
 /** Valid observation sources */
 const VALID_SOURCES = ['market', 'news', 'earnings', 'email', 'human', 'tool'] as const;
+
+// ============================================
+// Text Formatting Helpers (human-readable output)
+// ============================================
+
+/** Format a memory for display - compact single-line format */
+function formatMemory(m: { id: string; content: string; memory_type?: string; state?: string; exposures?: number; confirmations?: number }): string {
+  const stateIcon = m.state === 'violated' ? ' ⚠️' : m.state === 'confirmed' ? ' ✓' : '';
+  const confidence = m.exposures && m.exposures > 0
+    ? ` (${Math.round((m.confirmations || 0) / m.exposures * 100)}% conf, ${m.exposures} tests)`
+    : '';
+  return `[${m.id}] ${m.content}${stateIcon}${confidence}`;
+}
+
+/** Format search results */
+function formatFindResults(results: Array<{ memory: { id: string; content: string; memory_type: string; state?: string }; similarity: number; confidence: number }>, query: string): string {
+  if (results.length === 0) return `No results for "${query}"`;
+
+  const lines = results.map((r, i) => {
+    const sim = Math.round(r.similarity * 100);
+    const conf = Math.round(r.confidence * 100);
+    const stateIcon = r.memory.state === 'violated' ? ' ⚠️' : r.memory.state === 'confirmed' ? ' ✓' : '';
+    return `${i + 1}. [${r.memory.id}] ${r.memory.content}${stateIcon}\n   sim:${sim}% conf:${conf}%`;
+  });
+
+  return `Found ${results.length} for "${query}":\n\n${lines.join('\n\n')}`;
+}
+
+/** Format recall result */
+function formatRecall(memory: MemoryRow, connections: Array<{ target_id: string; strength: number }>): string {
+  const m = rowToMemory(memory);
+  const stateIcon = m.state === 'violated' ? ' ⚠️ VIOLATED' : m.state === 'confirmed' ? ' ✓ CONFIRMED' : '';
+  const confidence = m.exposures > 0
+    ? `${Math.round(m.confirmations / m.exposures * 100)}% (${m.confirmations}/${m.exposures})`
+    : 'untested';
+
+  let text = `[${m.id}] ${m.content}\n\n`;
+  text += `Type: ${m.memory_type} | State: ${m.state}${stateIcon} | Confidence: ${confidence}\n`;
+
+  if (m.memory_type === 'obs' && m.source) {
+    text += `Source: ${m.source}\n`;
+  }
+
+  if (m.violations && m.violations.length > 0) {
+    text += `\n⚠️ Violations:\n`;
+    m.violations.forEach((v: { condition: string; obs_id: string }) => {
+      text += `  - "${v.condition}" (by ${v.obs_id})\n`;
+    });
+  }
+
+  if (connections.length > 0) {
+    text += `\n🔗 Connections: ${connections.map(c => `[${c.target_id}]`).join(', ')}`;
+  }
+
+  return text;
+}
+
+/** Format insights results */
+function formatInsights(view: string, memories: MemoryRow[]): string {
+  if (memories.length === 0) return `No memories in "${view}" view`;
+
+  const lines = memories.map(row => {
+    const m = rowToMemory(row);
+    return formatMemory(m);
+  });
+
+  return `=== ${view.toUpperCase()} ===\n\n${lines.join('\n')}`;
+}
+
+/** Format pending predictions */
+function formatPending(memories: Array<{ id: string; content: string; resolves_by?: number }>): string {
+  if (memories.length === 0) return 'No pending time-bound assumptions';
+
+  const lines = memories.map(m => {
+    const deadline = m.resolves_by ? new Date(m.resolves_by).toISOString().split('T')[0] : 'no deadline';
+    return `[${m.id}] ${m.content}\n   Resolves by: ${deadline}`;
+  });
+
+  return `=== PENDING RESOLUTION ===\n\n${lines.join('\n\n')}`;
+}
+
+/** Text result wrapper */
+function textResult(text: string) {
+  return { content: [{ type: 'text' as const, text }] };
+}
 
 // ============================================
 // Tool Definitions
@@ -74,6 +159,32 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
       if (!VALID_SOURCES.includes(source as typeof VALID_SOURCES[number])) {
         return errorResult(`source must be one of: ${VALID_SOURCES.join(', ')}`);
+      }
+
+      // Generate embedding first for duplicate check
+      const embedding = await generateEmbedding(ctx.env.AI, content, config, requestId);
+
+      // Check for duplicates
+      const dupCheck = await checkDuplicate(ctx.env, embedding, requestId);
+      if (dupCheck.id && dupCheck.similarity >= config.dedupThreshold) {
+        // High confidence duplicate
+        const existing = await ctx.env.DB.prepare(
+          `SELECT content FROM memories WHERE id = ?`
+        ).bind(dupCheck.id).first<{ content: string }>();
+
+        return textResult(`⚠️ DUPLICATE DETECTED (${Math.round(dupCheck.similarity * 100)}% match)\n\nExisting: [${dupCheck.id}] ${existing?.content || '(not found)'}\n\nNew (skipped): ${content}`);
+      } else if (dupCheck.id && dupCheck.similarity >= config.dedupLowerThreshold) {
+        // Borderline - use LLM to decide
+        const existing = await ctx.env.DB.prepare(
+          `SELECT content FROM memories WHERE id = ?`
+        ).bind(dupCheck.id).first<{ content: string }>();
+
+        if (existing) {
+          const llmResult = await checkDuplicateWithLLM(ctx.env.AI, content, existing.content, config, requestId);
+          if (llmResult.isDuplicate && llmResult.confidence >= config.dedupConfidenceThreshold) {
+            return textResult(`⚠️ DUPLICATE DETECTED (LLM: ${Math.round(llmResult.confidence * 100)}% confidence)\n\nExisting: [${dupCheck.id}] ${existing.content}\n\nNew (skipped): ${content}\n\nReason: ${llmResult.reasoning}`);
+          }
+        }
       }
 
       const now = Date.now();
@@ -118,12 +229,13 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         requestId,
       });
 
-      // Generate embedding and store
-      const { embedding } = await storeObservationEmbeddings(ctx.env, ctx.env.AI, config, {
+      // Store embedding (already generated for dedup check)
+      await storeObservationEmbeddings(ctx.env, ctx.env.AI, config, {
         id,
         content,
         source,
         requestId,
+        embedding, // reuse pre-generated embedding
       });
 
       // Queue exposure check
@@ -139,11 +251,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
       await ctx.env.DETECTION_QUEUE.send(exposureJob);
 
-      return jsonResult({
-        success: true,
-        id,
-        exposure_check: 'queued',
-      });
+      return textResult(`✓ Observed [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}`);
     },
   }),
 
@@ -206,6 +314,30 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         const foundIds = new Set(sources.results?.map((r) => r.id) || []);
         const missing = derived_from.filter((id) => !foundIds.has(id));
         return errorResult(`Source memories not found: ${missing.join(', ')}`);
+      }
+
+      // Generate embedding first for duplicate check
+      const embedding = await generateEmbedding(ctx.env.AI, content, config, requestId);
+
+      // Check for duplicates
+      const dupCheck = await checkDuplicate(ctx.env, embedding, requestId);
+      if (dupCheck.id && dupCheck.similarity >= config.dedupThreshold) {
+        const existing = await ctx.env.DB.prepare(
+          `SELECT content FROM memories WHERE id = ?`
+        ).bind(dupCheck.id).first<{ content: string }>();
+
+        return textResult(`⚠️ DUPLICATE DETECTED (${Math.round(dupCheck.similarity * 100)}% match)\n\nExisting: [${dupCheck.id}] ${existing?.content || '(not found)'}\n\nNew (skipped): ${content}`);
+      } else if (dupCheck.id && dupCheck.similarity >= config.dedupLowerThreshold) {
+        const existing = await ctx.env.DB.prepare(
+          `SELECT content FROM memories WHERE id = ?`
+        ).bind(dupCheck.id).first<{ content: string }>();
+
+        if (existing) {
+          const llmResult = await checkDuplicateWithLLM(ctx.env.AI, content, existing.content, config, requestId);
+          if (llmResult.isDuplicate && llmResult.confidence >= config.dedupConfidenceThreshold) {
+            return textResult(`⚠️ DUPLICATE DETECTED (LLM: ${Math.round(llmResult.confidence * 100)}% confidence)\n\nExisting: [${dupCheck.id}] ${existing.content}\n\nNew (skipped): ${content}\n\nReason: ${llmResult.reasoning}`);
+          }
+        }
       }
 
       const now = Date.now();
@@ -274,7 +406,8 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
       });
 
       // Store embeddings
-      const { embedding } = await storeAssumptionEmbeddings(ctx.env, ctx.env.AI, config, {
+      // Store embeddings (reuse pre-computed embedding for content)
+      await storeAssumptionEmbeddings(ctx.env, ctx.env.AI, config, {
         id,
         content,
         invalidates_if,
@@ -282,6 +415,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         assumes,
         resolves_by,
         requestId,
+        embedding, // reuse pre-generated embedding
       });
 
       // Queue exposure check if conditions defined
@@ -305,12 +439,8 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         await ctx.env.DETECTION_QUEUE.send(exposureJob);
       }
 
-      return jsonResult({
-        success: true,
-        id,
-        time_bound: timeBound,
-        exposure_check: hasConditions ? 'queued' : 'skipped',
-      });
+      const typeLabel = timeBound ? 'Predicted' : 'Assumed';
+      return textResult(`✓ ${typeLabel} [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}\n\nDerived from: ${derived_from.map(d => `[${d}]`).join(', ')}`);
     },
   }),
 
@@ -389,18 +519,11 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         await recordAccessBatch(ctx.env.DB, accessEvents);
       }
 
-      return jsonResult({
-        results: results.map(r => ({
-          id: r.memory.id,
-          content: r.memory.content,
-          type: r.memory.memory_type,
-          score: r.score,
-          similarity: r.similarity,
-          confidence: r.confidence,
-        })),
-        query,
-        total: results.length,
-      });
+      return textResult(formatFindResults(results.map(r => ({
+        memory: { id: r.memory.id, content: r.memory.content, memory_type: r.memory.memory_type, state: r.memory.state },
+        similarity: r.similarity,
+        confidence: r.confidence,
+      })), query));
     },
   }),
 
@@ -425,17 +548,12 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         return errorResult(`Memory not found: ${memory_id}`);
       }
 
-      const memory = rowToMemory(row);
-
       // Get connected memories
       const edges = await ctx.env.DB.prepare(
         `SELECT target_id, strength FROM edges WHERE source_id = ?`
       ).bind(memory_id).all<{ target_id: string; strength: number }>();
 
-      return jsonResult({
-        memory,
-        connections: edges.results || [],
-      });
+      return textResult(formatRecall(row, edges.results || []));
     },
   }),
 
@@ -461,14 +579,12 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         'SELECT COUNT(*) as count FROM edges'
       ).first<{ count: number }>();
 
-      return jsonResult({
-        memories: {
-          obs: counts.obs || 0,
-          assumption: counts.assumption || 0,
-          total: Object.values(counts).reduce((a, b) => (a as number) + (b as number), 0),
-        },
-        edges: edgeCount?.count || 0,
-      });
+      const obsCount = counts.obs || 0;
+      const assumptionCount = counts.assumption || 0;
+      const total = obsCount + assumptionCount;
+      const edges = edgeCount?.count || 0;
+
+      return textResult(`📊 Memory Stats\nObservations: ${obsCount}\nAssumptions: ${assumptionCount}\nTotal: ${total}\nConnections: ${edges}`);
     },
   }),
 
@@ -503,16 +619,11 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
       const results = await ctx.env.DB.prepare(query).all<MemoryRow>();
 
-      return jsonResult({
-        pending: (results.results || []).map(row => ({
-          id: row.id,
-          content: row.content,
-          type: row.memory_type,
-          resolves_by: row.resolves_by,
-          created_at: row.created_at,
-        })),
-        total: results.results?.length || 0,
-      });
+      return textResult(formatPending((results.results || []).map(row => ({
+        id: row.id,
+        content: row.content,
+        resolves_by: row.resolves_by ?? undefined,
+      }))));
     },
   }),
 
@@ -585,18 +696,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
       const results = await ctx.env.DB.prepare(query).all<MemoryRow>();
 
-      return jsonResult({
-        view: view || 'recent',
-        memories: (results.results || []).map(row => ({
-          id: row.id,
-          content: row.content,
-          type: row.memory_type,
-          exposures: row.exposures,
-          confirmations: row.confirmations,
-          created_at: row.created_at,
-        })),
-        total: results.results?.length || 0,
-      });
+      return textResult(formatInsights(view || 'recent', results.results || []));
     },
   }),
 
@@ -738,11 +838,19 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
       await traverse(memory_id, 0, direction);
 
-      return jsonResult({
-        root: memory_id,
-        nodes: Array.from(nodes.values()),
-        edges,
-      });
+      const nodeList = Array.from(nodes.values());
+      if (nodeList.length === 0) {
+        return textResult(`[${memory_id}] has no ${direction === 'up' ? 'ancestors' : direction === 'down' ? 'descendants' : 'connections'}`);
+      }
+
+      const lines = nodeList.map(n => `[${n.id}] ${n.content}`);
+      const edgeLines = edges.map(e => `  ${e.source} → ${e.target}`);
+
+      let text = `=== ${direction.toUpperCase()} from [${memory_id}] ===\n\n`;
+      text += lines.join('\n') + '\n\n';
+      text += `Edges:\n${edgeLines.join('\n')}`;
+
+      return textResult(text);
     },
   }),
 
@@ -772,19 +880,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
       // If already an observation, return itself
       if (memory.memory_type === 'obs') {
-        return jsonResult({
-          memory: {
-            id: memory_id,
-            type: 'obs',
-            content: memory.content,
-          },
-          roots: [{
-            id: memory_id,
-            content: memory.content,
-            type: 'obs',
-          }],
-          pathDepth: 0,
-        });
+        return textResult(`[${memory_id}] is already an observation (ground truth)\n\n${memory.content}`);
       }
 
       // Trace to roots
@@ -841,15 +937,17 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
       await traceToRoots(memory_id, 0);
 
-      return jsonResult({
-        memory: {
-          id: memory_id,
-          type: memory.memory_type,
-          content: memory.content,
-        },
-        roots,
-        pathDepth: maxDepth,
-      });
+      if (roots.length === 0) {
+        return textResult(`[${memory_id}] has no traceable roots (orphan assumption)`);
+      }
+
+      const rootLines = roots.map(r => `[${r.id}] ${r.content}`);
+      let text = `=== ROOTS of [${memory_id}] (depth: ${maxDepth}) ===\n\n`;
+      text += `Source: ${memory.content.substring(0, 100)}...\n\n`;
+      text += `Grounded in ${roots.length} observation(s):\n\n`;
+      text += rootLines.join('\n');
+
+      return textResult(text);
     },
   }),
 
@@ -941,10 +1039,12 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         });
       }
 
-      return jsonResult({
-        bridges,
-        inputIds: memory_ids,
-      });
+      if (bridges.length === 0) {
+        return textResult(`No bridges found between ${memory_ids.map(id => `[${id}]`).join(' and ')}`);
+      }
+
+      const lines = bridges.map((b, i) => `${i + 1}. [${b.id}] ${b.content}\n   relevance: ${Math.round(b.relevanceScore * 100)}%`);
+      return textResult(`=== BRIDGES between ${memory_ids.map(id => `[${id}]`).join(' & ')} ===\n\n${lines.join('\n\n')}`);
     },
   }),
 ]);

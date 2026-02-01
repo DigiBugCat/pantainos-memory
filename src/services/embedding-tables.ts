@@ -88,10 +88,11 @@ export async function storeObservationEmbeddings(
     content: string;
     source: string;
     requestId?: string;
+    embedding?: number[]; // Optional pre-computed embedding (for dedup optimization)
   }
 ): Promise<{ embedding: number[] }> {
-  // Generate embedding for content
-  const embedding = await generateEmbedding(ai, params.content, config, params.requestId);
+  // Use pre-computed embedding or generate new one
+  const embedding = params.embedding ?? await generateEmbedding(ai, params.content, config, params.requestId);
 
   // Store in memory vectors
   // Note: Using 'as any' for Vectorize metadata type compatibility
@@ -129,6 +130,7 @@ export async function storeAssumptionEmbeddings(
     assumes?: string[];
     resolves_by?: number;
     requestId?: string;
+    embedding?: number[]; // Optional pre-computed embedding (for dedup optimization)
   }
 ): Promise<{
   embedding: number[];
@@ -139,8 +141,8 @@ export async function storeAssumptionEmbeddings(
   const confirmsEmbeddings: number[][] = [];
   const timeBound = params.resolves_by !== undefined;
 
-  // Generate embedding for content
-  const embedding = await generateEmbedding(ai, params.content, config, params.requestId);
+  // Use pre-computed embedding or generate new one
+  const embedding = params.embedding ?? await generateEmbedding(ai, params.content, config, params.requestId);
 
   // Store content in memory vectors
   await env.MEMORY_VECTORS.upsert([

@@ -119,55 +119,6 @@ app.get('/', (c) => {
 });
 
 // ============================================
-// MCP Streamable HTTP at root POST /
-// ============================================
-
-app.post('/', async (c) => {
-  logField(c, 'transport', 'streamable_http');
-  const tokenData = await validateAccessToken(c.req.raw, c.env);
-
-  if (!tokenData) {
-    logField(c, 'auth_result', 'no_token');
-    const issuer = getIssuerUrl(c);
-    return new Response('Unauthorized', {
-      status: 401,
-      headers: {
-        'WWW-Authenticate': `Bearer resource_metadata="${issuer}/.well-known/oauth-protected-resource"`,
-        'Content-Type': 'text/plain',
-        'Access-Control-Allow-Origin': '*',
-      },
-    });
-  }
-
-  logField(c, 'auth_email', tokenData.email);
-
-  const body = await c.req.text();
-
-  let message;
-  try {
-    message = JSON.parse(body);
-    logField(c, 'mcp_method', message.method);
-    logField(c, 'mcp_id', message.id);
-  } catch {
-    logField(c, 'parse_error', true);
-    return c.json({
-      jsonrpc: '2.0',
-      error: { code: -32700, message: 'Parse error' },
-    }, 400);
-  }
-
-  const { handleMCPMessage } = await import('./routes/mcp.js');
-  const response = await handleMCPMessage(message, tokenData.email, c.env);
-
-  if (!response) {
-    logField(c, 'mcp_notification', true);
-    return new Response(null, { status: 202 });
-  }
-
-  return c.json(response);
-});
-
-// ============================================
 // OAuth 2.0 Endpoints
 // ============================================
 
@@ -275,9 +226,9 @@ app.use('/mcp/*', async (c, next) => {
     return;
   }
 
-  // Fallback to CF Access service token
-  const serviceTokenId = c.req.header('CF-Access-Client-Id');
-  if (serviceTokenId) {
+  // Fallback to CF Access service token (check JWT assertion header set by CF Access)
+  const cfAccessJwt = c.req.header('Cf-Access-Jwt-Assertion');
+  if (cfAccessJwt) {
     logField(c, 'auth_method', 'cf_access_service_token');
     await next();
     return;
