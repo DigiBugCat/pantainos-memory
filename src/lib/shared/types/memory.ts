@@ -313,6 +313,8 @@ export interface ObserveResponse {
   id: string;
   /** Async exposure checking status */
   exposure_check: 'queued';
+  /** Classification challenge (only present if challenge triggered) */
+  challenge?: ClassificationChallenge;
 }
 
 /** Response from assume endpoint */
@@ -321,6 +323,8 @@ export interface AssumptionResponse {
   id: string;
   /** Whether this is a time-bound assumption (has resolves_by) */
   time_bound: boolean;
+  /** Classification challenge (only present if challenge triggered) */
+  challenge?: ClassificationChallenge;
 }
 
 /** @deprecated Use AssumptionResponse - kept for migration */
@@ -661,4 +665,79 @@ export interface MemoryStatsResponse {
 export interface TagInfo {
   name: string;
   count: number;
+}
+
+// ============================================
+// Reclassify Types
+// ============================================
+
+/** Request to reclassify an assumption as an observation */
+export interface ReclassifyToObservationRequest {
+  /** Source of the observation (required) */
+  source: ObservationSource;
+  /** Reason for reclassification (required) */
+  reason: string;
+}
+
+/** Response from reclassify-to-observation endpoint */
+export interface ReclassifyToObservationResponse {
+  success: true;
+  memory_id: string;
+  previous_type: 'assumption';
+  new_type: 'obs';
+  source: ObservationSource;
+  /** Number of incoming derived_from edges removed */
+  edges_removed: number;
+}
+
+/** Request to reclassify an observation as an assumption */
+export interface ReclassifyToAssumptionRequest {
+  /** Source memory IDs this assumption is based on (required) */
+  derived_from: string[];
+  /** Reason for reclassification (required) */
+  reason: string;
+  /** Conditions that would prove this wrong */
+  invalidates_if?: string[];
+  /** Conditions that would strengthen this */
+  confirms_if?: string[];
+  /** Unix timestamp deadline for time-bound assumptions */
+  resolves_by?: number;
+  /** What determines success/failure (required if resolves_by set) */
+  outcome_condition?: string;
+}
+
+/** Response from reclassify-to-assumption endpoint */
+export interface ReclassifyToAssumptionResponse {
+  success: true;
+  memory_id: string;
+  previous_type: 'obs';
+  new_type: 'assumption';
+  derived_from: string[];
+  /** Whether this is a time-bound assumption */
+  time_bound: boolean;
+  /** Number of edges created */
+  edges_created: number;
+}
+
+// ============================================
+// Classification Challenge Types
+// ============================================
+
+/** Classification challenge suggestion */
+export interface ClassificationChallenge {
+  /** Suggested correct type */
+  suggested_type: MemoryType;
+  /** Confidence in the suggestion (0-1) */
+  confidence: number;
+  /** Explanation for the suggestion */
+  reasoning: string;
+  /** Suggested fields if reclassifying */
+  suggested_fields?: {
+    /** If suggesting obs */
+    source?: ObservationSource;
+    /** If suggesting assumption */
+    derived_from?: string[];
+    /** If suggesting assumption */
+    invalidates_if?: string[];
+  };
 }

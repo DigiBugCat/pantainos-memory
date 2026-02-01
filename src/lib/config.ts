@@ -71,6 +71,16 @@ export interface Config {
     maxConnectBatch: number;
     maxCombineBatch: number;
   };
+
+  // Classification challenge (AI-powered type checking)
+  classification: {
+    /** Enable AI-powered classification challenges (default: false) */
+    challengeEnabled: boolean;
+    /** Model to use for classification analysis */
+    challengeModel: string;
+    /** Confidence threshold to trigger challenge (0-1, default: 0.7) */
+    challengeThreshold: number;
+  };
 }
 
 /**
@@ -186,6 +196,13 @@ export function getConfig(env: Record<string, string | undefined>): Config {
       maxDeleteBatch: parseInt_(env.BULK_MAX_DELETE, 100, 1, 1000, 'BULK_MAX_DELETE'),
       maxConnectBatch: parseInt_(env.BULK_MAX_CONNECT, 20, 2, 100, 'BULK_MAX_CONNECT'),
       maxCombineBatch: parseInt_(env.BULK_MAX_COMBINE, 10, 2, 50, 'BULK_MAX_COMBINE'),
+    },
+
+    // Classification challenge (AI-powered type checking)
+    classification: {
+      challengeEnabled: env.CLASSIFICATION_CHALLENGE_ENABLED === 'true',
+      challengeModel: env.CLASSIFICATION_CHALLENGE_MODEL || '@cf/openai/gpt-oss-20b',
+      challengeThreshold: parseNumber(env.CLASSIFICATION_CHALLENGE_THRESHOLD, 0.7, 0.3, 1.0, 'CLASSIFICATION_CHALLENGE_THRESHOLD'),
     },
   };
 }

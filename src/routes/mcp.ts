@@ -34,6 +34,7 @@ import { recordAccessBatch } from '../services/access-service.js';
 import { rowToMemory } from '../lib/transforms.js';
 import { createScoredMemory } from '../lib/scoring.js';
 import { incrementCentrality } from '../services/exposure-checker.js';
+import { challengeClassification, formatChallengeOutput } from '../services/classification-challenge.js';
 
 type Env = BaseEnv & LoggingEnv;
 
@@ -251,7 +252,18 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
       await ctx.env.DETECTION_QUEUE.send(exposureJob);
 
-      return textResult(`✓ Observed [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}`);
+      // Check for classification challenge (feature toggle)
+      let challengeText = '';
+      const challenge = await challengeClassification(ctx.env, ctx.env.AI, config, {
+        content,
+        current_type: 'obs',
+        requestId,
+      });
+      if (challenge) {
+        challengeText = formatChallengeOutput(challenge, 'obs');
+      }
+
+      return textResult(`✓ Observed [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}${challengeText}`);
     },
   }),
 
@@ -439,8 +451,19 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         await ctx.env.DETECTION_QUEUE.send(exposureJob);
       }
 
+      // Check for classification challenge (feature toggle)
+      let challengeText = '';
+      const challenge = await challengeClassification(ctx.env, ctx.env.AI, config, {
+        content,
+        current_type: 'assumption',
+        requestId,
+      });
+      if (challenge) {
+        challengeText = formatChallengeOutput(challenge, 'assumption');
+      }
+
       const typeLabel = timeBound ? 'Predicted' : 'Assumed';
-      return textResult(`✓ ${typeLabel} [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}\n\nDerived from: ${derived_from.map(d => `[${d}]`).join(', ')}`);
+      return textResult(`✓ ${typeLabel} [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}\n\nDerived from: ${derived_from.map(d => `[${d}]`).join(', ')}${challengeText}`);
     },
   }),
 
@@ -1045,6 +1068,280 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
       const lines = bridges.map((b, i) => `${i + 1}. [${b.id}] ${b.content}\n   relevance: ${Math.round(b.relevanceScore * 100)}%`);
       return textResult(`=== BRIDGES between ${memory_ids.map(id => `[${id}]`).join(' & ')} ===\n\n${lines.join('\n\n')}`);
+    },
+  }),
+
+  // ----------------------------------------
+  // Reclassify - Convert between memory types
+  // ----------------------------------------
+
+  defineTool({
+    name: 'reclassify_as_observation',
+    description: 'Convert an assumption to an observation. Use when a belief turns out to be direct factual knowledge from the world. Requires specifying a source for the new observation. Removes incoming derived_from edges since observations are root nodes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        memory_id: { type: 'string', description: 'ID of the assumption to convert' },
+        source: { type: 'string', enum: ['market', 'news', 'earnings', 'email', 'human', 'tool'], description: 'Source of the observation (required)' },
+        reason: { type: 'string', description: 'Why this should be an observation instead of an assumption (required)' },
+      },
+      required: ['memory_id', 'source', 'reason'],
+    },
+    handler: async (args, ctx) => {
+      const { memory_id, source, reason } = args as { memory_id: string; source: string; reason: string };
+
+      if (!VALID_SOURCES.includes(source as typeof VALID_SOURCES[number])) {
+        return errorResult(`source must be one of: ${VALID_SOURCES.join(', ')}`);
+      }
+
+      // Get current memory state
+      const memory = await ctx.env.DB.prepare(
+        `SELECT id, memory_type, content, state, retracted FROM memories WHERE id = ?`
+      ).bind(memory_id).first<{
+        id: string;
+        memory_type: string;
+        content: string;
+        state: string;
+        retracted: number;
+      }>();
+
+      if (!memory) {
+        return errorResult(`Memory not found: ${memory_id}`);
+      }
+
+      if (memory.memory_type !== 'assumption') {
+        return errorResult(`Memory is already type '${memory.memory_type}', not 'assumption'`);
+      }
+
+      if (memory.state !== 'active') {
+        return errorResult(`Cannot reclassify memory with state '${memory.state}'. Only 'active' memories can be reclassified.`);
+      }
+
+      if (memory.retracted === 1) {
+        return errorResult('Cannot reclassify a retracted memory');
+      }
+
+      const now = Date.now();
+
+      // Delete incoming derived_from edges
+      const incomingEdges = await ctx.env.DB.prepare(
+        `SELECT source_id FROM edges WHERE target_id = ? AND edge_type = 'derived_from'`
+      ).bind(memory_id).all<{ source_id: string }>();
+
+      const edgesRemoved = incomingEdges.results?.length || 0;
+
+      // Decrement centrality for each source
+      for (const edge of incomingEdges.results || []) {
+        await ctx.env.DB.prepare(
+          `UPDATE memories SET centrality = MAX(0, centrality - 1), updated_at = ? WHERE id = ?`
+        ).bind(now, edge.source_id).run();
+      }
+
+      // Delete the edges
+      await ctx.env.DB.prepare(
+        `DELETE FROM edges WHERE target_id = ? AND edge_type = 'derived_from'`
+      ).bind(memory_id).run();
+
+      // Update memories table
+      await ctx.env.DB.prepare(
+        `UPDATE memories
+         SET memory_type = 'obs',
+             source = ?,
+             assumes = NULL,
+             invalidates_if = NULL,
+             confirms_if = NULL,
+             outcome_condition = NULL,
+             resolves_by = NULL,
+             updated_at = ?
+         WHERE id = ?`
+      ).bind(source, now, memory_id).run();
+
+      // Update embeddings
+      const { updateMemoryTypeEmbeddings } = await import('../services/embedding-tables.js');
+      await updateMemoryTypeEmbeddings(ctx.env, ctx.env.AI, config, {
+        id: memory_id,
+        content: memory.content,
+        newType: 'obs',
+        source,
+        requestId,
+      });
+
+      // Record version
+      await recordVersion(ctx.env.DB, {
+        entityId: memory_id,
+        entityType: 'obs',
+        changeType: 'reclassified_as_observation',
+        contentSnapshot: {
+          id: memory_id,
+          memory_type: 'obs',
+          content: memory.content,
+          source,
+          previous_type: 'assumption',
+          edges_removed: edgesRemoved,
+        },
+        changeReason: reason,
+        sessionId: ctx.sessionId,
+        requestId,
+      });
+
+      return textResult(`✓ Reclassified [${memory_id}] as observation\n\nPrevious: assumption\nNew: observation (source: ${source})\nEdges removed: ${edgesRemoved}\n\nReason: ${reason}`);
+    },
+  }),
+
+  defineTool({
+    name: 'reclassify_as_assumption',
+    description: 'Convert an observation to an assumption. Use when factual knowledge should actually be treated as a derived belief. Requires specifying what memories this assumption is derived from. Creates derived_from edges to source memories.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        memory_id: { type: 'string', description: 'ID of the observation to convert' },
+        derived_from: { type: 'array', items: { type: 'string' }, description: 'IDs of source memories this assumption is based on (required)' },
+        reason: { type: 'string', description: 'Why this should be an assumption instead of an observation (required)' },
+        invalidates_if: { type: 'array', items: { type: 'string' }, description: 'Conditions that would prove this wrong' },
+        confirms_if: { type: 'array', items: { type: 'string' }, description: 'Conditions that would strengthen this (for time-bound assumptions)' },
+        resolves_by: { type: 'integer', description: 'Unix timestamp deadline for time-bound predictions (optional)' },
+        outcome_condition: { type: 'string', description: 'What determines success/failure (required if resolves_by set)' },
+      },
+      required: ['memory_id', 'derived_from', 'reason'],
+    },
+    handler: async (args, ctx) => {
+      const {
+        memory_id,
+        derived_from,
+        reason,
+        invalidates_if,
+        confirms_if,
+        resolves_by,
+        outcome_condition,
+      } = args as {
+        memory_id: string;
+        derived_from: string[];
+        reason: string;
+        invalidates_if?: string[];
+        confirms_if?: string[];
+        resolves_by?: number;
+        outcome_condition?: string;
+      };
+
+      if (!derived_from || derived_from.length === 0) {
+        return errorResult('derived_from is required and must be a non-empty array');
+      }
+
+      if (derived_from.includes(memory_id)) {
+        return errorResult('derived_from cannot include the memory being reclassified');
+      }
+
+      const timeBound = resolves_by !== undefined;
+      if (timeBound && !outcome_condition) {
+        return errorResult('outcome_condition is required for time-bound assumptions (when resolves_by is set)');
+      }
+
+      // Get current memory state
+      const memory = await ctx.env.DB.prepare(
+        `SELECT id, memory_type, content, retracted FROM memories WHERE id = ?`
+      ).bind(memory_id).first<{
+        id: string;
+        memory_type: string;
+        content: string;
+        retracted: number;
+      }>();
+
+      if (!memory) {
+        return errorResult(`Memory not found: ${memory_id}`);
+      }
+
+      if (memory.memory_type !== 'obs') {
+        return errorResult(`Memory is already type '${memory.memory_type}', not 'obs'`);
+      }
+
+      if (memory.retracted === 1) {
+        return errorResult('Cannot reclassify a retracted memory');
+      }
+
+      // Verify all source IDs exist
+      const placeholders = derived_from.map(() => '?').join(',');
+      const sources = await ctx.env.DB.prepare(
+        `SELECT id FROM memories WHERE id IN (${placeholders}) AND retracted = 0`
+      ).bind(...derived_from).all<{ id: string }>();
+
+      if (!sources.results || sources.results.length !== derived_from.length) {
+        const foundIds = new Set(sources.results?.map((r) => r.id) || []);
+        const missing = derived_from.filter((id) => !foundIds.has(id));
+        return errorResult(`Source memories not found or retracted: ${missing.join(', ')}`);
+      }
+
+      const now = Date.now();
+
+      // Create derived_from edges and increment centrality
+      let edgesCreated = 0;
+      for (const sourceId of derived_from) {
+        const edgeId = generateId('edge');
+        await ctx.env.DB.prepare(
+          `INSERT INTO edges (id, source_id, target_id, edge_type, strength, created_at)
+           VALUES (?, ?, ?, 'derived_from', 1.0, ?)`
+        ).bind(edgeId, sourceId, memory_id, now).run();
+
+        await incrementCentrality(ctx.env.DB, sourceId);
+        edgesCreated++;
+      }
+
+      // Update memories table
+      await ctx.env.DB.prepare(
+        `UPDATE memories
+         SET memory_type = 'assumption',
+             source = NULL,
+             invalidates_if = ?,
+             confirms_if = ?,
+             outcome_condition = ?,
+             resolves_by = ?,
+             updated_at = ?
+         WHERE id = ?`
+      ).bind(
+        invalidates_if ? JSON.stringify(invalidates_if) : null,
+        confirms_if ? JSON.stringify(confirms_if) : null,
+        outcome_condition || null,
+        resolves_by || null,
+        now,
+        memory_id
+      ).run();
+
+      // Update embeddings
+      const { updateMemoryTypeEmbeddings } = await import('../services/embedding-tables.js');
+      await updateMemoryTypeEmbeddings(ctx.env, ctx.env.AI, config, {
+        id: memory_id,
+        content: memory.content,
+        newType: 'assumption',
+        invalidates_if,
+        confirms_if,
+        resolves_by,
+        requestId,
+      });
+
+      // Record version
+      await recordVersion(ctx.env.DB, {
+        entityId: memory_id,
+        entityType: 'assumption',
+        changeType: 'reclassified_as_assumption',
+        contentSnapshot: {
+          id: memory_id,
+          memory_type: 'assumption',
+          content: memory.content,
+          derived_from,
+          invalidates_if,
+          confirms_if,
+          outcome_condition,
+          resolves_by,
+          previous_type: 'obs',
+          edges_created: edgesCreated,
+          time_bound: timeBound,
+        },
+        changeReason: reason,
+        sessionId: ctx.sessionId,
+        requestId,
+      });
+
+      const typeLabel = timeBound ? 'time-bound assumption' : 'assumption';
+      return textResult(`✓ Reclassified [${memory_id}] as ${typeLabel}\n\nPrevious: observation\nNew: ${typeLabel}\nDerived from: ${derived_from.map(d => `[${d}]`).join(', ')}\nEdges created: ${edgesCreated}\n\nReason: ${reason}`);
     },
   }),
 ]);

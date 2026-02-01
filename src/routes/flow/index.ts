@@ -20,6 +20,8 @@ import violateRoute from './violate.js';
 import retractRoute from './retract.js';
 import cascadeEventsRoute from './cascade-events.js';
 import cascadeApplyRoute from './cascade-apply.js';
+import reclassifyToObservationRoute from './reclassify-to-observation.js';
+import reclassifyToAssumptionRoute from './reclassify-to-assumption.js';
 
 type Variables = {
   config: Config;
@@ -52,5 +54,9 @@ app.route('/retract', retractRoute);
 // Cascade routes (for processing cascade events)
 app.route('/cascade', cascadeEventsRoute);
 app.route('/cascade', cascadeApplyRoute);
+
+// Reclassify routes (for converting between memory types)
+app.route('/reclassify-to-observation', reclassifyToObservationRoute);
+app.route('/reclassify-to-assumption', reclassifyToAssumptionRoute);
 
 export default app;

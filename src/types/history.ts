@@ -27,7 +27,9 @@ export type ChangeType =
   | 'violated'
   | 'confirmed'
   | 'retracted'
-  | 'resolved';
+  | 'resolved'
+  | 'reclassified_as_observation'
+  | 'reclassified_as_assumption';
 
 export interface EntityVersion {
   id: string;

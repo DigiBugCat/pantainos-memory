@@ -416,3 +416,125 @@ export async function deleteMemoryEmbeddings(
     await env.CONFIRMS_VECTORS.deleteByIds(confirmIds);
   }
 }
+
+// ============================================
+// Update Operations (for reclassification)
+// ============================================
+
+/**
+ * Update embeddings when a memory's type changes.
+ *
+ * For obs → assumption:
+ * - Update MEMORY_VECTORS metadata to reflect new type
+ * - Add condition embeddings to INVALIDATES_VECTORS and CONFIRMS_VECTORS
+ *
+ * For assumption → obs:
+ * - Update MEMORY_VECTORS metadata to reflect new type
+ * - Delete condition embeddings from INVALIDATES_VECTORS and CONFIRMS_VECTORS
+ */
+export async function updateMemoryTypeEmbeddings(
+  env: Env,
+  ai: Ai,
+  config: Config,
+  params: {
+    id: string;
+    content: string;
+    newType: 'obs' | 'assumption';
+    // For obs:
+    source?: string;
+    // For assumption:
+    invalidates_if?: string[];
+    confirms_if?: string[];
+    resolves_by?: number;
+    requestId?: string;
+  }
+): Promise<void> {
+  // Generate embedding for content (needed for metadata update)
+  const embedding = await generateEmbedding(ai, params.content, config, params.requestId);
+
+  if (params.newType === 'obs') {
+    // Converting to observation
+    // 1. Update MEMORY_VECTORS with obs metadata
+    await env.MEMORY_VECTORS.upsert([
+      {
+        id: params.id,
+        values: embedding,
+        metadata: {
+          type: 'obs',
+          source: params.source,
+          has_invalidates_if: false,
+        } as any,
+      },
+    ]);
+
+    // 2. Delete any condition embeddings (try common indices)
+    const invalidateIds = Array.from({ length: 10 }, (_, i) => `${params.id}:inv:${i}`);
+    const confirmIds = Array.from({ length: 10 }, (_, i) => `${params.id}:conf:${i}`);
+
+    await env.INVALIDATES_VECTORS.deleteByIds(invalidateIds);
+    await env.CONFIRMS_VECTORS.deleteByIds(confirmIds);
+  } else {
+    // Converting to assumption
+    const timeBound = params.resolves_by !== undefined;
+
+    // 1. Update MEMORY_VECTORS with assumption metadata
+    await env.MEMORY_VECTORS.upsert([
+      {
+        id: params.id,
+        values: embedding,
+        metadata: {
+          type: 'assumption',
+          has_invalidates_if: Boolean(params.invalidates_if?.length),
+          has_confirms_if: Boolean(params.confirms_if?.length),
+          has_outcome: timeBound,
+          resolves_by: params.resolves_by,
+          time_bound: timeBound,
+        } as any,
+      },
+    ]);
+
+    // 2. Add invalidates_if condition embeddings
+    if (params.invalidates_if && params.invalidates_if.length > 0) {
+      const conditionVectors = await Promise.all(
+        params.invalidates_if.map(async (condition, index) => {
+          const condEmbedding = await generateEmbedding(ai, condition, config, params.requestId);
+          return {
+            id: `${params.id}:inv:${index}`,
+            values: condEmbedding,
+            metadata: {
+              memory_id: params.id,
+              memory_type: 'assumption',
+              condition_index: index,
+              condition_text: condition,
+              time_bound: timeBound,
+            } as any,
+          };
+        })
+      );
+
+      await env.INVALIDATES_VECTORS.upsert(conditionVectors as any);
+    }
+
+    // 3. Add confirms_if condition embeddings (time-bound only)
+    if (params.confirms_if && params.confirms_if.length > 0) {
+      const conditionVectors = await Promise.all(
+        params.confirms_if.map(async (condition, index) => {
+          const condEmbedding = await generateEmbedding(ai, condition, config, params.requestId);
+          return {
+            id: `${params.id}:conf:${index}`,
+            values: condEmbedding,
+            metadata: {
+              memory_id: params.id,
+              memory_type: 'assumption',
+              condition_index: index,
+              condition_text: condition,
+              time_bound: true,
+            } as any,
+          };
+        })
+      );
+
+      await env.CONFIRMS_VECTORS.upsert(conditionVectors as any);
+    }
+  }
+}
