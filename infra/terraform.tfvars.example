@@ -1,11 +1,12 @@
 # Copy to terraform.tfvars and fill in values
+# Or use: terraform apply -var-file=dev.tfvars
 
-account_id = "6e0f27df112f7601b51fdb6241d6bafe"
+account_id = "your-cloudflare-account-id"
+
+# Environment: dev, staging, or prod
+environment = "dev"
 
 allowed_emails = [
-  "andrew@raftesalo.net",
+  "your-email@example.com",
   # Add more emails as needed
 ]
-
-# Set to true when ready for production
-create_prod = false

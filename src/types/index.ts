@@ -34,11 +34,6 @@ export interface Env extends MCPCoreEnv {
   // Queue for async exposure checking
   DETECTION_QUEUE: Queue<ExposureCheckJob>;
 
-  // Workflows for observable event processing
-  EXPOSURE_CHECK: Workflow;
-  SESSION_DISPATCH: Workflow;
-  INACTIVITY_CRON: Workflow;
-
   // API Key for authentication
   API_KEY?: string;
 

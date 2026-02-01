@@ -5,13 +5,19 @@ variable "account_id" {
   type        = string
 }
 
-variable "allowed_emails" {
-  description = "List of email addresses allowed to access the MCP server"
-  type        = list(string)
+variable "environment" {
+  description = "Environment name (dev, staging, prod)"
+  type        = string
+  default     = "dev"
+
+  validation {
+    condition     = contains(["dev", "staging", "prod"], var.environment)
+    error_message = "Environment must be one of: dev, staging, prod"
+  }
 }
 
-variable "create_prod" {
-  description = "Whether to create production Access application"
-  type        = bool
-  default     = false
+variable "allowed_emails" {
+  description = "List of email addresses allowed to access the API"
+  type        = list(string)
+  default     = []
 }

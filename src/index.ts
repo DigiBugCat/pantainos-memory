@@ -13,7 +13,7 @@ import { createWorkerApp, type LoggingEnv } from './lib/shared/hono/index.js';
 import { createStandaloneLogger, generateContextId, logField } from './lib/shared/logging/index.js';
 import { cors } from 'hono/cors';
 import type { Env as BaseEnv } from './types/index.js';
-import type { ExposureCheckJob } from './lib/shared/types/index.js';
+import type { ExposureCheckJob, ExposureCheckStatus } from './lib/shared/types/index.js';
 import { getConfig, type Config } from './lib/config.js';
 import { authorizeHandler, tokenHandler, registerHandler, validateAccessToken } from '@pantainos/mcp-core';
 
@@ -26,10 +26,20 @@ import experimentsRoutes from './experiments/index.js';
 import mcpRoutes from './routes/mcp.js';
 import internalRoutes from './routes/internal.js';
 
-// Workflow exports (observable event processing)
-export { ExposureCheckWorkflow } from './workflows/ExposureCheckWorkflow.js';
-export { SessionDispatchWorkflow } from './workflows/SessionDispatchWorkflow.js';
-export { InactivityCron } from './workflows/InactivityCron.js';
+// Services for inline processing (no workflows)
+import { checkExposures, checkExposuresForNewAssumption } from './services/exposure-checker.js';
+import {
+  queueSignificantEvent,
+  findInactiveSessions,
+  getPendingEvents,
+  markEventsDispatched,
+} from './services/event-queue.js';
+import {
+  dispatchToResolver,
+  type ViolationEvent,
+  type ConfirmationEvent,
+  type CascadeEvent,
+} from './services/resolver.js';
 
 // Extend Env with LoggingEnv for proper typing
 type Env = BaseEnv & LoggingEnv;
@@ -42,7 +52,7 @@ type Variables = {
   ipHash: string | undefined;
 };
 
-const app = createWorkerApp<Env, Variables>({ serviceName: 'pantainos-memory' });
+const app = createWorkerApp<Env, Variables>({ serviceName: 'memory' });
 
 // Global CORS for MCP/OAuth clients - must be applied to ALL routes
 // This matches the reference implementation pattern
@@ -78,7 +88,7 @@ app.use('*', async (c, next) => {
   if (clientIp) {
     // Simple hash for privacy - not reversible
     const encoder = new TextEncoder();
-    const data = encoder.encode(clientIp + '-pantainos-memory-salt');
+    const data = encoder.encode(clientIp + '-memory-salt');
     const hashBuffer = await crypto.subtle.digest('SHA-256', data);
     const hashArray = Array.from(new Uint8Array(hashBuffer));
     const ipHash = hashArray.slice(0, 8).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -107,9 +117,9 @@ const getIssuerUrl = (c: { env: Env; req: { url: string } }) =>
 app.get('/', (c) => {
   const issuer = getIssuerUrl(c);
   return c.json({
-    name: 'pantainos-memory',
+    name: 'memory',
     version: '2.0.0',
-    description: 'Pantainos Memory MCP Server with OAuth authentication',
+    description: 'Pantainos Memory API with OAuth authentication',
     endpoints: {
       mcp_http: `${issuer}/mcp`,
       oauth_metadata: `${issuer}/.well-known/oauth-authorization-server`,
@@ -448,6 +458,201 @@ app.use('/mcp/*', async (c, next) => {
 });
 app.route('/mcp', mcpRoutes);
 
+// ============================================
+// Helper Functions (inlined from workflows)
+// ============================================
+
+/** Update exposure check status in D1 */
+async function updateExposureCheckStatus(
+  db: D1Database,
+  memoryId: string,
+  status: ExposureCheckStatus
+): Promise<void> {
+  const updates: string[] = ['exposure_check_status = ?', 'updated_at = ?'];
+  const values: (string | number)[] = [status, Date.now()];
+
+  if (status === 'completed') {
+    updates.push('exposure_check_completed_at = ?');
+    values.push(Date.now());
+  }
+
+  values.push(memoryId);
+
+  await db.prepare(`
+    UPDATE memories
+    SET ${updates.join(', ')}
+    WHERE id = ?
+  `).bind(...values).run();
+}
+
+/** Process exposure check for a single job */
+async function processExposureCheck(
+  env: Env,
+  job: ExposureCheckJob,
+  log: ReturnType<typeof createStandaloneLogger>
+): Promise<void> {
+  // Handle legacy job format
+  const legacyJob = job as unknown as Record<string, unknown>;
+  const memoryId = job.memory_id || (legacyJob.observation_id as string);
+  const memoryType = job.memory_type || 'obs';
+  const content = job.content || (legacyJob.observation_content as string);
+
+  log.info('processing_exposure_check', { memory_id: memoryId, memory_type: memoryType });
+
+  // Mark as processing
+  await updateExposureCheckStatus(env.DB, memoryId, 'processing');
+
+  let results;
+
+  if (memoryType === 'obs') {
+    // For observations: check against existing assumptions
+    results = await checkExposures(env, memoryId, content, job.embedding);
+  } else {
+    // For assumptions: check against existing observations
+    const timeBound = job.time_bound ?? false;
+    results = await checkExposuresForNewAssumption(
+      env,
+      memoryId,
+      content,
+      job.invalidates_if || [],
+      job.confirms_if || [],
+      timeBound
+    );
+  }
+
+  // Queue significant events
+  const hasSignificantEvents = results.violations.length > 0 || results.autoConfirmed.length > 0;
+
+  if (hasSignificantEvents) {
+    for (const v of results.violations) {
+      await queueSignificantEvent(env, {
+        session_id: job.session_id,
+        event_type: 'violation',
+        memory_id: v.memory_id,
+        violated_by: memoryType === 'obs' ? memoryId : v.memory_id,
+        damage_level: v.damage_level,
+        context: {
+          condition: v.condition,
+          confidence: v.confidence,
+          condition_type: v.condition_type,
+          check_direction: memoryType === 'obs' ? 'obs_to_assumption' : 'assumption_to_obs',
+          triggering_memory: memoryId,
+        },
+      });
+    }
+
+    for (const c of results.autoConfirmed) {
+      await queueSignificantEvent(env, {
+        session_id: job.session_id,
+        event_type: 'prediction_confirmed',
+        memory_id: c.memory_id,
+        context: {
+          condition: c.condition,
+          confidence: c.confidence,
+        },
+      });
+    }
+  }
+
+  // Mark as completed
+  await updateExposureCheckStatus(env.DB, memoryId, 'completed');
+
+  log.info('exposure_check_complete', {
+    memory_id: memoryId,
+    memory_type: memoryType,
+    violations: results.violations.length,
+    confirmations: results.confirmations.length,
+    auto_confirmed: results.autoConfirmed.length,
+  });
+}
+
+/** Dispatch events for an inactive session */
+async function dispatchSessionEvents(
+  env: Env,
+  sessionId: string,
+  log: ReturnType<typeof createStandaloneLogger>
+): Promise<void> {
+  const events = await getPendingEvents(env, sessionId);
+
+  if (events.length === 0) {
+    return;
+  }
+
+  // Group events by type
+  const violations: ViolationEvent[] = events
+    .filter((e) => e.event_type === 'violation')
+    .map((e) => ({
+      id: e.id,
+      memory_id: e.memory_id,
+      violated_by: e.violated_by,
+      damage_level: e.damage_level,
+      context: JSON.parse(e.context || '{}'),
+    }));
+
+  const confirmations: ConfirmationEvent[] = events
+    .filter((e) => e.event_type === 'prediction_confirmed')
+    .map((e) => ({
+      id: e.id,
+      memory_id: e.memory_id,
+      context: JSON.parse(e.context || '{}'),
+    }));
+
+  const cascades: CascadeEvent[] = events
+    .filter((e) => e.event_type.includes(':cascade_'))
+    .map((e) => {
+      const context = JSON.parse(e.context || '{}');
+      const [, cascadeAction] = e.event_type.split(':cascade_');
+      return {
+        id: e.id,
+        memory_id: e.memory_id,
+        cascade_type: cascadeAction as 'review' | 'boost' | 'damage',
+        memory_type: 'assumption' as const,
+        context: {
+          reason: context.reason || '',
+          source_id: context.source_id || '',
+          source_outcome: context.source_outcome || 'void',
+          edge_type: context.edge_type || '',
+          suggested_action: context.suggested_action || 'review',
+        },
+      };
+    });
+
+  const batchId = `batch-${crypto.randomUUID().slice(0, 8)}`;
+
+  // Dispatch to resolver
+  await dispatchToResolver(env, {
+    batchId,
+    sessionId,
+    violations,
+    confirmations,
+    cascades,
+    summary: {
+      violationCount: violations.length,
+      confirmationCount: confirmations.length,
+      cascadeCount: cascades.length,
+      affectedMemories: [...new Set(events.map((e) => e.memory_id))],
+    },
+  });
+
+  // Mark events as dispatched
+  const eventIds = events.map((e) => e.id);
+  await markEventsDispatched(env, eventIds, batchId);
+
+  log.info('session_dispatch_complete', {
+    session_id: sessionId,
+    batch_id: batchId,
+    event_count: events.length,
+    violations: violations.length,
+    confirmations: confirmations.length,
+    cascades: cascades.length,
+  });
+}
+
+// ============================================
+// Inactivity timeout for session dispatch
+// ============================================
+const INACTIVITY_TIMEOUT_MS = 30_000;
+
 // Export for Cloudflare Workers
 export default {
   fetch: app.fetch,
@@ -468,18 +673,31 @@ export default {
       scheduled_time: new Date(event.scheduledTime).toISOString(),
     });
 
-    // Every minute: Trigger InactivityCron to find sessions with 30s+ inactivity
+    // Every minute: Find inactive sessions and dispatch their events
     if (event.cron === '* * * * *') {
       try {
-        await env.INACTIVITY_CRON.create({
-          id: `inactivity-${event.scheduledTime}`,
-          params: { triggeredAt: event.scheduledTime },
-        });
-        log.info('inactivity_cron_triggered', {
-          scheduled_time: new Date(event.scheduledTime).toISOString(),
-        });
+        const inactiveSessions = await findInactiveSessions(env, INACTIVITY_TIMEOUT_MS);
+
+        if (inactiveSessions.length === 0) {
+          log.info('no_inactive_sessions');
+          return;
+        }
+
+        log.info('found_inactive_sessions', { count: inactiveSessions.length });
+
+        // Dispatch events for each inactive session
+        for (const session of inactiveSessions) {
+          try {
+            await dispatchSessionEvents(env, session.session_id, log);
+          } catch (error) {
+            log.error('session_dispatch_failed', {
+              session_id: session.session_id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
       } catch (error) {
-        log.error('inactivity_cron_failed', {
+        log.error('inactivity_check_failed', {
           error: error instanceof Error ? error.message : String(error),
         });
       }
@@ -493,8 +711,7 @@ export default {
     }
   },
 
-  // Queue consumer for async exposure check jobs
-  // Triggers ExposureCheckWorkflow for each job (observable via CF dashboard)
+  // Queue consumer for async exposure check jobs (inline processing)
   async queue(
     batch: MessageBatch<ExposureCheckJob>,
     env: Env,
@@ -514,23 +731,11 @@ export default {
       const job = message.body;
 
       try {
-        // Trigger workflow instead of processing inline
-        // This gives us full observability in CF dashboard
-        await env.EXPOSURE_CHECK.create({
-          id: `exposure-${job.memory_id}-${Date.now()}`,
-          params: job,
-        });
-
+        // Process exposure check inline (no workflow)
+        await processExposureCheck(env, job, log);
         message.ack();
-
-        log.info('exposure_workflow_triggered', {
-          memory_id: job.memory_id,
-          memory_type: job.memory_type,
-          request_id: job.request_id,
-          session_id: job.session_id,
-        });
       } catch (error) {
-        log.error('exposure_workflow_trigger_failed', {
+        log.error('exposure_check_failed', {
           memory_id: job.memory_id,
           memory_type: job.memory_type,
           request_id: job.request_id,

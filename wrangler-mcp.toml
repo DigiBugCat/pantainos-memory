@@ -1,15 +1,16 @@
-# Pantainos Memory - Zettelkasten Knowledge Graph
+# Pantainos Memory MCP Worker
 #
-# Authentication: MCP OAuth 2.0 backed by Cloudflare Access
-# Configure CF_ACCESS_TEAM and CF_ACCESS_AUD for your Zero Trust application.
+# Separate worker for MCP protocol access.
+# - CF Access provides identity (bypass mode - doesn't block)
+# - MCP OAuth handles the protocol auth flow
+# - Shares D1/Vectorize bindings with API worker
 #
 # Environments:
-#   Local:      pnpm dev (uses dev resources with --remote flag)
-#   Dev:        wrangler deploy --env dev
-#   Production: wrangler deploy
+#   Dev:        wrangler deploy --config wrangler-mcp.toml --env dev
+#   Production: wrangler deploy --config wrangler-mcp.toml
 
-name = "memory"
-main = "src/index.ts"
+name = "memory-mcp"
+main = "src/mcp-index.ts"
 compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
 
@@ -17,18 +18,13 @@ compatibility_flags = ["nodejs_compat"]
 # Production Environment (default)
 # ============================================
 
-# Scheduled Jobs (Cron Triggers)
-[triggers]
-crons = ["* * * * *", "0 3 * * *"]
-
-# D1 Database
+# D1 Database (shared with API worker)
 [[d1_databases]]
 binding = "DB"
 database_name = "memory"
 database_id = "TODO"
-migrations_dir = "migrations"
 
-# Vectorize Indexes (768 dimensions, embeddinggemma-300m)
+# Vectorize Indexes (shared with API worker)
 [[vectorize]]
 binding = "MEMORY_VECTORS"
 index_name = "memory-vectors"
@@ -45,25 +41,15 @@ index_name = "memory-confirms"
 [ai]
 binding = "AI"
 
-# Analytics Engine
-[[analytics_engine_datasets]]
-binding = "ANALYTICS"
-dataset = "memory_prod"
-
 # OAuth KV (for MCP authentication state)
 [[kv_namespaces]]
 binding = "OAUTH_KV"
 id = "TODO"
 
-# Detection Queue
-[[queues.producers]]
-queue = "memory-detection"
-binding = "DETECTION_QUEUE"
-
-[[queues.consumers]]
-queue = "memory-detection"
-max_batch_size = 10
-max_batch_timeout = 5
+# Analytics Engine
+[[analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "memory_mcp_prod"
 
 # Configuration Variables
 [vars]
@@ -78,7 +64,7 @@ RESOLVER_TYPE = "none"
 # Dev Environment
 # ============================================
 [env.dev]
-name = "memory-dev"
+name = "memory-mcp-dev"
 
 [env.dev.ai]
 binding = "AI"
@@ -90,18 +76,18 @@ DEDUP_THRESHOLD = "0.85"
 DEDUP_LOWER_THRESHOLD = "0.70"
 DEDUP_CONFIDENCE_THRESHOLD = "0.8"
 RESOLVER_TYPE = "none"
-# Exposure check thresholds (lower = more sensitive)
 MIN_SIMILARITY = "0.35"
 VIOLATION_CONFIDENCE_THRESHOLD = "0.6"
 CONFIRM_CONFIDENCE_THRESHOLD = "0.7"
 MAX_CANDIDATES = "30"
 
+# D1 Database (shared with API worker)
 [[env.dev.d1_databases]]
 binding = "DB"
 database_name = "memory-dev"
 database_id = "cddfba98-685d-4139-933d-1160a00427c2"
-migrations_dir = "migrations"
 
+# Vectorize Indexes (shared with API worker)
 [[env.dev.vectorize]]
 binding = "MEMORY_VECTORS"
 index_name = "memory-dev-vectors"
@@ -114,25 +100,17 @@ index_name = "memory-dev-invalidates"
 binding = "CONFIRMS_VECTORS"
 index_name = "memory-dev-confirms"
 
-[[env.dev.queues.producers]]
-queue = "memory-dev-detection"
-binding = "DETECTION_QUEUE"
-
-[[env.dev.queues.consumers]]
-queue = "memory-dev-detection"
-max_batch_size = 10
-max_batch_timeout = 5
-
-[[env.dev.analytics_engine_datasets]]
-binding = "ANALYTICS"
-dataset = "memory_dev"
-
-# OAuth KV (for MCP authentication state)
+# OAuth KV (shared with API worker)
 [[env.dev.kv_namespaces]]
 binding = "OAUTH_KV"
 id = "8945fd577d87400c8f14dcfbd354aa88"
 
+# Analytics Engine
+[[env.dev.analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "memory_mcp_dev"
+
 # Local dev server
 [dev]
-port = 8794
+port = 8795
 local_protocol = "http"
