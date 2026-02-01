@@ -1,90 +1,113 @@
 # Pantainos Memory Infrastructure
 
-Terraform/OpenTofu configuration for Cloudflare Access.
+Full infrastructure managed via Terraform/OpenTofu.
 
-## Architecture
+## What Gets Created
 
-Two workers with separated concerns:
-
-| Worker | URL | CF Access | Purpose |
-|--------|-----|-----------|---------|
-| `memory-{env}` | `memory-{env}.pantainos.workers.dev` | **Enforced** | REST API |
-| `memory-mcp-{env}` | `memory-mcp-{env}.pantainos.workers.dev` | Identity-only | MCP protocol |
-
-The MCP worker uses CF Access for user identification but relies on MCP OAuth for actual authentication, avoiding cookie issues with MCP clients.
-
-## Deployment Flow
-
-1. **Deploy workers via wrangler** (handles D1, KV, Queue, Vectorize):
-   ```bash
-   # Build
-   pnpm build
-
-   # Deploy API worker
-   wrangler deploy --env dev
-
-   # Deploy MCP worker
-   wrangler deploy --config wrangler-mcp.toml --env dev
-   ```
-
-2. **Apply CF Access via Terraform**:
-   ```bash
-   cd infra
-   tofu init
-   tofu apply -var="environment=dev"
-   ```
+| Resource | Name Pattern | Purpose |
+|----------|--------------|---------|
+| D1 Database | `memory-{env}` | SQLite storage |
+| KV Namespace | `memory-{env}-oauth` | OAuth state |
+| Queue | `memory-{env}-detection` | Async processing |
+| Vectorize | `memory-{env}-{vectors,invalidates,confirms}` | Embeddings |
+| API Worker | `memory-{env}` | REST API |
+| MCP Worker | `memory-mcp-{env}` | MCP protocol |
+| CF Access (API) | Enforced | Blocks unauthorized |
+| CF Access (MCP) | Bypass | Passes identity only |
 
 ## Prerequisites
 
-**Cloudflare API Token** with permissions:
-- Zero Trust: Edit (for CF Access apps)
-- Account Settings: Read (for identity providers)
+1. **Cloudflare API Token** with permissions:
+   - Workers Scripts: Edit
+   - D1: Edit
+   - Workers KV Storage: Edit
+   - Queues: Edit
+   - Zero Trust: Edit
+   - Analytics Engine: Edit
 
-## Usage
+2. **Build the workers first:**
+   ```bash
+   pnpm build
+   ```
+   This creates `dist/index.js` and `dist/mcp-index.js`.
+
+3. **Create terraform.tfvars:**
+   ```bash
+   cp terraform.tfvars.example terraform.tfvars
+   # Edit with your values
+   ```
+
+## Deployment
 
 ```bash
 cd infra
 
-# Initialize
+# Initialize (first time only)
 tofu init
 
-# Dev environment
+# Build workers
+cd .. && pnpm build && cd infra
+
+# Deploy dev
 tofu apply -var="environment=dev"
 
-# Production
+# Deploy production
 tofu apply -var="environment=prod"
-
-# Destroy
-tofu destroy -var="environment=dev"
 ```
 
-## Using Workspaces
+## Using Workspaces (Recommended)
 
-For managing separate state per environment:
+Workspaces keep state separate per environment:
 
 ```bash
 # Create workspaces
 tofu workspace new dev
 tofu workspace new prod
 
-# Switch and apply
+# Deploy to dev
 tofu workspace select dev
 tofu apply -var="environment=dev"
+
+# Deploy to prod
+tofu workspace select prod
+tofu apply -var="environment=prod"
 ```
 
-## Files
+## Destroying
 
-| File | Purpose |
-|------|---------|
-| `main.tf` | CF Access apps and groups |
-| `variables.tf` | Input variables |
-| `outputs.tf` | AUD values for workers |
-| `terraform.tfvars` | Your config (gitignored) |
+```bash
+# Destroy specific environment
+tofu workspace select dev
+tofu destroy -var="environment=dev"
+```
 
 ## Outputs
 
-After applying, you'll get:
-- `api_url` - API worker URL
-- `mcp_url` - MCP worker URL
-- `cf_access_aud_api` - AUD for API worker (set as secret)
-- `cf_access_aud_mcp` - AUD for MCP worker (set as secret)
+After apply, you'll get:
+- `api_url` - API endpoint (protected by CF Access)
+- `mcp_url` - MCP endpoint (for Claude Code)
+- `d1_database_id` - Database ID
+- `kv_namespace_id` - KV ID
+- `queue_id` - Queue ID
+- `cf_access_aud_api` - AUD for API (if needed for secrets)
+- `cf_access_aud_mcp` - AUD for MCP
+- `vectorize_indexes` - Index names
+
+## MCP Configuration
+
+Add to Claude Code's MCP settings:
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "url": "https://memory-mcp-dev.pantainos.workers.dev/mcp"
+    }
+  }
+}
+```
+
+## Notes
+
+- **Vectorize**: Created via `wrangler` CLI (TF provider doesn't support natively)
+- **D1 Migrations**: Automatically run when `schema.sql` changes
+- **Workers**: Must rebuild (`pnpm build`) before each `tofu apply` if code changed
