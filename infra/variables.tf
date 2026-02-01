@@ -21,3 +21,8 @@ variable "allowed_emails" {
   type        = list(string)
   default     = []
 }
+
+variable "cf_access_team" {
+  description = "Cloudflare Zero Trust team name (subdomain of .cloudflareaccess.com)"
+  type        = string
+}

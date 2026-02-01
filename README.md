@@ -16,7 +16,6 @@ Zettelkasten-style knowledge graph for AI agents. Cloudflare Worker with D1, Vec
 │  /token         - OAuth token exchange                  │
 │                                                          │
 │  Queue Consumer → Exposure Check Workflow               │
-│  Cron Triggers  → Inactivity Detection                  │
 └─────────────────────────────────────────────────────────┘
          │              │                │
          ▼              ▼                ▼
@@ -149,3 +148,29 @@ Each environment creates:
   - `pantainos-memory-{env}-invalidates` - Invalidation conditions
   - `pantainos-memory-{env}-confirms` - Confirmation conditions
 - **Queue**: `pantainos-memory-{env}-detection`
+
+## Event Dispatch
+
+Events (violations, confirmations, cascades) accumulate in the `memory_events` table.
+To dispatch them to your resolver, you need an external scheduler to periodically:
+
+1. Query `/api/events/pending` to check for accumulated events
+2. Call the dispatch endpoint or trigger processing
+
+### Recommended: n8n Workflow
+
+Create an n8n workflow with:
+- **Schedule Trigger**: Every 1-5 minutes
+- **HTTP Request**: GET `https://memory-dev.pantainos.workers.dev/api/events/pending`
+- **IF Node**: Check if `pending > 0`
+- **HTTP Request**: POST to your resolver webhook with the batch
+
+Alternatively use: Temporal, cron jobs, AWS EventBridge, or any scheduler.
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `RESOLVER_TYPE` | `'none'` (default) or `'webhook'` |
+| `RESOLVER_WEBHOOK_URL` | Where to POST event batches |
+| `RESOLVER_WEBHOOK_TOKEN` | Bearer token for auth (optional) |
