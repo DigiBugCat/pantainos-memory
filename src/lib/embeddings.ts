@@ -29,6 +29,60 @@ function getGatewayOptions(config: Config): { gateway: { id: string } } | undefi
 }
 
 /**
+ * Call external LLM endpoint (OpenAI-compatible).
+ * Used when LLM_JUDGE_URL is configured to route LLM calls through n8n or other services.
+ */
+async function callExternalLLM(
+  url: string,
+  prompt: string,
+  apiKey?: string,
+  requestId?: string
+): Promise<string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (apiKey) {
+    headers['Authorization'] = `Bearer ${apiKey}`;
+  }
+  if (requestId) {
+    headers['X-Request-Id'] = requestId;
+  }
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model: 'default', // Let the endpoint decide the model
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.1,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`External LLM call failed: ${response.status} ${response.statusText}`);
+  }
+
+  const data = await response.json() as {
+    choices?: Array<{ message?: { content?: string } }>;
+    content?: string;
+    response?: string;
+    result?: string;
+  };
+
+  // Handle various response formats
+  const content = data.choices?.[0]?.message?.content
+    || data.content
+    || data.response
+    || data.result;
+
+  if (!content) {
+    throw new Error('No content in external LLM response');
+  }
+
+  return content;
+}
+
+/**
  * Generate embedding for text using configured model.
  * Includes retry logic for transient AI service failures.
  */
@@ -102,15 +156,16 @@ export interface LLMDuplicateResult {
 /**
  * Use LLM to determine if two memories are duplicates.
  * Called for borderline embedding similarity cases (0.70-0.85).
+ * If LLM_JUDGE_URL is configured, routes to external endpoint instead of Workers AI.
  */
 export async function checkDuplicateWithLLM(
   ai: Ai,
   contentA: string,
   contentB: string,
   config: Config,
-  requestId?: string
+  requestId?: string,
+  env?: Env
 ): Promise<LLMDuplicateResult> {
-  const model = config.dedupModel;
   const prompt = `Two memories are duplicates ONLY if they record the SAME insight about the SAME specific person/topic. Related themes don't count.
 
 Memory A: ${contentA}
@@ -119,52 +174,59 @@ Memory B: ${contentB}
 
 Respond with ONLY a JSON object (no markdown, no explanation): {"verdict": "duplicate" or "distinct", "confidence": 0.0-1.0, "reasoning": "brief explanation"}`;
 
-  // gpt-oss response type
-  interface GptOssResponse {
-    output?: Array<{
-      type: string;
-      content?: Array<{
-        text?: string;
-        type?: string;
+  let responseContent: string;
+
+  // Use external LLM endpoint if configured
+  if (env?.LLM_JUDGE_URL) {
+    responseContent = await withRetry(
+      () => callExternalLLM(env.LLM_JUDGE_URL!, prompt, env.LLM_JUDGE_API_KEY, requestId),
+      { retries: 2, delay: 100, name: 'checkDuplicateWithLLM_external', requestId }
+    );
+  } else {
+    // Use Workers AI
+    const model = config.dedupModel;
+
+    // gpt-oss response type
+    interface GptOssResponse {
+      output?: Array<{
+        type: string;
+        content?: Array<{
+          text?: string;
+          type?: string;
+        }>;
       }>;
-    }>;
-    response?: string;
-  }
+      response?: string;
+    }
 
-  const response = await withRetry(
-    async () => {
-      const result = await ai.run(
-        model as Parameters<typeof ai.run>[0],
-        { input: prompt } as any,
-        getGatewayOptions(config)
-      ) as GptOssResponse;
-      return result;
-    },
-    { retries: 2, delay: 100, name: 'checkDuplicateWithLLM', requestId }
-  );
+    const response = await withRetry(
+      async () => {
+        const result = await ai.run(
+          model as Parameters<typeof ai.run>[0],
+          { input: prompt } as any,
+          getGatewayOptions(config)
+        ) as GptOssResponse;
+        return result;
+      },
+      { retries: 2, delay: 100, name: 'checkDuplicateWithLLM', requestId }
+    );
 
-  try {
-    let content: string | undefined;
-
-    // gpt-oss models return output array with message content
+    // Extract content from Workers AI response
     if (response.output && Array.isArray(response.output)) {
-      // Find the message output (not reasoning)
       const messageOutput = response.output.find(o => o.type === 'message');
       if (messageOutput?.content?.[0]?.text) {
-        content = messageOutput.content[0].text;
+        responseContent = messageOutput.content[0].text;
       }
     }
-
-    // Fallback to response field for other models
-    if (!content && response.response) {
-      content = response.response;
+    if (!responseContent! && response.response) {
+      responseContent = response.response;
     }
-
-    if (!content) {
+    if (!responseContent!) {
       throw new Error('No content in LLM response');
     }
+  }
 
-    content = content.trim();
+  try {
+    let content = responseContent.trim();
 
     // Handle markdown code blocks if present
     if (content.includes('```')) {
@@ -189,7 +251,7 @@ Respond with ONLY a JSON object (no markdown, no explanation): {"verdict": "dupl
   } catch (e) {
     // Log the raw response for debugging
     getLog().error('llm_parse_failed', {
-      response_preview: JSON.stringify(response).substring(0, 500),
+      response_preview: responseContent.substring(0, 500),
       error: (e as Error).message,
     });
     return {

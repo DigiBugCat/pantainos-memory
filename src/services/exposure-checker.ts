@@ -713,51 +713,93 @@ async function checkConditionMatch(
   }
 
   try {
-    const response = await withRetry(
-      async () => {
-        const model = config.reasoningModel;
-        const isGptOss = model.includes('gpt-oss');
+    let responseText: string;
 
-        // AI Gateway config for observability (optional - gracefully falls back if not configured)
-        const gatewayConfig = getGatewayConfig(config, {
-          operation: 'condition_check',
-          conditionType,
-        });
+    // Use external LLM endpoint if configured
+    if (env.LLM_JUDGE_URL) {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (env.LLM_JUDGE_API_KEY) {
+        headers['Authorization'] = `Bearer ${env.LLM_JUDGE_API_KEY}`;
+      }
 
-        if (isGptOss) {
-          // GPT-OSS uses Responses API format with structured output
-          return await env.AI.run(
-            model as Parameters<typeof env.AI.run>[0],
-            {
-              input: prompt,
-              instructions: 'Return only valid JSON matching the schema',
-              response_format: {
-                type: 'json_schema',
-                json_schema: {
-                  name: 'condition_check',
-                  strict: true,
-                  schema: CONDITION_CHECK_SCHEMA,
-                },
-              },
-            } as Parameters<typeof env.AI.run>[1],
-            gatewayConfig
-          );
-        } else {
-          // Chat completion format for other models
-          return await env.AI.run(
-            model as Parameters<typeof env.AI.run>[0],
-            {
+      const extResponse = await withRetry(
+        async () => {
+          const res = await fetch(env.LLM_JUDGE_URL!, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              model: 'default',
               messages: [{ role: 'user', content: prompt }],
-              max_tokens: 200,
-            } as Parameters<typeof env.AI.run>[1],
-            gatewayConfig
-          );
-        }
-      },
-      { retries: 2, delay: 100 }
-    );
+              temperature: 0.1,
+            }),
+          });
+          if (!res.ok) {
+            throw new Error(`External LLM call failed: ${res.status}`);
+          }
+          return res.json() as Promise<{
+            choices?: Array<{ message?: { content?: string } }>;
+            content?: string;
+            response?: string;
+          }>;
+        },
+        { retries: 2, delay: 100 }
+      );
 
-    const responseText = extractContent(response);
+      responseText = extResponse.choices?.[0]?.message?.content
+        || extResponse.content
+        || extResponse.response
+        || '';
+    } else {
+      // Use Workers AI
+      const response = await withRetry(
+        async () => {
+          const model = config.reasoningModel;
+          const isGptOss = model.includes('gpt-oss');
+
+          // AI Gateway config for observability (optional - gracefully falls back if not configured)
+          const gatewayConfig = getGatewayConfig(config, {
+            operation: 'condition_check',
+            conditionType,
+          });
+
+          if (isGptOss) {
+            // GPT-OSS uses Responses API format with structured output
+            return await env.AI.run(
+              model as Parameters<typeof env.AI.run>[0],
+              {
+                input: prompt,
+                instructions: 'Return only valid JSON matching the schema',
+                response_format: {
+                  type: 'json_schema',
+                  json_schema: {
+                    name: 'condition_check',
+                    strict: true,
+                    schema: CONDITION_CHECK_SCHEMA,
+                  },
+                },
+              } as Parameters<typeof env.AI.run>[1],
+              gatewayConfig
+            );
+          } else {
+            // Chat completion format for other models
+            return await env.AI.run(
+              model as Parameters<typeof env.AI.run>[0],
+              {
+                messages: [{ role: 'user', content: prompt }],
+                max_tokens: 200,
+              } as Parameters<typeof env.AI.run>[1],
+              gatewayConfig
+            );
+          }
+        },
+        { retries: 2, delay: 100 }
+      );
+
+      responseText = extractContent(response);
+    }
+
     return parseConditionResponse(responseText);
   } catch (error) {
     getLog().error('condition_check_failed', { error: error instanceof Error ? error.message : String(error) });

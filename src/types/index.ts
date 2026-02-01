@@ -47,6 +47,11 @@ export interface Env extends MCPCoreEnv {
   CF_ACCOUNT_ID?: string;
   AI_GATEWAY_ID?: string;
 
+  // External LLM endpoint (optional - if set, routes LLM judge calls here instead of Workers AI)
+  // Should be OpenAI-compatible endpoint (e.g., n8n workflow, OpenRouter, etc.)
+  LLM_JUDGE_URL?: string;
+  LLM_JUDGE_API_KEY?: string;
+
   // Configurable via wrangler.toml [vars]
   EMBEDDING_MODEL?: string;
   REASONING_MODEL?: string;

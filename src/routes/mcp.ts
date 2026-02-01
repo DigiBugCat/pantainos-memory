@@ -180,7 +180,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         ).bind(dupCheck.id).first<{ content: string }>();
 
         if (existing) {
-          const llmResult = await checkDuplicateWithLLM(ctx.env.AI, content, existing.content, config, requestId);
+          const llmResult = await checkDuplicateWithLLM(ctx.env.AI, content, existing.content, config, requestId, ctx.env);
           if (llmResult.isDuplicate && llmResult.confidence >= config.dedupConfidenceThreshold) {
             return textResult(`⚠️ DUPLICATE DETECTED (LLM: ${Math.round(llmResult.confidence * 100)}% confidence)\n\nExisting: [${dupCheck.id}] ${existing.content}\n\nNew (skipped): ${content}\n\nReason: ${llmResult.reasoning}`);
           }
@@ -333,7 +333,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         ).bind(dupCheck.id).first<{ content: string }>();
 
         if (existing) {
-          const llmResult = await checkDuplicateWithLLM(ctx.env.AI, content, existing.content, config, requestId);
+          const llmResult = await checkDuplicateWithLLM(ctx.env.AI, content, existing.content, config, requestId, ctx.env);
           if (llmResult.isDuplicate && llmResult.confidence >= config.dedupConfidenceThreshold) {
             return textResult(`⚠️ DUPLICATE DETECTED (LLM: ${Math.round(llmResult.confidence * 100)}% confidence)\n\nExisting: [${dupCheck.id}] ${existing.content}\n\nNew (skipped): ${content}\n\nReason: ${llmResult.reasoning}`);
           }
