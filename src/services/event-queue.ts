@@ -14,27 +14,29 @@ import type { Env } from '../types/index.js';
 
 export type SignificantEventType =
   | 'violation'
-  | 'assumption_confirmed'
-  | 'assumption_resolved'
-  | 'assumption:cascade_review'
-  | 'assumption:cascade_boost'
-  | 'assumption:cascade_damage'
+  | 'thought_confirmed'
+  | 'thought_resolved'
+  | 'thought:cascade_review'
+  | 'thought:cascade_boost'
+  | 'thought:cascade_damage'
   // Upward propagation events (evidence validated/invalidated in upstream memories)
-  | 'assumption:evidence_validated'
-  | 'assumption:evidence_invalidated'
+  | 'thought:evidence_validated'
+  | 'thought:evidence_invalidated'
   // Legacy event types (for migration compatibility)
   | 'prediction_confirmed'
   | 'prediction_resolved'
-  | 'inference:cascade_review'
-  | 'inference:cascade_boost'
-  | 'inference:cascade_damage'
+  | 'assumption_confirmed'
+  | 'assumption_resolved'
   | 'prediction:cascade_review'
   | 'prediction:cascade_boost'
   | 'prediction:cascade_damage'
-  | 'inference:evidence_validated'
-  | 'inference:evidence_invalidated'
+  | 'assumption:cascade_review'
+  | 'assumption:cascade_boost'
+  | 'assumption:cascade_damage'
   | 'prediction:evidence_validated'
-  | 'prediction:evidence_invalidated';
+  | 'prediction:evidence_invalidated'
+  | 'assumption:evidence_validated'
+  | 'assumption:evidence_invalidated';
 
 export interface SignificantEvent {
   session_id?: string;

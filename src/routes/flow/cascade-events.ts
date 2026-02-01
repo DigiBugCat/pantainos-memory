@@ -6,9 +6,9 @@
  * and need to be applied to related memories.
  *
  * Event types:
- *   - inference:cascade_boost - Derived inference should be boosted
- *   - inference:cascade_damage - Derived inference should be damaged
- *   - inference:cascade_review - Derived inference needs manual review
+ *   - thought:cascade_boost - Derived thought should be boosted
+ *   - thought:cascade_damage - Derived thought should be damaged
+ *   - thought:cascade_review - Derived thought needs manual review
  *   - prediction:cascade_boost - Derived prediction should be boosted
  *   - prediction:cascade_damage - Derived prediction should be damaged
  *   - prediction:cascade_review - Derived prediction needs manual review
@@ -46,15 +46,15 @@ export interface CascadeEventWithContext {
   event_type: string;
   target_memory: {
     id: string;
-    memory_type: string;
+    type: 'observation' | 'thought' | 'prediction';
     content: string;
     state: string;
     confidence: number;
-    exposures: number;
+    times_tested: number;
   };
   source_memory?: {
     id: string;
-    memory_type: string;
+    type: 'observation' | 'thought' | 'prediction';
     content: string;
     outcome: string | null;
   };
@@ -76,15 +76,15 @@ app.get('/events', async (c) => {
 
   // Cascade event types (downstream cascade + upstream evidence propagation)
   const cascadeTypes = [
-    'inference:cascade_boost',
-    'inference:cascade_damage',
-    'inference:cascade_review',
+    'thought:cascade_boost',
+    'thought:cascade_damage',
+    'thought:cascade_review',
     'prediction:cascade_boost',
     'prediction:cascade_damage',
     'prediction:cascade_review',
     // Upward propagation events
-    'inference:evidence_validated',
-    'inference:evidence_invalidated',
+    'thought:evidence_validated',
+    'thought:evidence_invalidated',
     'prediction:evidence_validated',
     'prediction:evidence_invalidated',
   ];
@@ -131,38 +131,54 @@ app.get('/events', async (c) => {
 
     // Get target memory
     const targetMemory = await c.env.DB.prepare(`
-      SELECT id, memory_type, content, state, confirmations, exposures
+      SELECT id, source, derived_from, resolves_by, content, state, confirmations, times_tested
       FROM memories
       WHERE id = ? AND retracted = 0
     `).bind(event.memory_id).first<{
       id: string;
-      memory_type: string;
+      source: string | null;
+      derived_from: string | null;
+      resolves_by: number | null;
       content: string;
       state: string;
       confirmations: number;
-      exposures: number;
+      times_tested: number;
     }>();
 
     if (!targetMemory) continue;
 
-    const confidence = targetMemory.confirmations / Math.max(targetMemory.exposures, 1);
+    const confidence = targetMemory.confirmations / Math.max(targetMemory.times_tested, 1);
+
+    // Derive type from field presence
+    const getDisplayType = (m: { source: string | null; derived_from: string | null; resolves_by: number | null }): 'observation' | 'thought' | 'prediction' => {
+      if (m.source != null) return 'observation';
+      if (m.resolves_by != null) return 'prediction';
+      return 'thought';
+    };
 
     // Get source memory if available
     let sourceMemory: CascadeEventWithContext['source_memory'];
     if (context.source_id) {
       const source = await c.env.DB.prepare(`
-        SELECT id, memory_type, content, outcome
+        SELECT id, source, derived_from, resolves_by, content, outcome
         FROM memories
         WHERE id = ? AND retracted = 0
       `).bind(context.source_id).first<{
         id: string;
-        memory_type: string;
+        source: string | null;
+        derived_from: string | null;
+        resolves_by: number | null;
         content: string;
         outcome: string | null;
       }>();
 
       if (source) {
-        sourceMemory = source;
+        sourceMemory = {
+          id: source.id,
+          type: getDisplayType(source),
+          content: source.content,
+          outcome: source.outcome,
+        };
       }
     }
 
@@ -180,11 +196,11 @@ app.get('/events', async (c) => {
       event_type: event.event_type,
       target_memory: {
         id: targetMemory.id,
-        memory_type: targetMemory.memory_type,
+        type: getDisplayType(targetMemory),
         content: targetMemory.content,
         state: targetMemory.state,
         confidence,
-        exposures: targetMemory.exposures,
+        times_tested: targetMemory.times_tested,
       },
       source_memory: sourceMemory,
       reason: context.reason || 'cascade_propagation',
