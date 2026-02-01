@@ -47,10 +47,10 @@ locals {
   is_prod    = var.environment == "prod"
   env_suffix = local.is_prod ? "" : "-${var.environment}"
 
-  # Resource names
-  api_worker_name = local.is_prod ? "memory" : "memory-${var.environment}"
-  mcp_worker_name = local.is_prod ? "memory-mcp" : "memory-mcp-${var.environment}"
-  d1_name         = local.is_prod ? "memory" : "memory-${var.environment}"
+  # Resource names (base: pantainos-memory)
+  api_worker_name = local.is_prod ? "pantainos-memory" : "pantainos-memory-${var.environment}"
+  mcp_worker_name = local.is_prod ? "pantainos-memory-mcp" : "pantainos-memory-mcp-${var.environment}"
+  d1_name         = local.is_prod ? "pantainos-memory" : "pantainos-memory-${var.environment}"
   kv_name         = "${local.api_worker_name}-oauth"
   queue_name      = "${local.api_worker_name}-detection"
 
@@ -174,7 +174,7 @@ resource "cloudflare_worker_version" "api" {
 
   bindings = concat(local.common_bindings, [
     { type = "queue", name = "DETECTION_QUEUE", queue_name = local.queue_name },
-    { type = "analytics_engine", name = "ANALYTICS", dataset = "memory_api_${var.environment}" },
+    { type = "analytics_engine", name = "ANALYTICS", dataset = "pantainos_memory_api_${var.environment}" },
     { type = "plain_text", name = "CF_ACCESS_AUD", text = cloudflare_zero_trust_access_application.api.aud },
   ])
 
@@ -255,7 +255,7 @@ resource "cloudflare_worker_version" "mcp" {
 
   bindings = concat(local.common_bindings, [
     { type = "queue", name = "DETECTION_QUEUE", queue_name = local.queue_name },
-    { type = "analytics_engine", name = "ANALYTICS", dataset = "memory_mcp_${var.environment}" },
+    { type = "analytics_engine", name = "ANALYTICS", dataset = "pantainos_memory_mcp_${var.environment}" },
     { type = "plain_text", name = "CF_ACCESS_AUD", text = cloudflare_zero_trust_access_application.mcp.aud },
   ])
 
@@ -304,7 +304,7 @@ resource "terraform_data" "d1_migration" {
 
 resource "cloudflare_zero_trust_access_group" "memory_users" {
   account_id = var.account_id
-  name       = "memory-allowed-users${local.env_suffix}"
+  name       = "pantainos-memory-allowed-users${local.env_suffix}"
 
   include = [
     for email in var.allowed_emails : {
@@ -321,7 +321,7 @@ resource "cloudflare_zero_trust_access_group" "memory_users" {
 
 resource "cloudflare_zero_trust_access_application" "api" {
   account_id = var.account_id
-  name       = "Memory API${local.is_prod ? "" : " (${title(var.environment)})"}"
+  name       = "Pantainos Memory API${local.is_prod ? "" : " (${title(var.environment)})"}"
   type       = "self_hosted"
   domain     = local.api_url
 
@@ -365,7 +365,7 @@ resource "cloudflare_zero_trust_access_application" "api" {
 
 resource "cloudflare_zero_trust_access_application" "mcp" {
   account_id = var.account_id
-  name       = "Memory MCP${local.is_prod ? "" : " (${title(var.environment)})"}"
+  name       = "Pantainos Memory MCP${local.is_prod ? "" : " (${title(var.environment)})"}"
   type       = "self_hosted"
 
   # PATH-BASED: Only protect /authorize endpoint
@@ -401,14 +401,14 @@ resource "cloudflare_zero_trust_access_application" "mcp" {
 
 resource "cloudflare_zero_trust_access_service_token" "mcp" {
   account_id = var.account_id
-  name       = "memory-mcp${local.env_suffix}"
+  name       = "pantainos-memory-mcp${local.env_suffix}"
   duration   = "8760h" # 1 year
 }
 
 # CF Access app for /mcp endpoint - allows service tokens
 resource "cloudflare_zero_trust_access_application" "mcp_endpoint" {
   account_id = var.account_id
-  name       = "Memory MCP Endpoint${local.is_prod ? "" : " (${title(var.environment)})"}"
+  name       = "Pantainos Memory MCP Endpoint${local.is_prod ? "" : " (${title(var.environment)})"}"
   type       = "self_hosted"
 
   domain = "${local.mcp_url}/mcp"
