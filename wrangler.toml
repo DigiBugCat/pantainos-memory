@@ -41,7 +41,7 @@ class_name = "InactivityCron"
 [[d1_databases]]
 binding = "DB"
 database_name = "pantainos-memory-prod"
-database_id = "TODO"
+database_id = "cddfba98-685d-4139-933d-1160a00427c2"
 migrations_dir = "migrations"
 
 # Vectorize Indexes (768 dimensions, embeddinggemma-300m)
@@ -130,7 +130,7 @@ class_name = "InactivityCron"
 [[env.dev.d1_databases]]
 binding = "DB"
 database_name = "pantainos-memory-dev"
-database_id = "TODO"
+database_id = "cddfba98-685d-4139-933d-1160a00427c2"
 migrations_dir = "migrations"
 
 [[env.dev.vectorize]]
@@ -161,7 +161,7 @@ dataset = "pantainos_memory_dev"
 # OAuth KV (for MCP authentication state)
 [[env.dev.kv_namespaces]]
 binding = "OAUTH_KV"
-id = "TODO"
+id = "8945fd577d87400c8f14dcfbd354aa88"
 
 # Local dev server
 [dev]

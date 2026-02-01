@@ -93,13 +93,22 @@ pnpm deploy
 | POST | `/mcp` | MCP JSON-RPC endpoint |
 
 **MCP Tools exposed:**
-- `note` - Store a new memory
-- `recall` - Retrieve memory by ID
-- `find` - Semantic search
-- `connect` - Link memories
-- `reference` - Follow memory graph
-- `insights` - Memory statistics
-- ... and more
+
+| Tool | Description |
+|------|-------------|
+| `observe` | Record a fact from reality (immutable observation) |
+| `assume` | Form a derived belief from observations/assumptions |
+| `find` | Semantic search across memories |
+| `recall` | Get a memory by ID with confidence stats |
+| `reference` | Follow derivation graph (ancestors/descendants) |
+| `roots` | Trace assumption back to root observations |
+| `between` | Find memories bridging two given memories |
+| `pending` | List time-bound assumptions past deadline |
+| `insights` | Analyze knowledge graph health |
+| `stats` | Get memory counts |
+
+**Not exposed via MCP** (by design - resolution happens elsewhere):
+- `violate`/`confirm`/`retract` - Manual state changes
 
 ### Internal API (for service bindings)
 

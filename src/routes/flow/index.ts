@@ -7,10 +7,6 @@
  * - /confirm/:id - Manual confirmation
  * - /violate/:id - Manual violation
  * - /retract/:id - Retract an observation
- *
- * Legacy routes (deprecated, for migration):
- * - /infer - Create inference (use /assume without resolves_by)
- * - /predict - Create prediction (use /assume with resolves_by)
  */
 
 import { Hono } from 'hono';
@@ -19,8 +15,6 @@ import type { Env } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
 import observeRoute from './observe.js';
 import assumeRoute from './assume.js';
-import inferRoute from './infer.js';
-import predictRoute from './predict.js';
 import confirmRoute from './confirm.js';
 import violateRoute from './violate.js';
 import retractRoute from './retract.js';
@@ -51,11 +45,6 @@ app.use('*', memoryFieldLimits);
 // Mount flow routes (v4 architecture)
 app.route('/observe', observeRoute);
 app.route('/assume', assumeRoute);
-
-// Legacy routes (deprecated, for migration compatibility)
-app.route('/infer', inferRoute);
-app.route('/predict', predictRoute);
-
 app.route('/confirm', confirmRoute);
 app.route('/violate', violateRoute);
 app.route('/retract', retractRoute);

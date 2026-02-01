@@ -11,7 +11,7 @@
  */
 
 import { Hono } from 'hono';
-import type { Env as BaseEnv, MemoryRow, ScoredMemory, RecordAccessParams, HistoryEntityType } from '../types/index.js';
+import type { Env as BaseEnv, MemoryRow, ScoredMemory, RecordAccessParams, EdgeRow } from '../types/index.js';
 import type { Config } from '../lib/config.js';
 import type { ExposureCheckJob } from '../lib/shared/types/index.js';
 import {
@@ -28,11 +28,12 @@ import type { LoggingEnv } from '../lib/shared/hono/index.js';
 // Service imports for direct calls
 import { generateId } from '../lib/id.js';
 import { generateEmbedding, searchSimilar } from '../lib/embeddings.js';
-import { storeObservationEmbeddings } from '../services/embedding-tables.js';
+import { storeObservationEmbeddings, storeAssumptionEmbeddings } from '../services/embedding-tables.js';
 import { recordVersion } from '../services/history-service.js';
 import { recordAccessBatch } from '../services/access-service.js';
 import { rowToMemory } from '../lib/transforms.js';
 import { createScoredMemory } from '../lib/scoring.js';
+import { incrementCentrality } from '../services/exposure-checker.js';
 
 type Env = BaseEnv & LoggingEnv;
 
@@ -58,12 +59,12 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
   defineTool({
     name: 'observe',
-    description: 'Record an observation from reality. Observations are anchored facts that form the foundation of the knowledge graph.',
+    description: 'Record a fact from reality. Observations are ground truth - immutable anchors that can only be retracted, never edited. When stored, the system automatically checks if this observation contradicts any existing assumptions (triggering violations) or confirms them. Sources: market, news, earnings, email, human, tool.',
     inputSchema: {
       type: 'object',
       properties: {
         content: { type: 'string', description: 'The observation content (what was observed)' },
-        source: { type: 'string', description: 'Source of the observation (market, news, earnings, email, human, tool)' },
+        source: { type: 'string', enum: ['market', 'news', 'earnings', 'email', 'human', 'tool'], description: 'Source of the observation' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for categorization' },
       },
       required: ['content', 'source'],
@@ -147,13 +148,180 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
   }),
 
   defineTool({
+    name: 'assume',
+    description: 'Form a belief derived from observations or other assumptions. Must specify derived_from (source memory IDs) and invalidates_if (conditions that would prove this wrong). Optionally add confirms_if (conditions that would strengthen this). For time-bound predictions, include resolves_by (Unix timestamp) and outcome_condition. The system automatically checks new observations against these conditions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        content: { type: 'string', description: 'The assumption content (the derived belief)' },
+        derived_from: { type: 'array', items: { type: 'string' }, description: 'IDs of source memories this assumption is based on (required)' },
+        invalidates_if: { type: 'array', items: { type: 'string' }, description: 'Conditions that would prove this wrong (tested against new observations)' },
+        confirms_if: { type: 'array', items: { type: 'string' }, description: 'Conditions that would strengthen this (optional)' },
+        assumes: { type: 'array', items: { type: 'string' }, description: 'Underlying assumptions this belief rests on (optional)' },
+        resolves_by: { type: 'integer', description: 'Unix timestamp deadline for time-bound predictions (optional)' },
+        outcome_condition: { type: 'string', description: 'What determines success/failure for time-bound predictions (required if resolves_by set)' },
+        tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for categorization' },
+      },
+      required: ['content', 'derived_from'],
+    },
+    handler: async (args, ctx) => {
+      const {
+        content,
+        derived_from,
+        invalidates_if,
+        confirms_if,
+        assumes,
+        resolves_by,
+        outcome_condition,
+        tags,
+      } = args as {
+        content: string;
+        derived_from: string[];
+        invalidates_if?: string[];
+        confirms_if?: string[];
+        assumes?: string[];
+        resolves_by?: number;
+        outcome_condition?: string;
+        tags?: string[];
+      };
+
+      // Validate derived_from
+      if (!derived_from || derived_from.length === 0) {
+        return errorResult('derived_from is required and must be a non-empty array');
+      }
+
+      // Time-bound validation
+      const timeBound = resolves_by !== undefined;
+      if (timeBound && !outcome_condition) {
+        return errorResult('outcome_condition is required for time-bound assumptions (when resolves_by is set)');
+      }
+
+      // Verify all source IDs exist
+      const placeholders = derived_from.map(() => '?').join(',');
+      const sources = await ctx.env.DB.prepare(
+        `SELECT id FROM memories WHERE id IN (${placeholders}) AND retracted = 0`
+      ).bind(...derived_from).all<{ id: string }>();
+
+      if (!sources.results || sources.results.length !== derived_from.length) {
+        const foundIds = new Set(sources.results?.map((r) => r.id) || []);
+        const missing = derived_from.filter((id) => !foundIds.has(id));
+        return errorResult(`Source memories not found: ${missing.join(', ')}`);
+      }
+
+      const now = Date.now();
+      const id = generateId(timeBound ? 'pred' : 'infer');
+      const sessionId = ctx.sessionId;
+
+      // Store in D1
+      await ctx.env.DB.prepare(
+        `INSERT INTO memories (
+          id, memory_type, content,
+          assumes, invalidates_if, confirms_if,
+          outcome_condition, resolves_by,
+          confirmations, exposures, centrality, state, violations,
+          retracted, tags, session_id, created_at
+        ) VALUES (?, 'assumption', ?, ?, ?, ?, ?, ?, 0, 0, 0, 'active', '[]', 0, ?, ?, ?)`
+      ).bind(
+        id,
+        content,
+        assumes ? JSON.stringify(assumes) : null,
+        invalidates_if ? JSON.stringify(invalidates_if) : null,
+        confirms_if ? JSON.stringify(confirms_if) : null,
+        outcome_condition || null,
+        resolves_by || null,
+        tags ? JSON.stringify(tags) : null,
+        sessionId || null,
+        now
+      ).run();
+
+      // Create derivation edges and increment centrality
+      for (const sourceId of derived_from) {
+        const edgeId = generateId('edge');
+        await ctx.env.DB.prepare(
+          `INSERT INTO edges (id, source_id, target_id, edge_type, strength, created_at)
+           VALUES (?, ?, ?, 'derived_from', 1.0, ?)`
+        ).bind(edgeId, sourceId, id, now).run();
+
+        await incrementCentrality(ctx.env.DB, sourceId);
+      }
+
+      // Record version for audit trail
+      await recordVersion(ctx.env.DB, {
+        entityId: id,
+        entityType: 'assumption',
+        changeType: 'created',
+        contentSnapshot: {
+          id,
+          memory_type: 'assumption',
+          content,
+          assumes,
+          invalidates_if,
+          confirms_if,
+          outcome_condition,
+          resolves_by,
+          tags,
+          derived_from,
+          confirmations: 0,
+          exposures: 0,
+          centrality: 0,
+          state: 'active',
+          violations: [],
+          retracted: false,
+          time_bound: timeBound,
+        },
+        sessionId,
+        requestId,
+      });
+
+      // Store embeddings
+      const { embedding } = await storeAssumptionEmbeddings(ctx.env, ctx.env.AI, config, {
+        id,
+        content,
+        invalidates_if,
+        confirms_if,
+        assumes,
+        resolves_by,
+        requestId,
+      });
+
+      // Queue exposure check if conditions defined
+      const hasConditions = (invalidates_if && invalidates_if.length > 0) ||
+        (timeBound && confirms_if && confirms_if.length > 0);
+
+      if (hasConditions) {
+        const exposureJob: ExposureCheckJob = {
+          memory_id: id,
+          memory_type: 'assumption',
+          content,
+          embedding,
+          session_id: sessionId,
+          request_id: requestId,
+          timestamp: now,
+          invalidates_if,
+          confirms_if,
+          time_bound: timeBound,
+        };
+
+        await ctx.env.DETECTION_QUEUE.send(exposureJob);
+      }
+
+      return jsonResult({
+        success: true,
+        id,
+        time_bound: timeBound,
+        exposure_check: hasConditions ? 'queued' : 'skipped',
+      });
+    },
+  }),
+
+  defineTool({
     name: 'find',
-    description: 'Semantic search across all memories. Results are ranked by similarity × confidence × centrality.',
+    description: 'Search memories by meaning. Results ranked by: similarity (semantic match), confidence (survival rate under testing), and centrality (how many assumptions derive from this). Use to find related observations before forming assumptions, or to check if an assumption already exists.',
     inputSchema: {
       type: 'object',
       properties: {
         query: { type: 'string', description: 'Natural language search query' },
-        types: { type: 'array', items: { type: 'string' }, description: 'Filter by memory types (obs, assumption)' },
+        types: { type: 'array', items: { type: 'string', enum: ['obs', 'assumption'] }, description: 'Filter by memory types (obs, assumption)' },
         limit: { type: 'integer', description: 'Max results to return (default: 10)', minimum: 1, maximum: 100 },
         min_similarity: { type: 'number', description: 'Minimum similarity threshold (0-1)' },
       },
@@ -238,7 +406,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
   defineTool({
     name: 'recall',
-    description: 'Retrieve a specific memory by ID with its confidence stats and connections.',
+    description: 'Get a memory by ID. Returns the memory content, confidence stats (exposures, confirmations), state (active/violated/confirmed), and derivation edges. Use to inspect a specific memory before building on it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -306,11 +474,11 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
   defineTool({
     name: 'pending',
-    description: 'List predictions/assumptions awaiting resolution.',
+    description: 'List time-bound assumptions past their resolves_by deadline awaiting resolution. These need human review elsewhere to mark as confirmed or violated.',
     inputSchema: {
       type: 'object',
       properties: {
-        overdue: { type: 'boolean', description: 'Only show overdue predictions' },
+        overdue: { type: 'boolean', description: 'Only show overdue predictions (default: false shows all pending)' },
         limit: { type: 'integer', description: 'Max results (default: 20)' },
       },
     },
@@ -350,14 +518,14 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
   defineTool({
     name: 'insights',
-    description: 'Get insights about the knowledge graph structure.',
+    description: 'Analyze knowledge graph health. Views: hubs (most-connected memories), orphans (unconnected - no derivation links), untested (low exposure count - dangerous if confident), failing (have violations from contradicting observations), recent (latest memories).',
     inputSchema: {
       type: 'object',
       properties: {
         view: {
           type: 'string',
           enum: ['hubs', 'orphans', 'untested', 'failing', 'recent'],
-          description: 'Type of insight view'
+          description: 'Type of insight view (default: recent)'
         },
         limit: { type: 'integer', description: 'Max results (default: 20)' },
       },
@@ -428,6 +596,354 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
           created_at: row.created_at,
         })),
         total: results.results?.length || 0,
+      });
+    },
+  }),
+
+  // ----------------------------------------
+  // Graph Traversal - Navigate derivation chain
+  // ----------------------------------------
+
+  defineTool({
+    name: 'reference',
+    description: 'Follow the derivation graph from a memory. Returns memories connected by derivation edges - what this memory derives from (ancestors via direction=up) or what derives from it (descendants via direction=down). Use to trace reasoning chains and understand dependencies.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        memory_id: { type: 'string', description: 'ID of the memory to traverse from' },
+        direction: { type: 'string', enum: ['up', 'down', 'both'], description: 'Traverse direction: up (ancestors), down (descendants), both (default: both)' },
+        depth: { type: 'integer', description: 'Max traversal depth (default: 2)', minimum: 1, maximum: 10 },
+      },
+      required: ['memory_id'],
+    },
+    handler: async (args, ctx) => {
+      const { memory_id, direction = 'both', depth: maxDepth = 2 } = args as {
+        memory_id: string;
+        direction?: 'up' | 'down' | 'both';
+        depth?: number;
+      };
+
+      interface GraphNode {
+        id: string;
+        type: string;
+        content: string;
+        depth: number;
+      }
+
+      interface GraphEdge {
+        source: string;
+        target: string;
+        type: string;
+        strength: number;
+      }
+
+      const nodes: Map<string, GraphNode> = new Map();
+      const edges: GraphEdge[] = [];
+      const visited = new Set<string>();
+
+      // Get root memory
+      const rootRow = await ctx.env.DB.prepare(
+        `SELECT * FROM memories WHERE id = ?`
+      ).bind(memory_id).first<MemoryRow>();
+
+      if (!rootRow) {
+        return errorResult(`Memory not found: ${memory_id}`);
+      }
+
+      const rootMemory = rowToMemory(rootRow);
+      nodes.set(memory_id, {
+        id: memory_id,
+        type: rootMemory.memory_type,
+        content: rootMemory.content,
+        depth: 0,
+      });
+
+      // Traverse function
+      async function traverse(
+        memoryId: string,
+        currentDepth: number,
+        dir: string
+      ): Promise<void> {
+        if (currentDepth >= maxDepth || visited.has(`${memoryId}-${dir}`)) return;
+        visited.add(`${memoryId}-${dir}`);
+
+        // Traverse up (what this memory is derived from)
+        if (dir === 'up' || dir === 'both') {
+          const derivedFrom = await ctx.env.DB.prepare(
+            `SELECT * FROM edges WHERE target_id = ?`
+          ).bind(memoryId).all<EdgeRow>();
+
+          for (const row of derivedFrom.results || []) {
+            if (!nodes.has(row.source_id)) {
+              const sourceRow = await ctx.env.DB.prepare(
+                `SELECT * FROM memories WHERE id = ? AND retracted = 0`
+              ).bind(row.source_id).first<MemoryRow>();
+
+              if (sourceRow) {
+                const sourceMemory = rowToMemory(sourceRow);
+                nodes.set(row.source_id, {
+                  id: row.source_id,
+                  type: sourceMemory.memory_type,
+                  content: sourceMemory.content,
+                  depth: currentDepth + 1,
+                });
+              }
+            }
+
+            edges.push({
+              source: row.source_id,
+              target: memoryId,
+              type: row.edge_type,
+              strength: row.strength,
+            });
+
+            await traverse(row.source_id, currentDepth + 1, 'up');
+          }
+        }
+
+        // Traverse down (what derives from this memory)
+        if (dir === 'down' || dir === 'both') {
+          const derivesTo = await ctx.env.DB.prepare(
+            `SELECT * FROM edges WHERE source_id = ?`
+          ).bind(memoryId).all<EdgeRow>();
+
+          for (const row of derivesTo.results || []) {
+            if (!nodes.has(row.target_id)) {
+              const targetRow = await ctx.env.DB.prepare(
+                `SELECT * FROM memories WHERE id = ? AND retracted = 0`
+              ).bind(row.target_id).first<MemoryRow>();
+
+              if (targetRow) {
+                const targetMemory = rowToMemory(targetRow);
+                nodes.set(row.target_id, {
+                  id: row.target_id,
+                  type: targetMemory.memory_type,
+                  content: targetMemory.content,
+                  depth: currentDepth + 1,
+                });
+              }
+            }
+
+            edges.push({
+              source: memoryId,
+              target: row.target_id,
+              type: row.edge_type,
+              strength: row.strength,
+            });
+
+            await traverse(row.target_id, currentDepth + 1, 'down');
+          }
+        }
+      }
+
+      await traverse(memory_id, 0, direction);
+
+      return jsonResult({
+        root: memory_id,
+        nodes: Array.from(nodes.values()),
+        edges,
+      });
+    },
+  }),
+
+  defineTool({
+    name: 'roots',
+    description: 'Trace an assumption back to its root observations. Walks the derivation chain to find the original facts this belief is based on. Use to audit reasoning - every assumption should trace back to reality.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        memory_id: { type: 'string', description: 'ID of the memory to trace roots for' },
+      },
+      required: ['memory_id'],
+    },
+    handler: async (args, ctx) => {
+      const { memory_id } = args as { memory_id: string };
+
+      // Get the memory
+      const row = await ctx.env.DB.prepare(
+        `SELECT * FROM memories WHERE id = ?`
+      ).bind(memory_id).first<MemoryRow>();
+
+      if (!row) {
+        return errorResult(`Memory not found: ${memory_id}`);
+      }
+
+      const memory = rowToMemory(row);
+
+      // If already an observation, return itself
+      if (memory.memory_type === 'obs') {
+        return jsonResult({
+          memory: {
+            id: memory_id,
+            type: 'obs',
+            content: memory.content,
+          },
+          roots: [{
+            id: memory_id,
+            content: memory.content,
+            type: 'obs',
+          }],
+          pathDepth: 0,
+        });
+      }
+
+      // Trace to roots
+      const visited = new Set<string>();
+      const roots: Array<{ id: string; content: string; type: string }> = [];
+      let maxDepth = 0;
+
+      async function traceToRoots(memId: string, depth: number): Promise<void> {
+        if (visited.has(memId)) return;
+        visited.add(memId);
+
+        const derivedFrom = await ctx.env.DB.prepare(
+          `SELECT source_id FROM edges WHERE target_id = ? AND edge_type = 'derived_from'`
+        ).bind(memId).all<{ source_id: string }>();
+
+        if (!derivedFrom.results || derivedFrom.results.length === 0) {
+          // Check if this is an observation (root)
+          const obsRow = await ctx.env.DB.prepare(
+            `SELECT * FROM memories WHERE id = ? AND memory_type = 'obs' AND retracted = 0`
+          ).bind(memId).first<MemoryRow>();
+
+          if (obsRow && !roots.some(r => r.id === memId)) {
+            roots.push({
+              id: memId,
+              content: obsRow.content,
+              type: 'obs',
+            });
+            if (depth > maxDepth) maxDepth = depth;
+          }
+          return;
+        }
+
+        for (const parent of derivedFrom.results) {
+          const parentRow = await ctx.env.DB.prepare(
+            `SELECT * FROM memories WHERE id = ? AND retracted = 0`
+          ).bind(parent.source_id).first<MemoryRow>();
+
+          if (!parentRow) continue;
+
+          if (parentRow.memory_type === 'obs') {
+            if (!roots.some(r => r.id === parent.source_id)) {
+              roots.push({
+                id: parent.source_id,
+                content: parentRow.content,
+                type: 'obs',
+              });
+              if (depth + 1 > maxDepth) maxDepth = depth + 1;
+            }
+          } else {
+            await traceToRoots(parent.source_id, depth + 1);
+          }
+        }
+      }
+
+      await traceToRoots(memory_id, 0);
+
+      return jsonResult({
+        memory: {
+          id: memory_id,
+          type: memory.memory_type,
+          content: memory.content,
+        },
+        roots,
+        pathDepth: maxDepth,
+      });
+    },
+  }),
+
+  defineTool({
+    name: 'between',
+    description: 'Find memories that bridge two given memories. Discovers conceptual connections you might not have noticed. Use when you have two related ideas and want to understand what links them.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        memory_ids: { type: 'array', items: { type: 'string' }, description: 'IDs of memories to find bridges between (minimum 2)' },
+        limit: { type: 'integer', description: 'Max bridges to return (default: 5)', minimum: 1, maximum: 20 },
+      },
+      required: ['memory_ids'],
+    },
+    handler: async (args, ctx) => {
+      const { memory_ids, limit = 5 } = args as { memory_ids: string[]; limit?: number };
+
+      if (!memory_ids || memory_ids.length < 2) {
+        return errorResult('At least 2 memory IDs are required');
+      }
+
+      // Fetch content for all input memories
+      const contents: Array<{ id: string; content: string }> = [];
+
+      for (const id of memory_ids) {
+        const row = await ctx.env.DB.prepare(
+          `SELECT content FROM memories WHERE id = ? AND retracted = 0`
+        ).bind(id).first<{ content: string }>();
+
+        if (!row) {
+          return errorResult(`Memory not found: ${id}`);
+        }
+
+        contents.push({ id, content: row.content });
+      }
+
+      // Generate embeddings and compute centroid
+      const embeddings: number[][] = [];
+      for (const item of contents) {
+        const embedding = await generateEmbedding(ctx.env.AI, item.content, config, requestId);
+        embeddings.push(embedding);
+      }
+
+      // Compute centroid
+      const dimensions = embeddings[0].length;
+      const centroid = new Array(dimensions).fill(0);
+      for (const emb of embeddings) {
+        for (let i = 0; i < dimensions; i++) {
+          centroid[i] += emb[i];
+        }
+      }
+      for (let i = 0; i < dimensions; i++) {
+        centroid[i] /= embeddings.length;
+      }
+
+      // Search for memories near centroid
+      const searchResults = await searchSimilar(
+        ctx.env,
+        centroid,
+        limit * 3 + memory_ids.length,
+        0.3,
+        requestId
+      );
+
+      // Filter out input memories and fetch details
+      const inputIdSet = new Set(memory_ids);
+      const bridges: Array<{
+        id: string;
+        type: string;
+        content: string;
+        relevanceScore: number;
+      }> = [];
+
+      for (const match of searchResults) {
+        if (bridges.length >= limit) break;
+        if (inputIdSet.has(match.id)) continue;
+
+        const row = await ctx.env.DB.prepare(
+          `SELECT content, memory_type FROM memories WHERE id = ? AND retracted = 0`
+        ).bind(match.id).first<{ content: string; memory_type: string }>();
+
+        if (!row) continue;
+
+        bridges.push({
+          id: match.id,
+          type: row.memory_type,
+          content: row.content,
+          relevanceScore: match.similarity,
+        });
+      }
+
+      return jsonResult({
+        bridges,
+        inputIds: memory_ids,
       });
     },
   }),

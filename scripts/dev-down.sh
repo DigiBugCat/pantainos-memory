@@ -4,11 +4,18 @@ set -e
 # Pantainos Memory - Dev Environment Teardown
 # Deletes all Cloudflare resources in the correct order
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
 echo "==> Tearing down dev environment..."
 
-# Step 1: Deploy worker WITHOUT queue bindings to break the circular dependency
-echo "Unbinding queue from worker..."
-cat > /tmp/pantainos-unbind.toml << 'EOF'
+# Step 1: Remove queue consumer binding first (breaks the circular dependency)
+echo "Removing queue consumer binding..."
+wrangler queues consumer remove pantainos-memory-dev-detection pantainos-memory-dev 2>/dev/null || echo "  (consumer not found or already removed)"
+
+# Step 2: Deploy worker WITHOUT queue bindings to fully unbind
+echo "Unbinding queue producer from worker..."
+cat > "$PROJECT_DIR/unbind.toml" << 'EOF'
 name = "pantainos-memory-dev"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
@@ -22,16 +29,16 @@ REASONING_MODEL = "@cf/openai/gpt-oss-120b"
 EOF
 
 # Try to deploy without queue - this may fail if worker doesn't exist, that's OK
-wrangler deploy --config /tmp/pantainos-unbind.toml 2>/dev/null || true
-rm /tmp/pantainos-unbind.toml
+wrangler deploy --config "$PROJECT_DIR/unbind.toml" 2>/dev/null || true
+rm -f "$PROJECT_DIR/unbind.toml"
 
-# Step 2: Delete queue (now unbound)
+# Step 3: Delete queue (now unbound)
 echo "Deleting queue..."
-echo "y" | wrangler queues delete pantainos-memory-dev-detection 2>/dev/null || echo "Queue not found or already deleted"
+echo "y" | wrangler queues delete pantainos-memory-dev-detection 2>/dev/null || echo "  (queue not found or already deleted)"
 
-# Step 3: Delete worker
+# Step 4: Delete worker
 echo "Deleting worker..."
-wrangler delete --name pantainos-memory-dev --force 2>/dev/null || echo "Worker not found or already deleted"
+wrangler delete --name pantainos-memory-dev --force 2>/dev/null || echo "  (worker not found or already deleted)"
 
 # Step 4: Delete D1 database
 echo "Deleting D1 database..."

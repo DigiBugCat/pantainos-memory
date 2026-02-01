@@ -3,29 +3,40 @@ set -e
 
 # Pantainos Memory - Dev Environment Setup
 # Creates all Cloudflare resources and deploys the worker
+# Handles already-existing resources gracefully
 
 echo "==> Creating dev environment resources..."
 
-# Create D1 database
+# Create D1 database (or get existing ID)
 echo "Creating D1 database..."
-D1_OUTPUT=$(wrangler d1 create pantainos-memory-dev 2>&1)
-D1_ID=$(echo "$D1_OUTPUT" | grep "database_id" | sed 's/.*database_id = "\([^"]*\)".*/\1/')
+D1_OUTPUT=$(wrangler d1 create pantainos-memory-dev 2>&1) || true
+if echo "$D1_OUTPUT" | grep -q "already exists"; then
+  echo "D1 database already exists, fetching ID..."
+  D1_ID=$(wrangler d1 list 2>&1 | grep -A1 "pantainos-memory-dev" | grep -o '[a-f0-9-]\{36\}' | head -1)
+else
+  D1_ID=$(echo "$D1_OUTPUT" | grep "database_id" | sed 's/.*database_id = "\([^"]*\)".*/\1/')
+fi
 echo "D1 database ID: $D1_ID"
 
 # Create Vectorize indexes (768 dimensions for embeddinggemma-300m)
 echo "Creating Vectorize indexes..."
-wrangler vectorize create pantainos-memory-dev-vectors --dimensions=768 --metric=cosine
-wrangler vectorize create pantainos-memory-dev-invalidates --dimensions=768 --metric=cosine
-wrangler vectorize create pantainos-memory-dev-confirms --dimensions=768 --metric=cosine
+wrangler vectorize create pantainos-memory-dev-vectors --dimensions=768 --metric=cosine 2>&1 || echo "  (already exists)"
+wrangler vectorize create pantainos-memory-dev-invalidates --dimensions=768 --metric=cosine 2>&1 || echo "  (already exists)"
+wrangler vectorize create pantainos-memory-dev-confirms --dimensions=768 --metric=cosine 2>&1 || echo "  (already exists)"
 
 # Create Queue
 echo "Creating Queue..."
-wrangler queues create pantainos-memory-dev-detection
+wrangler queues create pantainos-memory-dev-detection 2>&1 || echo "  (already exists)"
 
-# Create KV namespace for OAuth
+# Create KV namespace for OAuth (or get existing ID)
 echo "Creating KV namespace..."
-KV_OUTPUT=$(wrangler kv namespace create "OAUTH_KV" --env dev 2>&1)
-KV_ID=$(echo "$KV_OUTPUT" | grep "id = " | sed 's/.*id = "\([^"]*\)".*/\1/')
+KV_OUTPUT=$(wrangler kv namespace create "pantainos-memory-dev-oauth" 2>&1) || true
+if echo "$KV_OUTPUT" | grep -q "already exists"; then
+  echo "KV namespace already exists, fetching ID..."
+  KV_ID=$(wrangler kv namespace list 2>&1 | grep -B2 "pantainos-memory-dev-oauth" | grep '"id"' | sed 's/.*"id": "\([^"]*\)".*/\1/')
+else
+  KV_ID=$(echo "$KV_OUTPUT" | grep '"id":' | sed 's/.*"id": "\([^"]*\)".*/\1/')
+fi
 echo "KV namespace ID: $KV_ID"
 
 # Update wrangler.toml with new IDs
