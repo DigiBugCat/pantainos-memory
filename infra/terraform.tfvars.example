@@ -1,0 +1,11 @@
+# Copy to terraform.tfvars and fill in values
+
+account_id = "6e0f27df112f7601b51fdb6241d6bafe"
+
+allowed_emails = [
+  "andrew@raftesalo.net",
+  # Add more emails as needed
+]
+
+# Set to true when ready for production
+create_prod = false

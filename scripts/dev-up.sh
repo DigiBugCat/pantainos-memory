@@ -9,10 +9,10 @@ echo "==> Creating dev environment resources..."
 
 # Create D1 database (or get existing ID)
 echo "Creating D1 database..."
-D1_OUTPUT=$(wrangler d1 create pantainos-memory-dev 2>&1) || true
+D1_OUTPUT=$(wrangler d1 create memory-dev 2>&1) || true
 if echo "$D1_OUTPUT" | grep -q "already exists"; then
   echo "D1 database already exists, fetching ID..."
-  D1_ID=$(wrangler d1 list 2>&1 | grep -A1 "pantainos-memory-dev" | grep -o '[a-f0-9-]\{36\}' | head -1)
+  D1_ID=$(wrangler d1 list 2>&1 | grep -A1 "memory-dev" | grep -o '[a-f0-9-]\{36\}' | head -1)
 else
   D1_ID=$(echo "$D1_OUTPUT" | grep "database_id" | sed 's/.*database_id = "\([^"]*\)".*/\1/')
 fi
@@ -20,20 +20,20 @@ echo "D1 database ID: $D1_ID"
 
 # Create Vectorize indexes (768 dimensions for embeddinggemma-300m)
 echo "Creating Vectorize indexes..."
-wrangler vectorize create pantainos-memory-dev-vectors --dimensions=768 --metric=cosine 2>&1 || echo "  (already exists)"
-wrangler vectorize create pantainos-memory-dev-invalidates --dimensions=768 --metric=cosine 2>&1 || echo "  (already exists)"
-wrangler vectorize create pantainos-memory-dev-confirms --dimensions=768 --metric=cosine 2>&1 || echo "  (already exists)"
+wrangler vectorize create memory-dev-vectors --dimensions=768 --metric=cosine 2>&1 || echo "  (already exists)"
+wrangler vectorize create memory-dev-invalidates --dimensions=768 --metric=cosine 2>&1 || echo "  (already exists)"
+wrangler vectorize create memory-dev-confirms --dimensions=768 --metric=cosine 2>&1 || echo "  (already exists)"
 
 # Create Queue
 echo "Creating Queue..."
-wrangler queues create pantainos-memory-dev-detection 2>&1 || echo "  (already exists)"
+wrangler queues create memory-dev-detection 2>&1 || echo "  (already exists)"
 
 # Create KV namespace for OAuth (or get existing ID)
 echo "Creating KV namespace..."
-KV_OUTPUT=$(wrangler kv namespace create "pantainos-memory-dev-oauth" 2>&1) || true
+KV_OUTPUT=$(wrangler kv namespace create "memory-dev-oauth" 2>&1) || true
 if echo "$KV_OUTPUT" | grep -q "already exists"; then
   echo "KV namespace already exists, fetching ID..."
-  KV_ID=$(wrangler kv namespace list 2>&1 | grep -B2 "pantainos-memory-dev-oauth" | grep '"id"' | sed 's/.*"id": "\([^"]*\)".*/\1/')
+  KV_ID=$(wrangler kv namespace list 2>&1 | grep -B2 "memory-dev-oauth" | grep '"id"' | sed 's/.*"id": "\([^"]*\)".*/\1/')
 else
   KV_ID=$(echo "$KV_OUTPUT" | grep '"id":' | sed 's/.*"id": "\([^"]*\)".*/\1/')
 fi
@@ -54,7 +54,7 @@ fi
 
 # Run migration
 echo "Running database migration..."
-wrangler d1 execute pantainos-memory-dev --remote --file=migrations/schema.sql
+wrangler d1 execute memory-dev --remote --file=migrations/schema.sql
 
 # Deploy
 echo "Deploying worker..."
@@ -62,12 +62,12 @@ wrangler deploy --env dev
 
 echo ""
 echo "==> Dev environment ready!"
-echo "URL: https://pantainos-memory-dev.pantainos.workers.dev"
+echo "URL: https://memory-dev.pantainos.workers.dev"
 echo ""
 echo "Resources created:"
 echo "  D1:        $D1_ID"
 echo "  KV:        $KV_ID"
-echo "  Vectorize: pantainos-memory-dev-vectors (768d)"
-echo "  Vectorize: pantainos-memory-dev-invalidates (768d)"
-echo "  Vectorize: pantainos-memory-dev-confirms (768d)"
-echo "  Queue:     pantainos-memory-dev-detection"
+echo "  Vectorize: memory-dev-vectors (768d)"
+echo "  Vectorize: memory-dev-invalidates (768d)"
+echo "  Vectorize: memory-dev-confirms (768d)"
+echo "  Queue:     memory-dev-detection"

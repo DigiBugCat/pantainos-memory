@@ -8,7 +8,7 @@
 #   Dev:        wrangler deploy --env dev
 #   Production: wrangler deploy
 
-name = "pantainos-memory"
+name = "memory"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
@@ -94,7 +94,7 @@ RESOLVER_TYPE = "none"
 # Dev Environment
 # ============================================
 [env.dev]
-name = "pantainos-memory-dev"
+name = "memory-dev"
 
 [env.dev.ai]
 binding = "AI"
