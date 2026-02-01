@@ -1,0 +1,11 @@
+# =============================================================================
+# Production Backend Configuration
+# =============================================================================
+# Usage: tofu init -backend-config=production.s3.tfbackend
+
+bucket = "terraform-state"
+key    = "production/memory/terraform.tfstate"
+
+endpoints = {
+  s3 = "https://6e0f27df112f7601b51fdb6241d6bafe.r2.cloudflarestorage.com"
+}
