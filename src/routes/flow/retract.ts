@@ -12,7 +12,7 @@
  */
 
 import { Hono } from 'hono';
-import type { RetractRequest, RetractResponse, MemoryType } from '../../lib/shared/types/index.js';
+import type { RetractRequest, RetractResponse } from '../../lib/shared/types/index.js';
 import { logField } from '../../lib/shared/logging/index.js';
 import type { Env } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
@@ -44,7 +44,10 @@ app.post('/:id', async (c) => {
   let body: RetractRequest;
   try {
     body = await c.req.json();
-  } catch {
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) {
+      logField(c, 'json_parse_warning', error instanceof Error ? error.message : 'unknown');
+    }
     return c.json({ success: false, error: 'Invalid JSON body' }, 400);
   }
 
@@ -54,16 +57,16 @@ app.post('/:id', async (c) => {
 
   // Verify observation exists and is not already retracted
   const observation = await c.env.DB.prepare(
-    `SELECT id, memory_type, content, retracted FROM memories WHERE id = ?`
+    `SELECT id, source, content, retracted FROM memories WHERE id = ?`
   )
     .bind(observationId)
-    .first<{ id: string; memory_type: string; content: string; retracted: number }>();
+    .first<{ id: string; source: string | null; content: string; retracted: number }>();
 
   if (!observation) {
     return c.json({ success: false, error: 'Observation not found' }, 404);
   }
 
-  if (observation.memory_type !== 'obs') {
+  if (observation.source == null) {
     return c.json({ success: false, error: 'Only observations can be retracted' }, 400);
   }
 
@@ -84,16 +87,15 @@ app.post('/:id', async (c) => {
 
   // Find downstream memories that depend on this observation
   const downstream = await c.env.DB.prepare(
-    `SELECT m.id, m.memory_type FROM memories m
+    `SELECT m.id FROM memories m
      INNER JOIN edges e ON e.source_id = ? AND e.target_id = m.id AND e.edge_type = 'derived_from'
      WHERE m.retracted = 0`
   )
     .bind(observationId)
-    .all<{ id: string; memory_type: string }>();
+    .all<{ id: string }>();
 
   const affected = (downstream.results || []).map(r => ({
     id: r.id,
-    memory_type: r.memory_type as MemoryType,
   }));
 
   // Decrement centrality for the observation (it's no longer active)
@@ -102,7 +104,7 @@ app.post('/:id', async (c) => {
   // Record version for audit trail
   await recordVersion(c.env.DB, {
     entityId: observationId,
-    entityType: 'obs',
+    entityType: 'observation',
     changeType: 'retracted',
     contentSnapshot: {
       id: observationId,

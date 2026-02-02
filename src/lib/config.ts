@@ -3,19 +3,9 @@
  * Values can be overridden via environment variables in wrangler.toml
  */
 
-import { createStandaloneLogger } from './shared/logging/index.js';
+import { createLazyLogger } from './lazy-logger.js';
 
-// Lazy logger for config operations - avoids crypto in global scope
-let _log: ReturnType<typeof createStandaloneLogger> | null = null;
-function getLog() {
-  if (!_log) {
-    _log = createStandaloneLogger({
-      component: 'Config',
-      requestId: 'config-init',
-    });
-  }
-  return _log;
-}
+const getLog = createLazyLogger('Config');
 
 export interface Config {
   // Models
@@ -46,10 +36,10 @@ export interface Config {
 
   // Robustness thresholds (for confidence tier calculation)
   robustness: {
-    /** Below this many exposures = untested (default: 3) */
-    untestedMaxExposures: number;
-    /** Below this many exposures = brittle (default: 10) */
-    brittleMaxExposures: number;
+    /** Below this many times_tested = untested (default: 3) */
+    untestedMaxTimesTested: number;
+    /** Below this many times_tested = brittle (default: 10) */
+    brittleMaxTimesTested: number;
     /** Above this confidence = robust when well-tested (default: 0.7) */
     robustMinConfidence: number;
   };
@@ -175,8 +165,8 @@ export function getConfig(env: Record<string, string | undefined>): Config {
 
     // Robustness thresholds (for confidence tier calculation)
     robustness: {
-      untestedMaxExposures: parseInt_(env.ROBUSTNESS_UNTESTED_MAX_EXPOSURES, 3, 1, 20, 'ROBUSTNESS_UNTESTED_MAX_EXPOSURES'),
-      brittleMaxExposures: parseInt_(env.ROBUSTNESS_BRITTLE_MAX_EXPOSURES, 10, 3, 50, 'ROBUSTNESS_BRITTLE_MAX_EXPOSURES'),
+      untestedMaxTimesTested: parseInt_(env.ROBUSTNESS_UNTESTED_MAX_TIMES_TESTED, 3, 1, 20, 'ROBUSTNESS_UNTESTED_MAX_TIMES_TESTED'),
+      brittleMaxTimesTested: parseInt_(env.ROBUSTNESS_BRITTLE_MAX_TIMES_TESTED, 10, 3, 50, 'ROBUSTNESS_BRITTLE_MAX_TIMES_TESTED'),
       robustMinConfidence: parseNumber(env.ROBUSTNESS_ROBUST_MIN_CONFIDENCE, 0.7, 0.3, 1.0, 'ROBUSTNESS_ROBUST_MIN_CONFIDENCE'),
     },
 

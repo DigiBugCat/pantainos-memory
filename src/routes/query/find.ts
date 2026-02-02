@@ -12,12 +12,15 @@
  */
 
 import { Hono } from 'hono';
-import type { Env, FindRequest, FindResponse, ScoredMemory, MemoryRow, MemoryType, RecordAccessParams } from '../../types/index.js';
+import type { Env, FindRequest, FindResponse, ScoredMemory, MemoryRow, RecordAccessParams } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
 import { generateEmbedding, searchSimilar } from '../../lib/embeddings.js';
+import { logField } from '../../lib/shared/logging/index.js';
 import { recordAccessBatch } from '../../services/access-service.js';
 import { rowToMemory } from '../../lib/transforms.js';
 import { createScoredMemory } from '../../lib/scoring.js';
+import { getMaxTimesTested } from '../../jobs/compute-stats.js';
+import { getDisplayType } from '../../lib/shared/types/index.js';
 
 type Variables = {
   config: Config;
@@ -40,7 +43,10 @@ app.post('/', async (c) => {
   let body: FindRequest;
   try {
     body = await c.req.json();
-  } catch {
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) {
+      logField(c, 'json_parse_warning', error instanceof Error ? error.message : 'unknown');
+    }
     return c.json({ success: false, error: 'Invalid JSON body' }, 400);
   }
 
@@ -50,8 +56,13 @@ app.post('/', async (c) => {
 
   const limit = body.limit || config.search.defaultLimit;
   const minSimilarity = body.min_similarity || config.search.minSimilarity;
-  const types = body.types || ['obs', 'assumption'];
   const includeRetracted = body.include_retracted || false;
+
+  // Build type filter from filter object
+  // Default: include all types if no filter specified
+  const allowObservations = !body.filter || body.filter.observations_only || (!body.filter.thoughts_only && !body.filter.predictions_only);
+  const allowThoughts = !body.filter || body.filter.thoughts_only || (!body.filter.observations_only && !body.filter.predictions_only);
+  const allowPredictions = !body.filter || body.filter.predictions_only || (!body.filter.observations_only && !body.filter.thoughts_only);
 
   // Generate embedding for query
   const queryEmbedding = await generateEmbedding(c.env.AI, body.query, config, requestId);
@@ -65,14 +76,14 @@ app.post('/', async (c) => {
     requestId
   );
 
+  // Get max_times_tested from system_stats for proper confidence normalization
+  const maxTimesTested = await getMaxTimesTested(c.env.DB);
+
   // Fetch memory details and filter
   const results: ScoredMemory[] = [];
 
   for (const match of searchResults) {
     if (results.length >= limit) break;
-
-    const memoryType = inferMemoryType(match.id);
-    if (!types.includes(memoryType)) continue;
 
     // Fetch from unified memories table
     const row = await c.env.DB.prepare(
@@ -81,8 +92,14 @@ app.post('/', async (c) => {
 
     if (!row) continue;
 
+    // Filter by type using field presence
+    const displayType = getDisplayType(row);
+    if (displayType === 'observation' && !allowObservations) continue;
+    if (displayType === 'thought' && !allowThoughts) continue;
+    if (displayType === 'prediction' && !allowPredictions) continue;
+
     const memory = rowToMemory(row);
-    const scoredMemory = createScoredMemory(memory, match.similarity, config);
+    const scoredMemory = createScoredMemory(memory, match.similarity, config, maxTimesTested);
     results.push(scoredMemory);
   }
 
@@ -93,7 +110,7 @@ app.post('/', async (c) => {
   if (results.length > 0) {
     const accessEvents: RecordAccessParams[] = results.map((result, index) => ({
       entityId: result.memory.id,
-      entityType: result.memory.memory_type,
+      entityType: getDisplayType(result.memory),
       accessType: 'find' as const,
       sessionId,
       requestId,
@@ -114,20 +131,5 @@ app.post('/', async (c) => {
 
   return c.json(response);
 });
-
-/**
- * Infer memory type from ID prefix.
- * v4: Both infer- and pred- prefixes map to 'assumption' type.
- */
-function inferMemoryType(id: string): MemoryType {
-  if (id.startsWith('obs-')) return 'obs';
-  // Both infer- and pred- prefixes are assumptions
-  if (id.startsWith('infer-')) return 'assumption';
-  if (id.startsWith('pred-')) return 'assumption';
-  // Legacy prefixes map to obs or assumption
-  if (id.startsWith('mem-')) return 'obs';
-  if (id.startsWith('thought-') || id.startsWith('note-')) return 'assumption';
-  return 'obs'; // Default
-}
 
 export default app;

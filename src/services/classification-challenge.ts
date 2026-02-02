@@ -1,72 +1,120 @@
 /**
- * Classification Challenge Service
+ * Classification Challenge Service - Memory Completeness Analysis
  *
- * Uses an LLM to analyze whether a memory is correctly classified as
- * an observation or assumption. When enabled via feature toggle, this
- * service challenges potential misclassifications during memory creation.
+ * Uses an LLM to analyze whether a memory is complete and well-formed.
+ * When enabled via feature toggle, this service suggests missing fields
+ * that would strengthen the memory (invalidates_if, derived_from, etc.)
  *
- * Key insight: The difference between observation and assumption is semantic:
- * - Observations are direct facts from reality (sourced from tools, news, humans, etc.)
- * - Assumptions are derived beliefs that could be wrong
+ * Key insight: Memory type is determined by field presence (source vs derived_from),
+ * not by a type column. The service now focuses on completeness rather than
+ * type misclassification.
  *
- * When the LLM detects a potential misclassification with sufficient confidence,
- * it returns a challenge that can be included in the response.
+ * When the LLM detects incomplete memories with sufficient confidence,
+ * it returns suggestions that can be included in the response.
  */
 
 import type { Env } from '../types/index.js';
 import type { Config } from '../lib/config.js';
-import type { ClassificationChallenge, ObservationSource, MemoryType } from '../lib/shared/types/index.js';
-import { createStandaloneLogger } from '../lib/shared/logging/index.js';
+import type { ObservationSource } from '../lib/shared/types/index.js';
+import { createLazyLogger } from '../lib/lazy-logger.js';
 import { withRetry } from '../lib/retry.js';
 
-// Lazy logger - avoids crypto in global scope
-let _log: ReturnType<typeof createStandaloneLogger> | null = null;
-function getLog() {
-  if (!_log) {
-    _log = createStandaloneLogger({
-      component: 'ClassificationChallenge',
-      requestId: 'classification-init',
-    });
-  }
-  return _log;
+const getLog = createLazyLogger('ClassificationChallenge', 'classification-init');
+
+/** Display type for memories (determined by field presence) */
+type DisplayType = 'observation' | 'thought' | 'prediction';
+
+/** Fields that might be missing from a memory */
+export type MissingFieldType = 'invalidates_if' | 'confirms_if' | 'derived_from' | 'source' | 'resolves_by';
+
+/** A missing field suggestion */
+export interface MissingField {
+  field: MissingFieldType;
+  reason: string;
 }
 
-/** JSON schema for classification response */
+/** Result of memory completeness analysis */
+export interface MemoryCompleteness {
+  is_complete: boolean;
+  missing_fields: MissingField[];
+  confidence: number;
+  reasoning: string;
+}
+
+/** @deprecated Use MemoryCompleteness - kept for backwards compatibility */
+export interface ClassificationChallenge {
+  correctly_classified: boolean;
+  suggested_type: DisplayType;
+  confidence: number;
+  reasoning: string;
+  suggested_fields?: {
+    source?: ObservationSource;
+  };
+  /** New field for completeness suggestions */
+  missing_fields?: MissingField[];
+}
+
+/** JSON schema for classification response (legacy) */
 const CLASSIFICATION_SCHEMA = {
   type: 'object',
   properties: {
     correctly_classified: { type: 'boolean' },
-    suggested_type: { type: 'string', enum: ['obs', 'assumption'] },
+    suggested_type: { type: 'string', enum: ['obs', 'thought'] },
     confidence: { type: 'number' },
     reasoning: { type: 'string' },
   },
   required: ['correctly_classified', 'suggested_type', 'confidence', 'reasoning'],
 };
 
+/** JSON schema for completeness analysis response */
+const COMPLETENESS_SCHEMA = {
+  type: 'object',
+  properties: {
+    is_complete: { type: 'boolean' },
+    missing_fields: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          field: { type: 'string', enum: ['invalidates_if', 'confirms_if', 'derived_from', 'source', 'resolves_by'] },
+          reason: { type: 'string' },
+        },
+        required: ['field', 'reason'],
+      },
+    },
+    confidence: { type: 'number' },
+    reasoning: { type: 'string' },
+  },
+  required: ['is_complete', 'missing_fields', 'confidence', 'reasoning'],
+};
+
 /**
  * Build the prompt for classification analysis.
  */
-function buildClassificationPrompt(content: string, currentType: MemoryType): string {
+function buildClassificationPrompt(content: string, currentType: DisplayType): string {
   return `Analyze whether this content is correctly classified as a "${currentType}".
 
 Content: "${content}"
 
 Classification definitions:
-- OBSERVATION (obs): Direct facts from reality. Things that were seen, measured, read, or received from external sources. Observations are concrete, specific, and can be verified by pointing to a source (market data, news article, email, tool output, human statement). They should not contain inference or interpretation.
+- OBSERVATION: Direct facts from reality. Things that were seen, measured, read, or received from external sources. Observations are concrete, specific, and can be verified by pointing to a source (market data, news article, email, tool output, human statement). They should not contain inference or interpretation.
 
-- ASSUMPTION: Beliefs derived from observations. These include interpretations, conclusions, predictions, or inferences. Assumptions are what you THINK based on what you KNOW. They may be wrong and should have falsification conditions.
+- THOUGHT: Beliefs derived from observations. These include interpretations, conclusions, or inferences. Thoughts are what you THINK based on what you KNOW. They may be wrong and should have falsification conditions.
+
+- PREDICTION: Time-bound thoughts with a deadline and outcome condition. A specific prediction that will be resolved by a certain date.
 
 Key distinguishing questions:
 1. Is this a direct report of something observed/received, or an interpretation/conclusion?
 2. Could this be directly attributed to a source (market, news, tool, human)?
 3. Does this contain words like "suggests", "implies", "means", "will", "should" that indicate inference?
+4. Is there a specific deadline or time-bound claim?
 
 Is this correctly classified as a "${currentType}"?
 
 Respond with JSON only:
 {
   "correctly_classified": boolean,
-  "suggested_type": "obs" or "assumption",
+  "suggested_type": "observation" or "thought" or "prediction",
   "confidence": number between 0 and 1,
   "reasoning": "brief explanation of your assessment"
 }`;
@@ -77,7 +125,7 @@ Respond with JSON only:
  */
 function parseClassificationResponse(responseText: string): {
   correctly_classified: boolean;
-  suggested_type: MemoryType;
+  suggested_type: DisplayType;
   confidence: number;
   reasoning: string;
 } | null {
@@ -85,9 +133,16 @@ function parseClassificationResponse(responseText: string): {
     // Try direct JSON parse
     const parsed = JSON.parse(responseText);
     if (typeof parsed.correctly_classified === 'boolean' && typeof parsed.confidence === 'number') {
+      // Map legacy 'obs' to 'observation'
+      let suggestedType: DisplayType = 'thought';
+      if (parsed.suggested_type === 'obs' || parsed.suggested_type === 'observation') {
+        suggestedType = 'observation';
+      } else if (parsed.suggested_type === 'prediction') {
+        suggestedType = 'prediction';
+      }
       return {
         correctly_classified: parsed.correctly_classified,
-        suggested_type: parsed.suggested_type === 'obs' ? 'obs' : 'assumption',
+        suggested_type: suggestedType,
         confidence: Number(parsed.confidence),
         reasoning: String(parsed.reasoning || ''),
       };
@@ -101,9 +156,16 @@ function parseClassificationResponse(responseText: string): {
   if (jsonMatch) {
     try {
       const parsed = JSON.parse(jsonMatch[0]);
+      // Map legacy 'obs' to 'observation'
+      let suggestedType: DisplayType = 'thought';
+      if (parsed.suggested_type === 'obs' || parsed.suggested_type === 'observation') {
+        suggestedType = 'observation';
+      } else if (parsed.suggested_type === 'prediction') {
+        suggestedType = 'prediction';
+      }
       return {
         correctly_classified: Boolean(parsed.correctly_classified),
-        suggested_type: parsed.suggested_type === 'obs' ? 'obs' : 'assumption',
+        suggested_type: suggestedType,
         confidence: Number(parsed.confidence) || 0,
         reasoning: String(parsed.reasoning || ''),
       };
@@ -154,7 +216,7 @@ export async function challengeClassification(
   config: Config,
   params: {
     content: string;
-    current_type: MemoryType;
+    current_type: DisplayType;
     requestId?: string;
   }
 ): Promise<ClassificationChallenge | null> {
@@ -242,22 +304,21 @@ export async function challengeClassification(
       });
 
       const challenge: ClassificationChallenge = {
+        correctly_classified: false,
         suggested_type: result.suggested_type,
         confidence: result.confidence,
         reasoning: result.reasoning,
       };
 
       // Add suggested fields based on suggested type
-      if (result.suggested_type === 'obs') {
+      if (result.suggested_type === 'observation') {
         // Suggest a likely source based on content analysis
         challenge.suggested_fields = {
           source: inferLikelySource(params.content),
         };
-      } else {
-        // For assumption, we can't automatically determine derived_from
-        // User will need to specify these manually
-        challenge.suggested_fields = {};
       }
+      // For thought/prediction, we can't automatically determine derived_from
+      // User will need to specify these manually
 
       return challenge;
     }
@@ -335,21 +396,269 @@ function inferLikelySource(content: string): ObservationSource {
 
 /**
  * Format a classification challenge for human-readable MCP output.
+ * Since all memories use the same underlying structure, misclassified memories
+ * should be retracted and recreated with the correct tool.
+ * @deprecated Use formatCompletenessOutput instead
  */
-export function formatChallengeOutput(challenge: ClassificationChallenge, currentType: MemoryType): string {
-  const suggestionText = challenge.suggested_type === 'obs' ? 'observation' : 'assumption';
-  const currentText = currentType === 'obs' ? 'observation' : 'assumption';
+export function formatChallengeOutput(challenge: ClassificationChallenge, currentType: DisplayType): string {
+  // If we have missing fields, use the new format
+  if (challenge.missing_fields && challenge.missing_fields.length > 0) {
+    return formatCompletenessOutput({
+      is_complete: false,
+      missing_fields: challenge.missing_fields,
+      confidence: challenge.confidence,
+      reasoning: challenge.reasoning,
+    });
+  }
 
+  // Legacy format for type misclassification
   let output = `\n⚠️ Classification Challenge:\n`;
-  output += `This might be better classified as an ${suggestionText} rather than an ${currentText}.\n`;
+  output += `This might be better classified as an ${challenge.suggested_type} rather than an ${currentType}.\n`;
   output += `Confidence: ${Math.round(challenge.confidence * 100)}%\n`;
   output += `Reasoning: "${challenge.reasoning}"\n`;
 
-  if (challenge.suggested_type === 'obs' && challenge.suggested_fields?.source) {
+  if (challenge.suggested_type === 'observation' && challenge.suggested_fields?.source) {
     output += `\nSuggested source: ${challenge.suggested_fields.source}\n`;
   }
 
-  output += `\nTo reclassify, use: reclassify_as_${challenge.suggested_type === 'obs' ? 'observation' : 'assumption'}`;
+  output += `\nTo fix: Retract this memory and recreate it with the correct fields `;
+  output += `(use observe with ${challenge.suggested_type === 'observation' ? '"source"' : '"derived_from"'}).`;
+
+  return output;
+}
+
+// ============================================
+// Memory Completeness Analysis (New Approach)
+// ============================================
+
+/**
+ * Build the prompt for completeness analysis.
+ */
+function buildCompletenessPrompt(
+  content: string,
+  currentFields: {
+    has_source?: boolean;
+    has_derived_from?: boolean;
+    has_invalidates_if?: boolean;
+    has_confirms_if?: boolean;
+    has_resolves_by?: boolean;
+  }
+): string {
+  return `Analyze whether this memory is complete and well-formed.
+
+Content: "${content}"
+
+Current fields present: ${JSON.stringify(currentFields)}
+
+Field definitions:
+- source: Where the information came from (for observations: market, news, tool, human, etc.)
+- derived_from: IDs of memories this belief is based on (for thoughts/inferences)
+- invalidates_if: Conditions that would prove this memory wrong (makes claims falsifiable)
+- confirms_if: Conditions that would strengthen confidence in this memory
+- resolves_by: Deadline for time-bound predictions (Unix timestamp)
+
+Check for these completeness issues:
+1. Falsifiable claims without invalidates_if conditions - any claim that could be proven wrong should ideally have kill conditions
+2. Apparent inferences without derived_from - if this seems like a conclusion based on other information, it should trace its reasoning
+3. Time-bound predictions without resolves_by/outcome_condition - predictions with implicit deadlines should make them explicit
+4. Claims that reference external information without source attribution
+
+Note: Not every memory needs every field. Simple facts or observations may be complete as-is.
+Focus on genuinely missing fields that would strengthen the memory, not theoretical completeness.
+
+Respond with JSON only:
+{
+  "is_complete": boolean,
+  "missing_fields": [
+    {"field": "invalidates_if" | "confirms_if" | "derived_from" | "source" | "resolves_by", "reason": "brief explanation"}
+  ],
+  "confidence": number between 0 and 1,
+  "reasoning": "brief overall assessment"
+}`;
+}
+
+/**
+ * Parse the LLM response for completeness analysis.
+ */
+function parseCompletenessResponse(responseText: string): MemoryCompleteness | null {
+  try {
+    // Try direct JSON parse
+    const parsed = JSON.parse(responseText);
+    if (typeof parsed.is_complete === 'boolean' && Array.isArray(parsed.missing_fields)) {
+      return {
+        is_complete: parsed.is_complete,
+        missing_fields: parsed.missing_fields.map((f: { field: string; reason: string }) => ({
+          field: f.field as MissingFieldType,
+          reason: String(f.reason || ''),
+        })),
+        confidence: Number(parsed.confidence) || 0,
+        reasoning: String(parsed.reasoning || ''),
+      };
+    }
+  } catch {
+    // Not valid JSON, try regex extraction
+  }
+
+  // Fallback: Extract JSON from response text
+  const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[0]);
+      if (typeof parsed.is_complete === 'boolean') {
+        return {
+          is_complete: parsed.is_complete,
+          missing_fields: (parsed.missing_fields || []).map((f: { field: string; reason: string }) => ({
+            field: f.field as MissingFieldType,
+            reason: String(f.reason || ''),
+          })),
+          confidence: Number(parsed.confidence) || 0,
+          reasoning: String(parsed.reasoning || ''),
+        };
+      }
+    } catch {
+      // JSON extraction failed
+    }
+  }
+
+  getLog().warn('completeness_parse_failed', { response_preview: responseText.slice(0, 200) });
+  return null;
+}
+
+/**
+ * Check if a memory is complete and suggest missing fields.
+ *
+ * @returns MemoryCompleteness object with suggestions, or null if complete/disabled
+ */
+export async function checkMemoryCompleteness(
+  _env: Env, // Reserved for future external LLM endpoint support
+  ai: Ai,
+  config: Config,
+  params: {
+    content: string;
+    has_source?: boolean;
+    has_derived_from?: boolean;
+    has_invalidates_if?: boolean;
+    has_confirms_if?: boolean;
+    has_resolves_by?: boolean;
+    requestId?: string;
+  }
+): Promise<MemoryCompleteness | null> {
+  // Check if feature is enabled (reuse the same toggle)
+  if (!config.classification.challengeEnabled) {
+    return null;
+  }
+
+  const prompt = buildCompletenessPrompt(params.content, {
+    has_source: params.has_source,
+    has_derived_from: params.has_derived_from,
+    has_invalidates_if: params.has_invalidates_if,
+    has_confirms_if: params.has_confirms_if,
+    has_resolves_by: params.has_resolves_by,
+  });
+
+  try {
+    const response = await withRetry(
+      async () => {
+        const model = config.classification.challengeModel;
+        const isGptOss = model.includes('gpt-oss');
+
+        // AI Gateway config for observability (optional)
+        const gatewayConfig = config.aiGatewayId
+          ? {
+              gateway: {
+                id: config.aiGatewayId,
+                metadata: {
+                  service: 'pantainos-memory',
+                  operation: 'completeness_check',
+                  model,
+                },
+              },
+            }
+          : undefined;
+
+        if (isGptOss) {
+          // GPT-OSS uses Responses API format with structured output
+          return await ai.run(
+            model as Parameters<typeof ai.run>[0],
+            {
+              input: prompt,
+              instructions: 'Return only valid JSON matching the schema',
+              response_format: {
+                type: 'json_schema',
+                json_schema: {
+                  name: 'completeness_check',
+                  strict: true,
+                  schema: COMPLETENESS_SCHEMA,
+                },
+              },
+            } as Parameters<typeof ai.run>[1],
+            gatewayConfig
+          );
+        } else {
+          // Chat completion format for other models
+          return await ai.run(
+            model as Parameters<typeof ai.run>[0],
+            {
+              messages: [{ role: 'user', content: prompt }],
+              max_tokens: 400,
+            } as Parameters<typeof ai.run>[1],
+            gatewayConfig
+          );
+        }
+      },
+      { retries: 2, delay: 100 }
+    );
+
+    const responseText = extractContent(response);
+    const result = parseCompletenessResponse(responseText);
+
+    if (!result) {
+      return null;
+    }
+
+    // Only return if:
+    // 1. Memory is incomplete according to LLM
+    // 2. Confidence is above threshold
+    // 3. There are actual missing fields
+    if (
+      !result.is_complete &&
+      result.confidence >= config.classification.challengeThreshold &&
+      result.missing_fields.length > 0
+    ) {
+      getLog().info('memory_completeness_check', {
+        is_complete: result.is_complete,
+        missing_fields: result.missing_fields.map((f) => f.field),
+        confidence: result.confidence,
+        content_preview: params.content.slice(0, 100),
+      });
+
+      return result;
+    }
+
+    return null;
+  } catch (error) {
+    getLog().error('completeness_check_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+/**
+ * Format memory completeness result for human-readable MCP output.
+ */
+export function formatCompletenessOutput(completeness: MemoryCompleteness): string {
+  if (completeness.is_complete || completeness.missing_fields.length === 0) {
+    return ''; // No output needed for complete memories
+  }
+
+  let output = `\n⚠️ This memory could be strengthened:\n`;
+
+  for (const field of completeness.missing_fields) {
+    output += `- Consider adding ${field.field} (${field.reason})\n`;
+  }
+
+  output += `\nUse the 'update' tool to add missing fields to this memory.`;
 
   return output;
 }

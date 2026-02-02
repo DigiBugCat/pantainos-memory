@@ -1,5 +1,5 @@
 /**
- * Memory Worker Types - Cognitive Loop Architecture (v3)
+ * Memory Worker Types - Unified Memory Model
  *
  * Re-exports shared types and defines worker-specific bindings.
  */
@@ -82,17 +82,17 @@ export interface Env extends MCPCoreEnv {
   CLEANUP_DEDUP_MAX_LLM?: string;
   CLEANUP_DEDUP_MIN?: string;
   CLEANUP_DEDUP_MAX?: string;
+
+  // Exposure checker thresholds
+  VIOLATION_CONFIDENCE_THRESHOLD?: string;
+  CONFIRM_CONFIDENCE_THRESHOLD?: string;
+  MAX_CANDIDATES?: string;
+  MIN_SIMILARITY?: string;
 }
 
 // ============================================
-// Legacy Type Aliases (for migration)
+// Type Aliases
 // ============================================
 
-// These map old entity types to the new unified memory type
-export type EntityType = 'obs' | 'assumption';
-
-// Legacy entity types for migration compatibility
-export type LegacyEntityType = 'obs' | 'infer' | 'pred';
-
-// Legacy aliases for backwards compatibility during migration
+// Source for observations
 export type ObservationSource = 'market' | 'news' | 'earnings' | 'email' | 'human' | 'tool';

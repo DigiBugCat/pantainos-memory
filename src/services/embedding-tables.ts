@@ -33,17 +33,19 @@ import { generateEmbedding } from '../lib/embeddings.js';
 
 /**
  * Metadata stored with memory content embeddings.
+ * Note: Uses internal shorthand for Vectorize - 'obs' for observation, 'thought' for derived
  */
 export interface MemoryVectorMetadata {
-  type: 'obs' | 'assumption';
+  /** Internal type marker: 'obs' = observation (has source), 'thought' = derived (has derived_from) */
+  type: 'obs' | 'thought';
   source?: string;
   has_invalidates_if: boolean;
   has_assumes?: boolean;
   has_confirms_if?: boolean;
   has_outcome?: boolean;
-  /** Presence indicates time-bound assumption */
+  /** Presence indicates time-bound thought */
   resolves_by?: number;
-  /** Whether this is a time-bound assumption */
+  /** Whether this is a time-bound thought */
   time_bound?: boolean;
 }
 
@@ -53,13 +55,11 @@ export interface MemoryVectorMetadata {
 export interface ConditionVectorMetadata {
   /** The memory ID this condition belongs to */
   memory_id: string;
-  /** Type of memory ('assumption') */
-  memory_type: 'assumption';
   /** Index of this condition in the array (for multiple conditions) */
   condition_index: number;
   /** The condition text (for debugging) */
   condition_text: string;
-  /** Whether from a time-bound assumption */
+  /** Whether from a time-bound thought */
   time_bound?: boolean;
 }
 
@@ -112,13 +112,105 @@ export async function storeObservationEmbeddings(
 }
 
 /**
- * Store assumption embeddings (unified for all assumptions).
+ * Store observation embeddings with conditions.
+ * For observations that have invalidates_if or confirms_if:
+ * - Content goes to MEMORY_VECTORS (with metadata indicating conditions exist)
+ * - invalidates_if conditions go to INVALIDATES_VECTORS
+ * - confirms_if conditions go to CONFIRMS_VECTORS
+ */
+export async function storeObservationWithConditions(
+  env: Env,
+  ai: Ai,
+  config: Config,
+  params: {
+    id: string;
+    content: string;
+    source: string;
+    invalidates_if?: string[];
+    confirms_if?: string[];
+    requestId?: string;
+    embedding?: number[]; // Optional pre-computed embedding (for dedup optimization)
+  }
+): Promise<{
+  embedding: number[];
+  invalidatesEmbeddings: number[][];
+  confirmsEmbeddings: number[][];
+}> {
+  const invalidatesEmbeddings: number[][] = [];
+  const confirmsEmbeddings: number[][] = [];
+
+  // Use pre-computed embedding or generate new one
+  const embedding = params.embedding ?? await generateEmbedding(ai, params.content, config, params.requestId);
+
+  // Store content in memory vectors with metadata indicating conditions
+  await env.MEMORY_VECTORS.upsert([
+    {
+      id: params.id,
+      values: embedding,
+      metadata: {
+        type: 'obs',
+        source: params.source,
+        has_invalidates_if: Boolean(params.invalidates_if?.length),
+        has_confirms_if: Boolean(params.confirms_if?.length),
+      } as any,
+    },
+  ]);
+
+  // Store invalidates_if conditions
+  if (params.invalidates_if && params.invalidates_if.length > 0) {
+    const conditionVectors = await Promise.all(
+      params.invalidates_if.map(async (condition, index) => {
+        const condEmbedding = await generateEmbedding(ai, condition, config, params.requestId);
+        invalidatesEmbeddings.push(condEmbedding);
+        return {
+          id: `${params.id}:inv:${index}`,
+          values: condEmbedding,
+          metadata: {
+            memory_id: params.id,
+            condition_index: index,
+            condition_text: condition,
+            time_bound: false, // Observations are not time-bound
+          } as any,
+        };
+      })
+    );
+
+    await env.INVALIDATES_VECTORS.upsert(conditionVectors as any);
+  }
+
+  // Store confirms_if conditions
+  if (params.confirms_if && params.confirms_if.length > 0) {
+    const conditionVectors = await Promise.all(
+      params.confirms_if.map(async (condition, index) => {
+        const condEmbedding = await generateEmbedding(ai, condition, config, params.requestId);
+        confirmsEmbeddings.push(condEmbedding);
+        return {
+          id: `${params.id}:conf:${index}`,
+          values: condEmbedding,
+          metadata: {
+            memory_id: params.id,
+            condition_index: index,
+            condition_text: condition,
+            time_bound: false, // Observations are not time-bound
+          } as any,
+        };
+      })
+    );
+
+    await env.CONFIRMS_VECTORS.upsert(conditionVectors as any);
+  }
+
+  return { embedding, invalidatesEmbeddings, confirmsEmbeddings };
+}
+
+/**
+ * Store thought embeddings (unified for all thoughts).
  * Content goes to memory table, conditions go to respective condition tables.
  *
- * Time-bound assumptions (has resolves_by) store confirms_if conditions.
- * General assumptions (no resolves_by) only store invalidates_if conditions.
+ * Time-bound thoughts (has resolves_by) store confirms_if conditions.
+ * General thoughts (no resolves_by) only store invalidates_if conditions.
  */
-export async function storeAssumptionEmbeddings(
+export async function storeThoughtEmbeddings(
   env: Env,
   ai: Ai,
   config: Config,
@@ -150,7 +242,7 @@ export async function storeAssumptionEmbeddings(
       id: params.id,
       values: embedding,
       metadata: {
-        type: 'assumption',
+        type: 'thought',
         has_invalidates_if: Boolean(params.invalidates_if?.length),
         has_assumes: Boolean(params.assumes?.length),
         has_confirms_if: Boolean(params.confirms_if?.length),
@@ -172,7 +264,6 @@ export async function storeAssumptionEmbeddings(
           values: condEmbedding,
           metadata: {
             memory_id: params.id,
-            memory_type: 'assumption',
             condition_index: index,
             condition_text: condition,
             time_bound: timeBound,
@@ -184,7 +275,7 @@ export async function storeAssumptionEmbeddings(
     await env.INVALIDATES_VECTORS.upsert(conditionVectors as any);
   }
 
-  // Store confirms_if conditions (time-bound assumptions only)
+  // Store confirms_if conditions (time-bound thoughts only)
   if (params.confirms_if && params.confirms_if.length > 0) {
     const conditionVectors = await Promise.all(
       params.confirms_if.map(async (condition, index) => {
@@ -195,7 +286,6 @@ export async function storeAssumptionEmbeddings(
           values: condEmbedding,
           metadata: {
             memory_id: params.id,
-            memory_type: 'assumption',
             condition_index: index,
             condition_text: condition,
             time_bound: true,
@@ -210,49 +300,6 @@ export async function storeAssumptionEmbeddings(
   return { embedding, invalidatesEmbeddings, confirmsEmbeddings };
 }
 
-/**
- * @deprecated Use storeAssumptionEmbeddings - kept for migration compatibility
- */
-export async function storeInferenceEmbeddings(
-  env: Env,
-  ai: Ai,
-  config: Config,
-  params: {
-    id: string;
-    content: string;
-    invalidates_if?: string[];
-    assumes?: string[];
-    requestId?: string;
-  }
-): Promise<{ embedding: number[]; conditionEmbeddings: number[][] }> {
-  const result = await storeAssumptionEmbeddings(env, ai, config, params);
-  return { embedding: result.embedding, conditionEmbeddings: result.invalidatesEmbeddings };
-}
-
-/**
- * @deprecated Use storeAssumptionEmbeddings with resolves_by - kept for migration compatibility
- */
-export async function storePredictionEmbeddings(
-  env: Env,
-  ai: Ai,
-  config: Config,
-  params: {
-    id: string;
-    content: string;
-    invalidates_if?: string[];
-    confirms_if?: string[];
-    assumes?: string[];
-    resolves_by: number;
-    requestId?: string;
-  }
-): Promise<{
-  embedding: number[];
-  invalidatesEmbeddings: number[][];
-  confirmsEmbeddings: number[][];
-}> {
-  return storeAssumptionEmbeddings(env, ai, config, params);
-}
-
 // ============================================
 // Search Operations
 // ============================================
@@ -263,15 +310,13 @@ export interface ConditionCandidate {
   vector_id: string;
   /** The memory this condition belongs to */
   memory_id: string;
-  /** Type of memory */
-  memory_type: 'assumption';
   /** Which condition in the array */
   condition_index: number;
   /** The condition text */
   condition_text: string;
   /** Similarity score */
   similarity: number;
-  /** Whether from a time-bound assumption */
+  /** Whether from a time-bound thought */
   time_bound?: boolean;
 }
 
@@ -301,7 +346,6 @@ export async function searchInvalidatesConditions(
       return {
         vector_id: m.id,
         memory_id: meta.memory_id,
-        memory_type: meta.memory_type,
         condition_index: meta.condition_index,
         condition_text: meta.condition_text,
         similarity: m.score,
@@ -335,7 +379,6 @@ export async function searchConfirmsConditions(
       return {
         vector_id: m.id,
         memory_id: meta.memory_id,
-        memory_type: meta.memory_type,
         condition_index: meta.condition_index,
         condition_text: meta.condition_text,
         similarity: m.score,
@@ -346,15 +389,15 @@ export async function searchConfirmsConditions(
 /** Candidate from memory content search */
 export interface MemoryCandidate {
   id: string;
-  type: 'obs' | 'assumption';
+  type: 'obs' | 'thought';
   similarity: number;
   source?: string;
   time_bound?: boolean;
 }
 
 /**
- * Search for observations that might violate a new assumption.
- * Used for bi-directional checking: when creating assumption, find existing obs that might violate it.
+ * Search for observations that might violate a new thought.
+ * Used for bi-directional checking: when creating thought, find existing obs that might violate it.
  */
 export async function searchObservationsForViolation(
   env: Env,
@@ -424,11 +467,11 @@ export async function deleteMemoryEmbeddings(
 /**
  * Update embeddings when a memory's type changes.
  *
- * For obs → assumption:
+ * For observation → thought/prediction:
  * - Update MEMORY_VECTORS metadata to reflect new type
  * - Add condition embeddings to INVALIDATES_VECTORS and CONFIRMS_VECTORS
  *
- * For assumption → obs:
+ * For thought/prediction → observation:
  * - Update MEMORY_VECTORS metadata to reflect new type
  * - Delete condition embeddings from INVALIDATES_VECTORS and CONFIRMS_VECTORS
  */
@@ -439,10 +482,10 @@ export async function updateMemoryTypeEmbeddings(
   params: {
     id: string;
     content: string;
-    newType: 'obs' | 'assumption';
-    // For obs:
+    newType: 'observation' | 'thought' | 'prediction';
+    // For observation:
     source?: string;
-    // For assumption:
+    // For thought/prediction:
     invalidates_if?: string[];
     confirms_if?: string[];
     resolves_by?: number;
@@ -452,7 +495,7 @@ export async function updateMemoryTypeEmbeddings(
   // Generate embedding for content (needed for metadata update)
   const embedding = await generateEmbedding(ai, params.content, config, params.requestId);
 
-  if (params.newType === 'obs') {
+  if (params.newType === 'observation') {
     // Converting to observation
     // 1. Update MEMORY_VECTORS with obs metadata
     await env.MEMORY_VECTORS.upsert([
@@ -467,23 +510,23 @@ export async function updateMemoryTypeEmbeddings(
       },
     ]);
 
-    // 2. Delete any condition embeddings (try common indices)
+    // Delete any condition embeddings (try common indices - we don't know previous count during type conversion)
     const invalidateIds = Array.from({ length: 10 }, (_, i) => `${params.id}:inv:${i}`);
     const confirmIds = Array.from({ length: 10 }, (_, i) => `${params.id}:conf:${i}`);
 
     await env.INVALIDATES_VECTORS.deleteByIds(invalidateIds);
     await env.CONFIRMS_VECTORS.deleteByIds(confirmIds);
   } else {
-    // Converting to assumption
+    // Converting to thought
     const timeBound = params.resolves_by !== undefined;
 
-    // 1. Update MEMORY_VECTORS with assumption metadata
+    // 1. Update MEMORY_VECTORS with thought metadata
     await env.MEMORY_VECTORS.upsert([
       {
         id: params.id,
         values: embedding,
         metadata: {
-          type: 'assumption',
+          type: 'thought',
           has_invalidates_if: Boolean(params.invalidates_if?.length),
           has_confirms_if: Boolean(params.confirms_if?.length),
           has_outcome: timeBound,
@@ -503,7 +546,6 @@ export async function updateMemoryTypeEmbeddings(
             values: condEmbedding,
             metadata: {
               memory_id: params.id,
-              memory_type: 'assumption',
               condition_index: index,
               condition_text: condition,
               time_bound: timeBound,
@@ -525,7 +567,6 @@ export async function updateMemoryTypeEmbeddings(
             values: condEmbedding,
             metadata: {
               memory_id: params.id,
-              memory_type: 'assumption',
               condition_index: index,
               condition_text: condition,
               time_bound: true,

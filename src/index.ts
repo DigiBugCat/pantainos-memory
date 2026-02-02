@@ -3,7 +3,7 @@
  *
  * Knowledge system with two primitives:
  * - Observations (obs): intake from reality - facts from the world
- * - Assumptions: derived beliefs that can be tested (general or time-bound)
+ * - Thoughts: derived beliefs that can be tested (general or time-bound)
  *
  * Memories are weighted bets, not facts. Confidence = survival rate under test.
  * Queue processes exposure checking (violations + confirmations).
@@ -27,7 +27,7 @@ import mcpRoutes from './routes/mcp.js';
 import internalRoutes from './routes/internal.js';
 
 // Services for inline processing (no workflows)
-import { checkExposures, checkExposuresForNewAssumption } from './services/exposure-checker.js';
+import { checkExposures, checkExposuresForNewThought } from './services/exposure-checker.js';
 import {
   queueSignificantEvent,
   findInactiveSessions,
@@ -40,6 +40,7 @@ import {
   type ConfirmationEvent,
   type CascadeEvent,
 } from './services/resolver.js';
+import { computeSystemStats } from './jobs/compute-stats.js';
 
 // Extend Env with LoggingEnv for proper typing
 type Env = BaseEnv & LoggingEnv;
@@ -307,27 +308,37 @@ app.get('/api/config', (c) => {
 
 // Stats endpoint - v4 architecture
 app.get('/api/stats', async (c) => {
-  // Count memories by type
-  const memoryCounts = await c.env.DB.prepare(
-    `SELECT memory_type, COUNT(*) as count FROM memories WHERE retracted = 0 GROUP BY memory_type`
-  ).all<{ memory_type: string; count: number }>();
+  // Count memories by type using field presence
+  const obsCount = await c.env.DB.prepare(
+    `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND source IS NOT NULL`
+  ).first<{ count: number }>();
 
-  const counts = Object.fromEntries(
-    (memoryCounts.results || []).map(r => [r.memory_type, r.count])
-  );
+  const thoughtCount = await c.env.DB.prepare(
+    `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND derived_from IS NOT NULL AND resolves_by IS NULL`
+  ).first<{ count: number }>();
+
+  const predictionCount = await c.env.DB.prepare(
+    `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND resolves_by IS NOT NULL`
+  ).first<{ count: number }>();
+
+  const counts = {
+    observation: obsCount?.count || 0,
+    thought: thoughtCount?.count || 0,
+    prediction: predictionCount?.count || 0,
+  };
 
   // Count edges
   const edgeCount = await c.env.DB.prepare(
     'SELECT COUNT(*) as count FROM edges'
   ).first<{ count: number }>();
 
-  // Get robustness stats (exposures distribution)
+  // Get robustness stats (times_tested distribution)
   const robustnessStats = await c.env.DB.prepare(`
     SELECT
       CASE
-        WHEN exposures < 3 THEN 'untested'
-        WHEN exposures < 10 THEN 'brittle'
-        WHEN CAST(confirmations AS REAL) / CASE WHEN exposures = 0 THEN 1 ELSE exposures END >= 0.7 THEN 'robust'
+        WHEN times_tested < 3 THEN 'untested'
+        WHEN times_tested < 10 THEN 'brittle'
+        WHEN CAST(confirmations AS REAL) / CASE WHEN times_tested = 0 THEN 1 ELSE times_tested END >= 0.7 THEN 'robust'
         ELSE 'tested'
       END as robustness,
       COUNT(*) as count
@@ -343,9 +354,10 @@ app.get('/api/stats', async (c) => {
 
   return c.json({
     memories: {
-      obs: counts.obs || 0,
-      assumption: counts.assumption || 0,
-      total: (counts.obs || 0) + (counts.assumption || 0),
+      observation: counts.observation,
+      thought: counts.thought,
+      prediction: counts.prediction,
+      total: counts.observation + counts.thought + counts.prediction,
     },
     edges: edgeCount?.count || 0,
     robustness: Object.fromEntries(
@@ -491,26 +503,24 @@ async function processExposureCheck(
   job: ExposureCheckJob,
   log: ReturnType<typeof createStandaloneLogger>
 ): Promise<void> {
-  // Handle legacy job format
-  const legacyJob = job as unknown as Record<string, unknown>;
-  const memoryId = job.memory_id || (legacyJob.observation_id as string);
-  const memoryType = job.memory_type || 'obs';
-  const content = job.content || (legacyJob.observation_content as string);
+  const memoryId = job.memory_id;
+  const isObservation = job.is_observation ?? true;
+  const content = job.content;
 
-  log.info('processing_exposure_check', { memory_id: memoryId, memory_type: memoryType });
+  log.info('processing_exposure_check', { memory_id: memoryId, is_observation: isObservation });
 
   // Mark as processing
   await updateExposureCheckStatus(env.DB, memoryId, 'processing');
 
   let results;
 
-  if (memoryType === 'obs') {
-    // For observations: check against existing assumptions
+  if (isObservation) {
+    // For observations: check against existing thoughts
     results = await checkExposures(env, memoryId, content, job.embedding);
   } else {
-    // For assumptions: check against existing observations
+    // For thoughts: check against existing observations
     const timeBound = job.time_bound ?? false;
-    results = await checkExposuresForNewAssumption(
+    results = await checkExposuresForNewThought(
       env,
       memoryId,
       content,
@@ -529,13 +539,13 @@ async function processExposureCheck(
         session_id: job.session_id,
         event_type: 'violation',
         memory_id: v.memory_id,
-        violated_by: memoryType === 'obs' ? memoryId : v.memory_id,
+        violated_by: isObservation ? memoryId : v.memory_id,
         damage_level: v.damage_level,
         context: {
           condition: v.condition,
           confidence: v.confidence,
           condition_type: v.condition_type,
-          check_direction: memoryType === 'obs' ? 'obs_to_assumption' : 'assumption_to_obs',
+          check_direction: isObservation ? 'obs_to_thought' : 'thought_to_obs',
           triggering_memory: memoryId,
         },
       });
@@ -559,7 +569,7 @@ async function processExposureCheck(
 
   log.info('exposure_check_complete', {
     memory_id: memoryId,
-    memory_type: memoryType,
+    is_observation: isObservation,
     violations: results.violations.length,
     confirmations: results.confirmations.length,
     auto_confirmed: results.autoConfirmed.length,
@@ -606,7 +616,7 @@ async function dispatchSessionEvents(
         id: e.id,
         memory_id: e.memory_id,
         cascade_type: cascadeAction as 'review' | 'boost' | 'damage',
-        memory_type: 'assumption' as const,
+        memory_type: 'thought' as const,
         context: {
           reason: context.reason || '',
           source_id: context.source_id || '',
@@ -703,11 +713,25 @@ export default {
       }
     }
 
-    // Daily at 3:00 AM UTC: Maintenance tasks
+    // Daily at 3:00 AM UTC: Compute system stats for confidence model
     if (event.cron === '0 3 * * *') {
-      log.info('daily_maintenance_triggered', {
+      log.info('daily_stats_computation_triggered', {
         scheduled_time: new Date(event.scheduledTime).toISOString(),
       });
+
+      try {
+        const result = await computeSystemStats(env, `cron-${event.scheduledTime}`);
+        log.info('daily_stats_computation_complete', {
+          max_times_tested: result.maxTimesTested,
+          median_times_tested: result.medianTimesTested,
+          source_count: Object.keys(result.sourceTrackRecords).length,
+          total_memories: result.totalMemories,
+        });
+      } catch (error) {
+        log.error('daily_stats_computation_failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
   },
 
@@ -737,7 +761,7 @@ export default {
       } catch (error) {
         log.error('exposure_check_failed', {
           memory_id: job.memory_id,
-          memory_type: job.memory_type,
+          is_observation: job.is_observation,
           request_id: job.request_id,
           error: error instanceof Error ? error.message : String(error),
           stack: error instanceof Error ? error.stack : undefined,

@@ -2,13 +2,14 @@
  * Confirm Route - POST /api/confirm/:id
  *
  * Manually confirm a memory (increase confidence).
- * This increments both confirmations and exposures.
+ * This increments both confirmations and times_tested.
  *
  * Optionally link to an observation that confirms this memory.
  */
 
 import { Hono } from 'hono';
 import type { ConfirmRequest, ConfirmResponse, MemoryRow } from '../../lib/shared/types/index.js';
+import { getDisplayType } from '../../lib/shared/types/index.js';
 import { logField } from '../../lib/shared/logging/index.js';
 import type { Env } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
@@ -42,7 +43,10 @@ app.post('/:id', async (c) => {
   let body: ConfirmRequest = {};
   try {
     body = await c.req.json();
-  } catch {
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) {
+      logField(c, 'json_parse_warning', error instanceof Error ? error.message : 'unknown');
+    }
     // Body is optional
   }
 
@@ -77,12 +81,12 @@ app.post('/:id', async (c) => {
   // Record version for audit trail
   await recordVersion(c.env.DB, {
     entityId: memoryId,
-    entityType: memory.memory_type,
+    entityType: getDisplayType(memory),
     changeType: 'confirmed',
     contentSnapshot: {
       confirmations: memory.confirmations,
-      exposures: memory.exposures,
-      confidence: stats.confidence,
+      times_tested: memory.times_tested,
+      confidence: stats.effective_confidence,
       observation_id: body.observation_id,
     },
     changeReason: body.notes,
@@ -97,7 +101,7 @@ app.post('/:id', async (c) => {
   // The confirmation is already recorded in the memory and audit trail.
 
   logField(c, 'memory_id', memoryId);
-  logField(c, 'confidence', stats.confidence);
+  logField(c, 'confidence', stats.effective_confidence);
 
   const response: ConfirmResponse = {
     success: true,

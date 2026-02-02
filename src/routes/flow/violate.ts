@@ -2,12 +2,13 @@
  * Violate Route - POST /api/violate/:id
  *
  * Manually violate a memory (record a violation).
- * This adds to the violations array and increments exposures.
+ * This adds to the violations array and increments times_tested.
  * Violations mark but don't delete - the graveyard is data.
  */
 
 import { Hono } from 'hono';
 import type { ViolateRequest, ViolateResponse, MemoryRow } from '../../lib/shared/types/index.js';
+import { getDisplayType } from '../../lib/shared/types/index.js';
 import { logField } from '../../lib/shared/logging/index.js';
 import type { Env } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
@@ -42,7 +43,10 @@ app.post('/:id', async (c) => {
   let body: ViolateRequest;
   try {
     body = await c.req.json();
-  } catch {
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) {
+      logField(c, 'json_parse_warning', error instanceof Error ? error.message : 'unknown');
+    }
     return c.json({ success: false, error: 'Invalid JSON body' }, 400);
   }
 
@@ -80,27 +84,26 @@ app.post('/:id', async (c) => {
 
   // Find downstream memories that might be affected (memories that depend on this one)
   const downstream = await c.env.DB.prepare(
-    `SELECT m.id, m.memory_type FROM memories m
+    `SELECT m.id FROM memories m
      INNER JOIN edges e ON e.source_id = ? AND e.target_id = m.id AND e.edge_type = 'derived_from'
      WHERE m.retracted = 0`
   )
     .bind(memoryId)
-    .all<{ id: string; memory_type: string }>();
+    .all<{ id: string }>();
 
   const affected = (downstream.results || []).map(r => ({
     id: r.id,
-    memory_type: r.memory_type as 'obs' | 'assumption',
   }));
 
   // Record version for audit trail
   await recordVersion(c.env.DB, {
     entityId: memoryId,
-    entityType: memory.memory_type,
+    entityType: getDisplayType(memory),
     changeType: 'violated',
     contentSnapshot: {
       confirmations: memory.confirmations,
-      exposures: memory.exposures,
-      confidence: stats.confidence,
+      times_tested: memory.times_tested,
+      confidence: stats.effective_confidence,
       violation,
       total_violations: memory.violations.length,
       affected_count: affected.length,
@@ -122,8 +125,8 @@ app.post('/:id', async (c) => {
     damage_level: violation.damage_level as 'core' | 'peripheral' | undefined,
     context: {
       condition: body.condition,
-      new_exposures: memory.exposures,
-      new_confidence: stats.confidence,
+      new_times_tested: memory.times_tested,
+      new_confidence: stats.effective_confidence,
       total_violations: memory.violations.length,
       affected_count: affected.length,
       affected_ids: affected.map((a) => a.id),
@@ -132,7 +135,7 @@ app.post('/:id', async (c) => {
 
   logField(c, 'memory_id', memoryId);
   logField(c, 'damage_level', violation.damage_level);
-  logField(c, 'confidence', stats.confidence);
+  logField(c, 'confidence', stats.effective_confidence);
 
   const response: ViolateResponse = {
     success: true,

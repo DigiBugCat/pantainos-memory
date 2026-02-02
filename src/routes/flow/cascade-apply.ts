@@ -4,8 +4,8 @@
  * Apply cascade effects to memories. This is how agents act on cascade events.
  *
  * Actions:
- *   - boost: Increment confirmations + exposures + cascade_boosts
- *   - damage: Increment exposures + cascade_damages (lowers confidence)
+ *   - boost: Increment confirmations + times_tested + cascade_boosts
+ *   - damage: Increment times_tested + cascade_damages (lowers confidence)
  *   - dismiss: Mark event processed without modifying memory
  *
  * Request body:
@@ -20,6 +20,7 @@ import { Hono } from 'hono';
 import type { Env } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
 import type { MemoryRow, Violation } from '../../lib/shared/types/index.js';
+import { logField } from '../../lib/shared/logging/index.js';
 
 type Variables = {
   config: Config;
@@ -41,14 +42,14 @@ export interface ApplyCascadeResponse {
   action: string;
   previous: {
     confirmations: number;
-    exposures: number;
+    times_tested: number;
     cascade_boosts: number;
     cascade_damages: number;
     confidence: number;
   };
   current: {
     confirmations: number;
-    exposures: number;
+    times_tested: number;
     cascade_boosts: number;
     cascade_damages: number;
     confidence: number;
@@ -66,7 +67,10 @@ app.post('/apply', async (c) => {
   let body: ApplyCascadeRequest;
   try {
     body = await c.req.json();
-  } catch {
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) {
+      logField(c, 'json_parse_warning', error instanceof Error ? error.message : 'unknown');
+    }
     return c.json({ success: false, error: 'Invalid JSON body' }, 400);
   }
 
@@ -82,9 +86,10 @@ app.post('/apply', async (c) => {
 
   // Get current memory state
   const row = await c.env.DB.prepare(`
-    SELECT id, memory_type, content, confirmations, exposures, centrality, state, violations,
+    SELECT id, content, confirmations, times_tested, centrality, state, violations,
            cascade_boosts, cascade_damages, last_cascade_at,
-           source, assumes, invalidates_if, confirms_if, outcome_condition, resolves_by,
+           source, derived_from, assumes, invalidates_if, confirms_if, outcome_condition, resolves_by,
+           starting_confidence, contradictions,
            retracted, retracted_at, retraction_reason,
            exposure_check_status, exposure_check_completed_at,
            tags, session_id, created_at, updated_at
@@ -98,10 +103,10 @@ app.post('/apply', async (c) => {
 
   const previous = {
     confirmations: row.confirmations,
-    exposures: row.exposures,
+    times_tested: row.times_tested,
     cascade_boosts: row.cascade_boosts || 0,
     cascade_damages: row.cascade_damages || 0,
-    confidence: row.confirmations / Math.max(row.exposures, 1),
+    confidence: row.confirmations / Math.max(row.times_tested, 1),
   };
 
   // Handle dismiss action - just mark event as processed
@@ -127,21 +132,21 @@ app.post('/apply', async (c) => {
   // Apply boost or damage
   let updateQuery: string;
   if (body.action === 'boost') {
-    // Boost: increment confirmations, exposures, cascade_boosts
+    // Boost: increment confirmations, times_tested, cascade_boosts
     updateQuery = `
       UPDATE memories
       SET confirmations = confirmations + 1,
-          exposures = exposures + 1,
+          times_tested = times_tested + 1,
           cascade_boosts = cascade_boosts + 1,
           last_cascade_at = ?,
           updated_at = ?
       WHERE id = ?
     `;
   } else {
-    // Damage: increment exposures, cascade_damages (no confirmation increment)
+    // Damage: increment times_tested, cascade_damages (no confirmation increment)
     updateQuery = `
       UPDATE memories
-      SET exposures = exposures + 1,
+      SET times_tested = times_tested + 1,
           cascade_damages = cascade_damages + 1,
           last_cascade_at = ?,
           updated_at = ?
@@ -181,22 +186,22 @@ app.post('/apply', async (c) => {
 
   // Get updated state
   const updatedRow = await c.env.DB.prepare(`
-    SELECT confirmations, exposures, cascade_boosts, cascade_damages
+    SELECT confirmations, times_tested, cascade_boosts, cascade_damages
     FROM memories
     WHERE id = ?
   `).bind(body.memory_id).first<{
     confirmations: number;
-    exposures: number;
+    times_tested: number;
     cascade_boosts: number;
     cascade_damages: number;
   }>();
 
   const current = {
     confirmations: updatedRow?.confirmations || previous.confirmations,
-    exposures: updatedRow?.exposures || previous.exposures,
+    times_tested: updatedRow?.times_tested || previous.times_tested,
     cascade_boosts: updatedRow?.cascade_boosts || previous.cascade_boosts,
     cascade_damages: updatedRow?.cascade_damages || previous.cascade_damages,
-    confidence: (updatedRow?.confirmations || 0) / Math.max(updatedRow?.exposures || 1, 1),
+    confidence: (updatedRow?.confirmations || 0) / Math.max(updatedRow?.times_tested || 1, 1),
   };
 
   return c.json({

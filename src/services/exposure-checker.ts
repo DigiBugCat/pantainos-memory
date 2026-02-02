@@ -15,20 +15,10 @@ import type {
   Violation,
   ExposureCheckResult,
 } from '../lib/shared/types/index.js';
-import { createStandaloneLogger } from '../lib/shared/logging/index.js';
+import { createLazyLogger } from '../lib/lazy-logger.js';
 import { getDamageLevel } from './confidence.js';
 
-// Lazy logger - avoids crypto in global scope
-let _log: ReturnType<typeof createStandaloneLogger> | null = null;
-function getLog() {
-  if (!_log) {
-    _log = createStandaloneLogger({
-      component: 'ExposureChecker',
-      requestId: 'exposure-check-init',
-    });
-  }
-  return _log;
-}
+const getLog = createLazyLogger('ExposureChecker', 'exposure-check-init');
 import { generateId } from '../lib/id.js';
 import { withRetry } from '../lib/retry.js';
 import { getConfig, type Config } from '../lib/config.js';
@@ -60,10 +50,10 @@ const DEFAULT_MIN_SIMILARITY = 0.4;
 /** Get configurable thresholds from env or use defaults */
 function getThresholds(env: Env) {
   return {
-    violationConfidence: parseFloat((env as any).VIOLATION_CONFIDENCE_THRESHOLD) || DEFAULT_VIOLATION_CONFIDENCE,
-    confirmConfidence: parseFloat((env as any).CONFIRM_CONFIDENCE_THRESHOLD) || DEFAULT_CONFIRM_CONFIDENCE,
-    maxCandidates: parseInt((env as any).MAX_CANDIDATES) || DEFAULT_MAX_CANDIDATES,
-    minSimilarity: parseFloat((env as any).MIN_SIMILARITY) || DEFAULT_MIN_SIMILARITY,
+    violationConfidence: parseFloat(env.VIOLATION_CONFIDENCE_THRESHOLD ?? '') || DEFAULT_VIOLATION_CONFIDENCE,
+    confirmConfidence: parseFloat(env.CONFIRM_CONFIDENCE_THRESHOLD ?? '') || DEFAULT_CONFIRM_CONFIDENCE,
+    maxCandidates: parseInt(env.MAX_CANDIDATES ?? '') || DEFAULT_MAX_CANDIDATES,
+    minSimilarity: parseFloat(env.MIN_SIMILARITY ?? '') || DEFAULT_MIN_SIMILARITY,
   };
 }
 
@@ -444,7 +434,8 @@ export async function checkExposures(
 
     // Get full memory details
     const memory = await getMemoryById(env.DB, candidate.memory_id);
-    if (!memory || memory.memory_type !== 'pred') continue;
+    // Only process predictions (have resolves_by set)
+    if (!memory || memory.resolves_by == null) continue;
 
     // LLM-judge this specific condition
     const match = await checkConditionMatch(
@@ -463,7 +454,7 @@ export async function checkExposures(
         confidence: match.confidence,
       });
 
-      await autoConfirmAssumption(env.DB, candidate.memory_id, observationId);
+      await autoConfirmThought(env.DB, candidate.memory_id, observationId);
 
       // Propagate resolution to related memories (mark for review, don't auto-modify)
       try {
@@ -491,18 +482,18 @@ export async function checkExposures(
 }
 
 /**
- * Check exposures for a new assumption (Bi-directional Architecture).
+ * Check exposures for a new thought (Bi-directional Architecture).
  *
- * When an assumption is created with invalidates_if conditions:
+ * When a thought is created with invalidates_if conditions:
  * 1. Generate embeddings for each invalidates_if condition
  * 2. Search MEMORY_VECTORS (obs only) for existing observations that might match
  * 3. LLM-judge each match
  *
  * This catches violations from observations that already exist in the system.
  *
- * @param timeBound - Whether this is a time-bound assumption (has resolves_by)
+ * @param timeBound - Whether this is a time-bound thought (has resolves_by)
  */
-export async function checkExposuresForNewAssumption(
+export async function checkExposuresForNewThought(
   env: Env,
   memoryId: string,
   memoryContent: string,
@@ -603,7 +594,7 @@ export async function checkExposuresForNewAssumption(
     }
   }
 
-  // 2. For time-bound assumptions with confirms_if, check if existing observations confirm them
+  // 2. For time-bound thoughts with confirms_if, check if existing observations confirm them
   if (timeBound && confirmsIf.length > 0) {
     for (const condition of confirmsIf) {
       const conditionEmbedding = await generateEmbedding(
@@ -641,7 +632,7 @@ export async function checkExposuresForNewAssumption(
             confidence: match.confidence,
           });
 
-          await autoConfirmAssumption(env.DB, memoryId, obsCandidate.id);
+          await autoConfirmThought(env.DB, memoryId, obsCandidate.id);
           processedObs.add(obsCandidate.id);
           break;
         }
@@ -653,7 +644,7 @@ export async function checkExposuresForNewAssumption(
 }
 
 /**
- * @deprecated Use checkExposuresForNewAssumption - kept for migration compatibility
+ * @deprecated Use checkExposuresForNewThought - kept for migration compatibility
  */
 export async function checkExposuresForNewPrediction(
   env: Env,
@@ -664,7 +655,7 @@ export async function checkExposuresForNewPrediction(
   confirmsIf: string[]
 ): Promise<ExposureCheckResult> {
   const timeBound = memoryType === 'pred';
-  return checkExposuresForNewAssumption(env, memoryId, memoryContent, invalidatesIf, confirmsIf, timeBound);
+  return checkExposuresForNewThought(env, memoryId, memoryContent, invalidatesIf, confirmsIf, timeBound);
 }
 
 /**
@@ -676,8 +667,7 @@ async function getMemoryById(
 ): Promise<MemoryRow | null> {
   const row = await db
     .prepare(
-      `SELECT id, content, memory_type, invalidates_if, assumes, confirms_if, centrality
-       FROM memories WHERE id = ? AND retracted = 0`
+      `SELECT * FROM memories WHERE id = ? AND retracted = 0`
     )
     .bind(memoryId)
     .first<MemoryRow>();
@@ -813,7 +803,7 @@ async function checkConditionMatch(
 
 /**
  * Record a violation for a memory.
- * Updates: violations array, exposures count.
+ * Updates: violations array, times_tested count, contradictions count.
  * If damage_level is 'core', auto-resolves the memory as incorrect.
  */
 async function recordViolation(
@@ -823,9 +813,9 @@ async function recordViolation(
 ): Promise<void> {
   // Get current violations
   const row = await db
-    .prepare('SELECT violations, exposures FROM memories WHERE id = ?')
+    .prepare('SELECT violations, times_tested FROM memories WHERE id = ?')
     .bind(memoryId)
-    .first<{ violations: string; exposures: number }>();
+    .first<{ violations: string; times_tested: number }>();
 
   if (!row) {
     return;
@@ -843,7 +833,8 @@ async function recordViolation(
         `
       UPDATE memories
       SET violations = ?,
-          exposures = exposures + 1,
+          times_tested = times_tested + 1,
+          contradictions = contradictions + 1,
           state = 'resolved',
           outcome = 'incorrect',
           resolved_at = ?,
@@ -860,7 +851,8 @@ async function recordViolation(
         `
       UPDATE memories
       SET violations = ?,
-          exposures = exposures + 1,
+          times_tested = times_tested + 1,
+          contradictions = contradictions + 1,
           state = 'violated',
           updated_at = ?
       WHERE id = ?
@@ -873,7 +865,7 @@ async function recordViolation(
 
 /**
  * Record a confirmation for a memory.
- * Updates: confirmations count, exposures count
+ * Updates: confirmations count, times_tested count
  */
 async function recordConfirmation(
   db: D1Database,
@@ -883,7 +875,7 @@ async function recordConfirmation(
     .prepare(
       `
     UPDATE memories
-    SET confirmations = confirmations + 1, exposures = exposures + 1, updated_at = ?
+    SET confirmations = confirmations + 1, times_tested = times_tested + 1, updated_at = ?
     WHERE id = ?
     `
     )
@@ -892,12 +884,12 @@ async function recordConfirmation(
 }
 
 /**
- * Auto-confirm a time-bound assumption when confirms_if condition matches.
- * Creates edge, updates stats, and resolves the assumption as correct.
+ * Auto-confirm a time-bound thought when confirms_if condition matches.
+ * Creates edge, updates stats, and resolves the thought as correct.
  */
-async function autoConfirmAssumption(
+async function autoConfirmThought(
   db: D1Database,
-  assumptionId: string,
+  thoughtId: string,
   observationId: string
 ): Promise<void> {
   const now = Date.now();
@@ -907,7 +899,7 @@ async function autoConfirmAssumption(
       `
     UPDATE memories
     SET confirmations = confirmations + 1,
-        exposures = exposures + 1,
+        times_tested = times_tested + 1,
         state = 'resolved',
         outcome = 'correct',
         resolved_at = ?,
@@ -915,10 +907,10 @@ async function autoConfirmAssumption(
     WHERE id = ?
     `
     )
-    .bind(now, now, assumptionId)
+    .bind(now, now, thoughtId)
     .run();
 
-  await createEdge(db, observationId, assumptionId, 'confirmed_by');
+  await createEdge(db, observationId, thoughtId, 'confirmed_by');
 }
 
 /**
@@ -930,7 +922,7 @@ async function createEdge(
   targetId: string,
   edgeType: 'derived_from' | 'violated_by' | 'confirmed_by'
 ): Promise<void> {
-  const id = generateId('edge');
+  const id = generateId();
   await db
     .prepare(
       `
@@ -959,7 +951,7 @@ export async function manualConfirm(
     .prepare(
       `
     UPDATE memories
-    SET confirmations = confirmations + 1, exposures = exposures + 1, updated_at = ?
+    SET confirmations = confirmations + 1, times_tested = times_tested + 1, updated_at = ?
     WHERE id = ?
     `
     )
@@ -1014,7 +1006,8 @@ export async function manualViolate(
         `
       UPDATE memories
       SET violations = ?,
-          exposures = exposures + 1,
+          times_tested = times_tested + 1,
+          contradictions = contradictions + 1,
           state = 'resolved',
           outcome = 'incorrect',
           resolved_at = ?,
@@ -1031,7 +1024,8 @@ export async function manualViolate(
         `
       UPDATE memories
       SET violations = ?,
-          exposures = exposures + 1,
+          times_tested = times_tested + 1,
+          contradictions = contradictions + 1,
           state = 'violated',
           updated_at = ?
       WHERE id = ?

@@ -1,21 +1,11 @@
 import type { Env } from '../types/index.js';
 import type { Config } from './config.js';
-import { createStandaloneLogger } from './shared/logging/index.js';
+import { createLazyLogger } from './lazy-logger.js';
 import { defaultConfig } from './config.js';
 import { EmbeddingError, VectorStoreError } from './errors.js';
 import { withRetry } from './retry.js';
 
-// Lazy logger for embedding operations - avoids crypto in global scope
-let _log: ReturnType<typeof createStandaloneLogger> | null = null;
-function getLog() {
-  if (!_log) {
-    _log = createStandaloneLogger({
-      component: 'Embeddings',
-      requestId: 'embed-init',
-    });
-  }
-  return _log;
-}
+const getLog = createLazyLogger('Embeddings', 'embed-init');
 
 /**
  * Get AI Gateway options for Workers AI calls.
@@ -202,7 +192,7 @@ Respond with ONLY a JSON object (no markdown, no explanation): {"verdict": "dupl
       async () => {
         const result = await ai.run(
           model as Parameters<typeof ai.run>[0],
-          { input: prompt } as any,
+          { input: prompt } as { input: string },
           getGatewayOptions(config)
         ) as GptOssResponse;
         return result;

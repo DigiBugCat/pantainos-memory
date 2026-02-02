@@ -1,10 +1,14 @@
 /**
- * Confidence Service - Cognitive Loop Architecture (v3)
+ * Confidence Service - Unified Thought Model (v4)
  *
- * Implements the confidence model where memories are weighted bets:
- * - Confidence = survival rate under test (confirmations / exposures)
- * - Robustness = tier based on exposure history
- * - Score = similarity × confidence × centrality for search ranking
+ * Implements Subjective Logic-inspired confidence model:
+ * - Starting confidence = prior belief based on source/type
+ * - Effective confidence = blend of prior + evidence weight
+ * - Evidence weight = log-scale normalization against global max
+ * - Score = similarity × (1 + effective × boost_weight)
+ *
+ * Key insight: Untested memories retain their prior, while tested
+ * memories earn confidence through survival rate.
  */
 
 import type {
@@ -16,15 +20,36 @@ import type {
 import type { Config } from '../lib/config.js';
 
 // ============================================
+// Starting Confidence Defaults
+// ============================================
+
+/** Default starting confidence by observation source */
+export const SOURCE_STARTING_CONFIDENCE: Record<string, number> = {
+  market: 0.75,    // API data, hard to fake
+  tool: 0.70,      // Computed/generated
+  earnings: 0.70,  // Official but revisable
+  news: 0.55,      // Can be misreported
+  email: 0.50,     // Depends on sender
+  human: 0.50,     // Memory is fallible
+};
+
+/** Default starting confidence by memory type */
+export const TYPE_STARTING_CONFIDENCE = {
+  think: 0.40,     // General thought
+  predict: 0.35,   // Time-bound prediction
+  obs: 0.50,       // Observation (fallback)
+} as const;
+
+// ============================================
 // Configuration
 // ============================================
 
 /** Default thresholds for robustness tiers (can be overridden via config) */
 export const ROBUSTNESS_THRESHOLDS = {
-  /** Below this many exposures = untested */
-  UNTESTED_MAX_EXPOSURES: 3,
-  /** Below this many exposures = brittle */
-  BRITTLE_MAX_EXPOSURES: 10,
+  /** Below this many times_tested = untested */
+  UNTESTED_MAX_TIMES_TESTED: 3,
+  /** Below this many times_tested = brittle */
+  BRITTLE_MAX_TIMES_TESTED: 10,
   /** Above this confidence = robust (when well-tested) */
   ROBUST_MIN_CONFIDENCE: 0.7,
 } as const;
@@ -33,8 +58,8 @@ export const ROBUSTNESS_THRESHOLDS = {
 export function getRobustnessThresholds(config?: Config) {
   if (config?.robustness) {
     return {
-      UNTESTED_MAX_EXPOSURES: config.robustness.untestedMaxExposures,
-      BRITTLE_MAX_EXPOSURES: config.robustness.brittleMaxExposures,
+      UNTESTED_MAX_TIMES_TESTED: config.robustness.untestedMaxTimesTested,
+      BRITTLE_MAX_TIMES_TESTED: config.robustness.brittleMaxTimesTested,
       ROBUST_MIN_CONFIDENCE: config.robustness.robustMinConfidence,
     };
   }
@@ -53,30 +78,65 @@ export const SCORING_WEIGHTS = {
   ROBUSTNESS_BONUS: 1.2,
   /** Weight for centrality in score calculation */
   CENTRALITY_WEIGHT: 0.1,
+  /** Weight for confidence boost in search scoring */
+  CONFIDENCE_BOOST_WEIGHT: 0.5,
 } as const;
+
+/** Default max_times_tested if not available from system_stats */
+export const DEFAULT_MAX_TIMES_TESTED = 10;
 
 // ============================================
 // Core Functions
 // ============================================
 
 /**
- * Calculate raw confidence from confirmations/exposures.
- * Confidence = confirmations / max(exposures, 1)
+ * Calculate evidence weight using log-scale normalization.
+ * This determines how much to trust earned evidence vs prior belief.
  *
- * A memory that has never been tested has 0 confidence.
- * A memory with 10 confirmations and 10 exposures has 1.0 confidence.
+ * @param timesTested - Number of times this memory was tested
+ * @param maxTimesTested - Global max (from system_stats or default)
+ * @returns Evidence weight between 0 and 1
  */
-export function getConfidence(memory: Memory): number {
-  return memory.confirmations / Math.max(memory.exposures, 1);
+export function getEvidenceWeight(timesTested: number, maxTimesTested: number = DEFAULT_MAX_TIMES_TESTED): number {
+  // Log-scale evidence weight (self-normalizing)
+  return Math.log(timesTested + 1) / Math.log(maxTimesTested + 1);
 }
 
 /**
- * Determine robustness tier based on exposure history.
+ * Calculate earned confidence from testing history.
+ * Earned = confirmations / max(times_tested, 1)
+ */
+export function getEarnedConfidence(memory: Memory): number {
+  return memory.confirmations / Math.max(memory.times_tested, 1);
+}
+
+/**
+ * Calculate effective confidence using Subjective Logic blend.
  *
- * - untested: < untestedMaxExposures (hasn't been tested enough)
- * - brittle: untestedMaxExposures - brittleMaxExposures (some testing, but could collapse)
- * - tested: > brittleMaxExposures but < robustMinConfidence
- * - robust: > brittleMaxExposures and >= robustMinConfidence
+ * Formula: effective = startingConfidence * (1 - evidenceWeight) + earned * evidenceWeight
+ *
+ * - If never tested: returns starting_confidence (prior)
+ * - As testing increases: transitions toward earned confidence
+ * - Fully tested: almost entirely earned confidence
+ *
+ * @param memory - The memory to evaluate
+ * @param maxTimesTested - Global max for normalization (from system_stats)
+ */
+export function getEffectiveConfidence(memory: Memory, maxTimesTested: number = DEFAULT_MAX_TIMES_TESTED): number {
+  const evidenceWeight = getEvidenceWeight(memory.times_tested, maxTimesTested);
+  const earned = getEarnedConfidence(memory);
+
+  // Blend prior with evidence
+  return memory.starting_confidence * (1 - evidenceWeight) + earned * evidenceWeight;
+}
+
+/**
+ * Determine robustness tier based on testing history.
+ *
+ * - untested: < untestedMaxTimesTested (hasn't been tested enough)
+ * - brittle: untestedMaxTimesTested - brittleMaxTimesTested (some testing, but could collapse)
+ * - tested: > brittleMaxTimesTested but < robustMinConfidence
+ * - robust: > brittleMaxTimesTested and >= robustMinConfidence
  *
  * @param memory - The memory to evaluate
  * @param config - Optional config for custom thresholds (uses defaults if not provided)
@@ -84,15 +144,15 @@ export function getConfidence(memory: Memory): number {
 export function getRobustness(memory: Memory, config?: Config): Robustness {
   const thresholds = getRobustnessThresholds(config);
 
-  if (memory.exposures < thresholds.UNTESTED_MAX_EXPOSURES) {
+  if (memory.times_tested < thresholds.UNTESTED_MAX_TIMES_TESTED) {
     return 'untested';
   }
 
-  if (memory.exposures < thresholds.BRITTLE_MAX_EXPOSURES) {
+  if (memory.times_tested < thresholds.BRITTLE_MAX_TIMES_TESTED) {
     return 'brittle';
   }
 
-  const confidence = getConfidence(memory);
+  const confidence = getEffectiveConfidence(memory);
   return confidence >= thresholds.ROBUST_MIN_CONFIDENCE
     ? 'robust'
     : 'tested';
@@ -103,13 +163,20 @@ export function getRobustness(memory: Memory, config?: Config): Robustness {
  *
  * @param memory - The memory to evaluate
  * @param config - Optional config for custom thresholds
+ * @param maxTimesTested - Global max for normalization (from system_stats)
  */
-export function getConfidenceStats(memory: Memory, config?: Config): ConfidenceStats {
+export function getConfidenceStats(
+  memory: Memory,
+  config?: Config,
+  maxTimesTested: number = DEFAULT_MAX_TIMES_TESTED
+): ConfidenceStats {
   return {
-    confidence: getConfidence(memory),
+    starting_confidence: memory.starting_confidence,
+    effective_confidence: getEffectiveConfidence(memory, maxTimesTested),
     robustness: getRobustness(memory, config),
-    exposures: memory.exposures,
+    times_tested: memory.times_tested,
     confirmations: memory.confirmations,
+    contradictions: memory.contradictions,
     centrality: memory.centrality,
     violation_count: memory.violations.length,
     exposure_check_status: memory.exposure_check_status,
@@ -133,51 +200,38 @@ export function getDamageLevel(centrality: number): DamageLevel {
 // ============================================
 
 /**
- * Calculate search score combining similarity, confidence, and centrality.
+ * Calculate search score using new formula.
  *
- * Formula: score = similarity × confidence × centralityFactor × robustnessBonus
+ * New Formula: score = similarity × (1 + effective_confidence × BOOST_WEIGHT)
  *
- * Where:
- * - similarity: from Vectorize (0-1)
- * - confidence: confirmations / exposures (0-1)
- * - centralityFactor: 1 + log(centrality + 1) × weight
- * - robustnessBonus: 1.2 if well-tested, 1.0 otherwise
+ * This replaces the old multiplicative formula which penalized untested memories.
+ * Now similarity drives ranking, and confidence provides a boost.
+ *
+ * @param memory - The memory to score
+ * @param similarity - Vectorize similarity score (0-1)
+ * @param maxTimesTested - Global max for normalization
  */
-export function calculateScore(memory: Memory, similarity: number): number {
-  const confidence = getConfidence(memory);
-  const centralityFactor =
-    1 + Math.log(memory.centrality + 1) * SCORING_WEIGHTS.CENTRALITY_WEIGHT;
-  const robustnessBonus =
-    memory.exposures >= ROBUSTNESS_THRESHOLDS.BRITTLE_MAX_EXPOSURES
-      ? SCORING_WEIGHTS.ROBUSTNESS_BONUS
-      : 1.0;
-
-  return similarity * confidence * centralityFactor * robustnessBonus;
-}
-
-/**
- * Calculate score for a memory that has never been tested.
- * Uses a default confidence of 0.5 to not completely bury new content.
- */
-export function calculateUntestedScore(
+export function calculateScore(
   memory: Memory,
-  similarity: number
+  similarity: number,
+  maxTimesTested: number = DEFAULT_MAX_TIMES_TESTED
 ): number {
-  const defaultConfidence = 0.5;
-  const centralityFactor =
-    1 + Math.log(memory.centrality + 1) * SCORING_WEIGHTS.CENTRALITY_WEIGHT;
+  const effective = getEffectiveConfidence(memory, maxTimesTested);
 
-  return similarity * defaultConfidence * centralityFactor;
+  // New formula: similarity with confidence boost
+  return similarity * (1 + effective * SCORING_WEIGHTS.CONFIDENCE_BOOST_WEIGHT);
 }
 
 /**
- * Smart scoring that handles untested memories appropriately.
+ * Smart scoring that handles all memories appropriately.
+ * Now just delegates to calculateScore which uses the new formula.
  */
-export function smartScore(memory: Memory, similarity: number): number {
-  if (memory.exposures === 0) {
-    return calculateUntestedScore(memory, similarity);
-  }
-  return calculateScore(memory, similarity);
+export function smartScore(
+  memory: Memory,
+  similarity: number,
+  maxTimesTested: number = DEFAULT_MAX_TIMES_TESTED
+): number {
+  return calculateScore(memory, similarity, maxTimesTested);
 }
 
 // ============================================
@@ -185,7 +239,7 @@ export function smartScore(memory: Memory, similarity: number): number {
 // ============================================
 
 /**
- * Check if a memory is "brittle" - high confidence but low exposures.
+ * Check if a memory is "brittle" - high confidence but low testing.
  * These are memories that look good but haven't been tested enough.
  *
  * @param memory - The memory to evaluate
@@ -194,54 +248,54 @@ export function smartScore(memory: Memory, similarity: number): number {
  */
 export function isBrittle(
   memory: Memory,
-  options: { maxExposures?: number; minConfidence?: number } = {},
+  options: { maxTimesTested?: number; minConfidence?: number } = {},
   config?: Config
 ): boolean {
   const thresholds = getRobustnessThresholds(config);
-  const maxExposures = options.maxExposures ?? thresholds.BRITTLE_MAX_EXPOSURES;
+  const maxTimesTested = options.maxTimesTested ?? thresholds.BRITTLE_MAX_TIMES_TESTED;
   const minConfidence = options.minConfidence ?? 0.5;
 
-  if (memory.exposures >= maxExposures) {
+  if (memory.times_tested >= maxTimesTested) {
     return false; // Well tested
   }
 
-  if (memory.exposures === 0) {
+  if (memory.times_tested === 0) {
     return true; // Never tested = brittle
   }
 
-  const confidence = getConfidence(memory);
-  return confidence >= minConfidence; // High confidence but low exposure
+  const confidence = getEffectiveConfidence(memory);
+  return confidence >= minConfidence; // High confidence but low testing
 }
 
 /**
  * Get a human-readable description of why a memory is brittle.
  */
 export function getBrittleReason(memory: Memory): string {
-  if (memory.exposures === 0) {
+  if (memory.times_tested === 0) {
     return 'Never been tested against observations';
   }
 
-  const confidence = getConfidence(memory);
+  const confidence = getEffectiveConfidence(memory);
   if (confidence >= 0.8) {
-    return `High confidence (${(confidence * 100).toFixed(0)}%) but only ${memory.exposures} exposures`;
+    return `High confidence (${(confidence * 100).toFixed(0)}%) but only ${memory.times_tested} tests`;
   }
 
-  if (memory.exposures < 3) {
-    return `Only tested ${memory.exposures} time(s)`;
+  if (memory.times_tested < 3) {
+    return `Only tested ${memory.times_tested} time(s)`;
   }
 
-  return `Tested ${memory.exposures} times but confidence is ${(confidence * 100).toFixed(0)}%`;
+  return `Tested ${memory.times_tested} times but confidence is ${(confidence * 100).toFixed(0)}%`;
 }
 
 /**
  * Check if a memory is "failing" - low confidence despite testing.
  */
-export function isFailing(memory: Memory, minExposures = 5): boolean {
-  if (memory.exposures < minExposures) {
+export function isFailing(memory: Memory, minTimesTested = 5): boolean {
+  if (memory.times_tested < minTimesTested) {
     return false; // Not enough data
   }
 
-  const confidence = getConfidence(memory);
+  const confidence = getEffectiveConfidence(memory);
   return confidence < 0.5; // More violations than confirmations
 }
 
@@ -283,7 +337,7 @@ export function sortByScore(
  */
 export function filterBrittle(
   memories: Memory[],
-  options?: { maxExposures?: number; minConfidence?: number }
+  options?: { maxTimesTested?: number; minConfidence?: number }
 ): Memory[] {
   return memories.filter((m) => isBrittle(m, options));
 }
@@ -293,9 +347,9 @@ export function filterBrittle(
  */
 export function filterFailing(
   memories: Memory[],
-  minExposures = 5
+  minTimesTested = 5
 ): Memory[] {
-  return memories.filter((m) => isFailing(m, minExposures));
+  return memories.filter((m) => isFailing(m, minTimesTested));
 }
 
 /**
