@@ -17,13 +17,12 @@ Zettelkasten-style knowledge graph for AI agents. Cloudflare Worker with D1, Vec
 │                                                          │
 │  Queue Consumer → Exposure Check Workflow               │
 └─────────────────────────────────────────────────────────┘
-         │              │                │
-         ▼              ▼                ▼
-    ┌────────┐    ┌──────────┐    ┌───────────┐
-    │   D1   │    │ Vectorize │    │ Workers AI │
-    │(SQLite)│    │ (768-dim) │    │ (Embeddings│
-    └────────┘    └──────────┘    │  + Judge)  │
-         │                         └───────────┘
+         │              │                │                │
+         ▼              ▼                ▼                ▼
+    ┌────────┐    ┌──────────┐    ┌───────────┐    ┌───────────┐
+    │   D1   │    │ Vectorize │    │ Workers AI │    │ External  │
+    │(SQLite)│    │ (768-dim) │    │(Embeddings)│    │ LLM (opt) │
+    └────────┘    └──────────┘    └───────────┘    └───────────┘
          │
     ┌────────┐
     │   KV   │
@@ -137,6 +136,44 @@ pnpm deploy
 | `CONFIRM_CONFIDENCE_THRESHOLD` | LLM confidence for confirmations | `0.7` |
 | `CF_ACCESS_TEAM` | Cloudflare Access team name | - |
 | `CF_ACCESS_AUD` | Access application AUD tag | - |
+
+### External LLM Endpoint (Optional)
+
+By default, LLM judge calls (deduplication, exposure checking) use Cloudflare Workers AI. You can route these to any OpenAI-compatible endpoint instead:
+
+| Variable | Description |
+|----------|-------------|
+| `LLM_JUDGE_URL` | OpenAI-compatible chat completions endpoint |
+| `LLM_JUDGE_API_KEY` | Bearer token for authentication (optional) |
+
+**Example configurations:**
+
+```bash
+# OpenRouter
+LLM_JUDGE_URL=https://openrouter.ai/api/v1/chat/completions
+LLM_JUDGE_API_KEY=sk-or-...
+
+# n8n workflow (custom routing/logging)
+LLM_JUDGE_URL=https://your-n8n.example.com/webhook/llm-judge
+
+# Local Ollama
+LLM_JUDGE_URL=http://localhost:11434/v1/chat/completions
+
+# Azure OpenAI
+LLM_JUDGE_URL=https://your-resource.openai.azure.com/openai/deployments/gpt-4/chat/completions?api-version=2024-02-01
+LLM_JUDGE_API_KEY=your-azure-key
+```
+
+The endpoint receives standard OpenAI chat format:
+```json
+{
+  "model": "default",
+  "messages": [{ "role": "user", "content": "..." }],
+  "temperature": 0.1
+}
+```
+
+Response must include `choices[0].message.content` or one of: `content`, `response`, `result`.
 
 ## Resources
 
