@@ -32,3 +32,15 @@ variable "claude_proxy_worker_name" {
   type        = string
   default     = "claude-proxy"
 }
+
+variable "resolver_github_repo" {
+  description = "GitHub repo for resolver issue creation (e.g. DigiBugCat/Cassandra-Finance)"
+  type        = string
+  default     = "DigiBugCat/Cassandra-Finance"
+}
+
+variable "resolver_github_token" {
+  description = "GitHub PAT with issues:write permission on the resolver repo"
+  type        = string
+  sensitive   = true
+}

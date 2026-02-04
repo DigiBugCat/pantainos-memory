@@ -38,10 +38,12 @@ export interface Env extends MCPCoreEnv {
   API_KEY?: string;
 
   // Resolver configuration (for agentic dispatch)
-  // RESOLVER_TYPE: 'webhook' | 'none' (default)
+  // RESOLVER_TYPE: 'webhook' | 'github' | 'none' (default)
   RESOLVER_TYPE?: string;
   RESOLVER_WEBHOOK_URL?: string;
   RESOLVER_WEBHOOK_TOKEN?: string;
+  RESOLVER_GITHUB_TOKEN?: string;   // PAT with issues:write on target repo
+  RESOLVER_GITHUB_REPO?: string;    // e.g. "DigiBugCat/Cassandra-Finance"
 
   // AI Gateway for observability (optional - enables logging, metrics, cost tracking)
   CF_ACCOUNT_ID?: string;

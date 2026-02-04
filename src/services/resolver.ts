@@ -42,8 +42,8 @@ export interface CascadeEvent {
   id: string;
   memory_id: string;
   cascade_type: 'review' | 'boost' | 'damage';
-  // v4: Unified assumption type (time_bound indicates pred-like behavior)
-  memory_type: 'assumption';
+  // v4: Unified thought type (time_bound indicates pred-like behavior)
+  memory_type: 'thought';
   context: {
     reason: string;
     source_id: string;
@@ -67,7 +67,7 @@ export interface ResolverPayload {
   };
 }
 
-export type ResolverType = 'webhook' | 'none';
+export type ResolverType = 'webhook' | 'github' | 'none';
 
 /**
  * Dispatch session batch to the configured resolver.
@@ -94,6 +94,10 @@ export async function dispatchToResolver(env: Env, payload: ResolverPayload): Pr
   switch (resolverType) {
     case 'webhook':
       await dispatchViaWebhook(env, payload);
+      break;
+
+    case 'github':
+      await dispatchViaGitHub(env, payload);
       break;
 
     case 'none':
@@ -133,4 +137,106 @@ async function dispatchViaWebhook(env: Env, payload: ResolverPayload): Promise<v
   }
 
   getLog().info('webhook_dispatched', { url: env.RESOLVER_WEBHOOK_URL });
+}
+
+/**
+ * Dispatch via GitHub issue creation.
+ *
+ * Creates an issue in the configured repo with the `memory-resolver` label.
+ * A GitHub Actions workflow watches for this label and spawns Claude to resolve.
+ */
+async function dispatchViaGitHub(env: Env, payload: ResolverPayload): Promise<void> {
+  if (!env.RESOLVER_GITHUB_TOKEN) {
+    throw new Error('GitHub resolver requires RESOLVER_GITHUB_TOKEN');
+  }
+  if (!env.RESOLVER_GITHUB_REPO) {
+    throw new Error('GitHub resolver requires RESOLVER_GITHUB_REPO');
+  }
+
+  const { summary } = payload;
+  const parts: string[] = [];
+  if (summary.violationCount > 0) parts.push(`${summary.violationCount} violation${summary.violationCount > 1 ? 's' : ''}`);
+  if (summary.confirmationCount > 0) parts.push(`${summary.confirmationCount} confirmation${summary.confirmationCount > 1 ? 's' : ''}`);
+  if (summary.cascadeCount > 0) parts.push(`${summary.cascadeCount} cascade${summary.cascadeCount > 1 ? 's' : ''}`);
+  const title = `Memory Resolver: ${parts.join(', ')}`;
+
+  const body = formatGitHubIssueBody(payload);
+
+  const response = await fetch(`https://api.github.com/repos/${env.RESOLVER_GITHUB_REPO}/issues`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `token ${env.RESOLVER_GITHUB_TOKEN}`,
+      'Accept': 'application/vnd.github+json',
+      'User-Agent': 'pantainos-memory',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+    body: JSON.stringify({
+      title,
+      body,
+      labels: ['memory-resolver'],
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`GitHub issue creation failed: ${response.status} - ${text}`);
+  }
+
+  const issue = await response.json() as { number: number; html_url: string };
+  getLog().info('github_issue_created', {
+    repo: env.RESOLVER_GITHUB_REPO,
+    issue_number: issue.number,
+    url: issue.html_url,
+  });
+}
+
+/**
+ * Format the resolver payload into a structured GitHub issue body.
+ */
+function formatGitHubIssueBody(payload: ResolverPayload): string {
+  const sections: string[] = [];
+
+  sections.push(`## Memory Resolver Event\n`);
+  sections.push(`- **Batch ID:** \`${payload.batchId}\``);
+  sections.push(`- **Session ID:** \`${payload.sessionId}\``);
+  sections.push(`- **Affected Memories:** ${payload.summary.affectedMemories.map(id => `\`${id}\``).join(', ')}\n`);
+
+  if (payload.violations.length > 0) {
+    sections.push(`### Violations (${payload.violations.length})\n`);
+    sections.push(`| Memory ID | Violated By | Damage Level | Context |`);
+    sections.push(`|-----------|-------------|--------------|---------|`);
+    for (const v of payload.violations) {
+      const ctx = v.context.condition || v.context.reason || '';
+      sections.push(`| \`${v.memory_id}\` | \`${v.violated_by || 'N/A'}\` | ${v.damage_level || 'N/A'} | ${ctx} |`);
+    }
+    sections.push('');
+  }
+
+  if (payload.confirmations.length > 0) {
+    sections.push(`### Confirmations (${payload.confirmations.length})\n`);
+    sections.push(`| Memory ID | Context |`);
+    sections.push(`|-----------|---------|`);
+    for (const c of payload.confirmations) {
+      const ctx = c.context.condition || c.context.reason || '';
+      sections.push(`| \`${c.memory_id}\` | ${ctx} |`);
+    }
+    sections.push('');
+  }
+
+  if (payload.cascades.length > 0) {
+    sections.push(`### Cascades (${payload.cascades.length})\n`);
+    sections.push(`| Memory ID | Type | Source | Action |`);
+    sections.push(`|-----------|------|--------|--------|`);
+    for (const c of payload.cascades) {
+      sections.push(`| \`${c.memory_id}\` | ${c.cascade_type} | \`${c.context.source_id}\` | ${c.context.suggested_action} |`);
+    }
+    sections.push('');
+  }
+
+  sections.push(`<details>\n<summary>Raw Payload</summary>\n`);
+  sections.push('```json');
+  sections.push(JSON.stringify(payload, null, 2));
+  sections.push('```\n</details>');
+
+  return sections.join('\n');
 }
