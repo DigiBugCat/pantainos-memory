@@ -77,9 +77,7 @@ locals {
     { type = "plain_text", name = "RESOLVER_TYPE", text = "none" },
     { type = "plain_text", name = "CF_ACCESS_TEAM", text = var.cf_access_team },
     { type = "plain_text", name = "CLASSIFICATION_CHALLENGE_ENABLED", text = "true" },
-    { type = "plain_text", name = "LLM_JUDGE_URL", text = var.llm_judge_url },
-    { type = "secret_text", name = "LLM_JUDGE_CF_CLIENT_ID", text = var.llm_judge_cf_client_id },
-    { type = "secret_text", name = "LLM_JUDGE_CF_CLIENT_SECRET", text = var.llm_judge_cf_client_secret },
+    { type = "service", name = "CLAUDE_PROXY", service = var.claude_proxy_worker_name },
   ]
 }
 

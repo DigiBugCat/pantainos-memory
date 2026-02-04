@@ -231,16 +231,13 @@ export async function challengeClassification(
   try {
     let responseText: string;
 
-    if (env.LLM_JUDGE_URL) {
-      // Route through external LLM endpoint (e.g., claude-proxy)
+    if (env.CLAUDE_PROXY || env.LLM_JUDGE_URL) {
+      // Route through external LLM (service binding or URL)
       responseText = await withRetry(
         () => callExternalLLM(
-          env.LLM_JUDGE_URL!,
+          env.CLAUDE_PROXY ?? env.LLM_JUDGE_URL!,
           prompt,
-          env.LLM_JUDGE_API_KEY,
-          params.requestId,
-          env.LLM_JUDGE_CF_CLIENT_ID,
-          env.LLM_JUDGE_CF_CLIENT_SECRET
+          { apiKey: env.LLM_JUDGE_API_KEY, requestId: params.requestId }
         ),
         { retries: 2, delay: 100 }
       );
@@ -266,7 +263,6 @@ export async function challengeClassification(
             : undefined;
 
           if (isGptOss) {
-            // GPT-OSS uses Responses API format with structured output
             return await ai.run(
               model as Parameters<typeof ai.run>[0],
               {
@@ -284,7 +280,6 @@ export async function challengeClassification(
               gatewayConfig
             );
           } else {
-            // Chat completion format for other models
             return await ai.run(
               model as Parameters<typeof ai.run>[0],
               {
@@ -307,10 +302,6 @@ export async function challengeClassification(
       return null;
     }
 
-    // Only return challenge if:
-    // 1. Classification is incorrect according to LLM
-    // 2. Confidence is above threshold
-    // 3. Suggested type differs from current type
     if (
       !result.correctly_classified &&
       result.confidence >= config.classification.challengeThreshold &&
@@ -579,16 +570,13 @@ export async function checkMemoryCompleteness(
   try {
     let responseText: string;
 
-    if (env.LLM_JUDGE_URL) {
-      // Route through external LLM endpoint (e.g., claude-proxy)
+    if (env.CLAUDE_PROXY || env.LLM_JUDGE_URL) {
+      // Route through external LLM (service binding or URL)
       responseText = await withRetry(
         () => callExternalLLM(
-          env.LLM_JUDGE_URL!,
+          env.CLAUDE_PROXY ?? env.LLM_JUDGE_URL!,
           prompt,
-          env.LLM_JUDGE_API_KEY,
-          params.requestId,
-          env.LLM_JUDGE_CF_CLIENT_ID,
-          env.LLM_JUDGE_CF_CLIENT_SECRET
+          { apiKey: env.LLM_JUDGE_API_KEY, requestId: params.requestId }
         ),
         { retries: 2, delay: 100 }
       );
@@ -599,7 +587,6 @@ export async function checkMemoryCompleteness(
           const model = config.classification.challengeModel;
           const isGptOss = model.includes('gpt-oss');
 
-          // AI Gateway config for observability (optional)
           const gatewayConfig = config.aiGatewayId
             ? {
                 gateway: {
@@ -614,7 +601,6 @@ export async function checkMemoryCompleteness(
             : undefined;
 
           if (isGptOss) {
-            // GPT-OSS uses Responses API format with structured output
             return await ai.run(
               model as Parameters<typeof ai.run>[0],
               {
@@ -632,7 +618,6 @@ export async function checkMemoryCompleteness(
               gatewayConfig
             );
           } else {
-            // Chat completion format for other models
             return await ai.run(
               model as Parameters<typeof ai.run>[0],
               {

@@ -65,6 +65,11 @@ queue = "memory-detection"
 max_batch_size = 10
 max_batch_timeout = 5
 
+# Service Binding to claude-proxy (worker-to-worker, bypasses CF Access)
+[[services]]
+binding = "CLAUDE_PROXY"
+service = "claude-proxy"
+
 # Configuration Variables
 [vars]
 REASONING_MODEL = "@cf/openai/gpt-oss-120b"
@@ -84,6 +89,10 @@ name = "memory-dev"
 
 [env.dev.ai]
 binding = "AI"
+
+[[env.dev.services]]
+binding = "CLAUDE_PROXY"
+service = "claude-proxy-dev"
 
 [env.dev.vars]
 REASONING_MODEL = "@cf/openai/gpt-oss-120b"

@@ -20,40 +20,47 @@ function getGatewayOptions(config: Config): { gateway: { id: string } } | undefi
 
 /**
  * Call external LLM endpoint (OpenAI-compatible).
- * Used when LLM_JUDGE_URL is configured to route LLM calls through n8n or other services.
- * Supports CF Access service token auth (for claude-proxy) and/or Bearer token auth.
+ * Supports two modes:
+ *   1. Service binding (fetcher) — direct worker-to-worker, bypasses CF Access
+ *   2. URL + optional API key — external HTTP endpoint
  */
 export async function callExternalLLM(
-  url: string,
+  urlOrFetcher: string | Fetcher,
   prompt: string,
-  apiKey?: string,
-  requestId?: string,
-  cfClientId?: string,
-  cfClientSecret?: string
+  options?: { apiKey?: string; requestId?: string; path?: string }
 ): Promise<string> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   };
-  if (cfClientId && cfClientSecret) {
-    headers['CF-Access-Client-Id'] = cfClientId;
-    headers['CF-Access-Client-Secret'] = cfClientSecret;
+  if (options?.apiKey) {
+    headers['Authorization'] = `Bearer ${options.apiKey}`;
   }
-  if (apiKey) {
-    headers['Authorization'] = `Bearer ${apiKey}`;
-  }
-  if (requestId) {
-    headers['X-Request-Id'] = requestId;
+  if (options?.requestId) {
+    headers['X-Request-Id'] = options.requestId;
   }
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      model: 'default', // Let the endpoint decide the model
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.1,
-    }),
+  const body = JSON.stringify({
+    model: 'claude-haiku-4-5-20251001',
+    messages: [{ role: 'user', content: prompt }],
   });
+
+  let response: Response;
+  if (typeof urlOrFetcher === 'string') {
+    // External URL fetch
+    response = await fetch(urlOrFetcher, {
+      method: 'POST',
+      headers,
+      body,
+    });
+  } else {
+    // Service binding — call worker directly, path routes within the worker
+    const path = options?.path ?? '/v1/chat/completions';
+    response = await urlOrFetcher.fetch(new Request(`https://internal${path}`, {
+      method: 'POST',
+      headers,
+      body,
+    }));
+  }
 
   if (!response.ok) {
     throw new Error(`External LLM call failed: ${response.status} ${response.statusText}`);
@@ -173,10 +180,10 @@ Respond with ONLY a JSON object (no markdown, no explanation): {"verdict": "dupl
 
   let responseContent: string;
 
-  // Use external LLM endpoint if configured
-  if (env?.LLM_JUDGE_URL) {
+  // Use external LLM endpoint if configured (service binding or URL)
+  if (env?.CLAUDE_PROXY || env?.LLM_JUDGE_URL) {
     responseContent = await withRetry(
-      () => callExternalLLM(env.LLM_JUDGE_URL!, prompt, env.LLM_JUDGE_API_KEY, requestId, env.LLM_JUDGE_CF_CLIENT_ID, env.LLM_JUDGE_CF_CLIENT_SECRET),
+      () => callExternalLLM(env.CLAUDE_PROXY ?? env.LLM_JUDGE_URL!, prompt, { apiKey: env.LLM_JUDGE_API_KEY, requestId }),
       { retries: 2, delay: 100, name: 'checkDuplicateWithLLM_external', requestId }
     );
   } else {

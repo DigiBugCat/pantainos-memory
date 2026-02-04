@@ -22,7 +22,7 @@ const getLog = createLazyLogger('ExposureChecker', 'exposure-check-init');
 import { generateId } from '../lib/id.js';
 import { withRetry } from '../lib/retry.js';
 import { getConfig, type Config } from '../lib/config.js';
-import { generateEmbedding } from '../lib/embeddings.js';
+import { generateEmbedding, callExternalLLM } from '../lib/embeddings.js';
 import {
   searchInvalidatesConditions,
   searchConfirmsConditions,
@@ -705,46 +705,16 @@ async function checkConditionMatch(
   try {
     let responseText: string;
 
-    // Use external LLM endpoint if configured
-    if (env.LLM_JUDGE_URL) {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-      };
-      if (env.LLM_JUDGE_CF_CLIENT_ID && env.LLM_JUDGE_CF_CLIENT_SECRET) {
-        headers['CF-Access-Client-Id'] = env.LLM_JUDGE_CF_CLIENT_ID;
-        headers['CF-Access-Client-Secret'] = env.LLM_JUDGE_CF_CLIENT_SECRET;
-      }
-      if (env.LLM_JUDGE_API_KEY) {
-        headers['Authorization'] = `Bearer ${env.LLM_JUDGE_API_KEY}`;
-      }
-
-      const extResponse = await withRetry(
-        async () => {
-          const res = await fetch(env.LLM_JUDGE_URL!, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-              model: 'default',
-              messages: [{ role: 'user', content: prompt }],
-              temperature: 0.1,
-            }),
-          });
-          if (!res.ok) {
-            throw new Error(`External LLM call failed: ${res.status}`);
-          }
-          return res.json() as Promise<{
-            choices?: Array<{ message?: { content?: string } }>;
-            content?: string;
-            response?: string;
-          }>;
-        },
+    // Use external LLM endpoint if configured (service binding or URL)
+    if (env.CLAUDE_PROXY || env.LLM_JUDGE_URL) {
+      responseText = await withRetry(
+        () => callExternalLLM(
+          env.CLAUDE_PROXY ?? env.LLM_JUDGE_URL!,
+          prompt,
+          { apiKey: env.LLM_JUDGE_API_KEY }
+        ),
         { retries: 2, delay: 100 }
       );
-
-      responseText = extResponse.choices?.[0]?.message?.content
-        || extResponse.content
-        || extResponse.response
-        || '';
     } else {
       // Use Workers AI
       const response = await withRetry(

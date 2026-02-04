@@ -52,9 +52,9 @@ export interface Env extends MCPCoreEnv {
   LLM_JUDGE_URL?: string;
   LLM_JUDGE_API_KEY?: string;
 
-  // CF Access service token for authenticating to external LLM endpoint (e.g., claude-proxy)
-  LLM_JUDGE_CF_CLIENT_ID?: string;
-  LLM_JUDGE_CF_CLIENT_SECRET?: string;
+  // Service binding to claude-proxy worker (preferred over LLM_JUDGE_URL for worker-to-worker calls)
+  // Bypasses CF Access — no auth headers needed
+  CLAUDE_PROXY?: Fetcher;
 
   // Configurable via wrangler.toml [vars]
   EMBEDDING_MODEL?: string;
