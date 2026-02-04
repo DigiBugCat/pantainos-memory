@@ -1,51 +1,46 @@
 /**
- * Scoring Module - Cognitive Loop Architecture (v3)
+ * Scoring Module - Unified Thought Model (v4)
  *
- * New scoring formula based on confidence model:
- *   score = similarity × confidence × centralityBonus × robustnessBonus
+ * New scoring formula using Subjective Logic:
+ *   score = similarity × (1 + effective_confidence × BOOST_WEIGHT)
  *
  * Where:
- * - confidence = confirmations / max(exposures, 1)
- * - centralityBonus = 1 + log(centrality + 1) × 0.1
- * - robustnessBonus = 1.2 if exposures > 10, else 1.0
+ * - effective_confidence = blend of starting_confidence + earned evidence
+ * - BOOST_WEIGHT = 0.5 (configurable)
+ *
+ * Key change: Similarity drives ranking, confidence provides boost.
+ * Untested memories use their starting_confidence (prior), not 0.
  */
 
 import type { Memory, ScoredMemory } from './shared/types/index.js';
-import { getConfidence, getRobustness } from '../services/confidence.js';
+import {
+  getEffectiveConfidence,
+  getRobustness,
+  SCORING_WEIGHTS,
+  DEFAULT_MAX_TIMES_TESTED,
+} from '../services/confidence.js';
 import type { Config } from './config.js';
-
-/**
- * Calculate centrality bonus based on how many memories depend on this one.
- * More dependents = more valuable if damaged.
- */
-function calculateCentralityBonus(centrality: number): number {
-  // Log scale to prevent extreme values
-  return 1 + Math.log(centrality + 1) * 0.1;
-}
-
-/**
- * Calculate robustness bonus - well-tested memories deserve boost.
- */
-function calculateRobustnessBonus(memory: Memory): number {
-  const robustness = getRobustness(memory);
-  return robustness === 'robust' ? 1.2 : 1.0;
-}
 
 /**
  * Calculate final score for a memory based on similarity and confidence model.
  *
- * Formula: similarity × confidence × centralityBonus × robustnessBonus
+ * New Formula: similarity × (1 + effective_confidence × BOOST_WEIGHT)
+ *
+ * @param similarity - Vectorize similarity score (0-1)
+ * @param memory - The memory to score
+ * @param _config - Optional config (reserved for future use)
+ * @param maxTimesTested - Global max for normalization (from system_stats)
  */
 export function calculateScore(
   similarity: number,
   memory: Memory,
-  _config?: Config
+  _config?: Config,
+  maxTimesTested: number = DEFAULT_MAX_TIMES_TESTED
 ): number {
-  const confidence = getConfidence(memory);
-  const centralityBonus = calculateCentralityBonus(memory.centrality);
-  const robustnessBonus = calculateRobustnessBonus(memory);
+  const effective = getEffectiveConfidence(memory, maxTimesTested);
 
-  return similarity * confidence * centralityBonus * robustnessBonus;
+  // New formula: similarity with confidence boost
+  return similarity * (1 + effective * SCORING_WEIGHTS.CONFIDENCE_BOOST_WEIGHT);
 }
 
 /**
@@ -54,13 +49,14 @@ export function calculateScore(
  */
 export function rankResults<T extends { similarity: number; memory: Memory }>(
   results: T[],
-  config?: Config
+  config?: Config,
+  maxTimesTested: number = DEFAULT_MAX_TIMES_TESTED
 ): (T & { score: number; confidence: number })[] {
   return results
     .map(r => ({
       ...r,
-      score: calculateScore(r.similarity, r.memory, config),
-      confidence: getConfidence(r.memory),
+      score: calculateScore(r.similarity, r.memory, config, maxTimesTested),
+      confidence: getEffectiveConfidence(r.memory, maxTimesTested),
     }))
     .sort((a, b) => b.score - a.score);
 }
@@ -71,11 +67,12 @@ export function rankResults<T extends { similarity: number; memory: Memory }>(
 export function createScoredMemory(
   memory: Memory,
   similarity: number,
-  config?: Config
+  config?: Config,
+  maxTimesTested: number = DEFAULT_MAX_TIMES_TESTED
 ): ScoredMemory {
-  const confidence = getConfidence(memory);
-  const robustness = getRobustness(memory);
-  const score = calculateScore(similarity, memory, config);
+  const confidence = getEffectiveConfidence(memory, maxTimesTested);
+  const robustness = getRobustness(memory, config);
+  const score = calculateScore(similarity, memory, config, maxTimesTested);
 
   return {
     memory,

@@ -2,12 +2,12 @@
  * Graveyard Route - GET /api/graveyard
  *
  * Analyze patterns in violations across memories.
- * The "graveyard" is where violated assumptions go to teach us.
+ * The "graveyard" is where violated thoughts go to teach us.
  *
  * Returns:
  *   - Common violated conditions
  *   - Sources that cause most violations
- *   - Patterns in what assumptions fail
+ *   - Patterns in what thoughts fail
  *
  * Query params:
  *   - group_by: 'condition' | 'source' | 'time_period' (default: condition)

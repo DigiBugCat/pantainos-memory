@@ -14,12 +14,12 @@ import { Hono } from 'hono';
 import type { Env as BaseEnv, MemoryRow, ScoredMemory, RecordAccessParams, EdgeRow } from '../types/index.js';
 import type { Config } from '../lib/config.js';
 import type { ExposureCheckJob } from '../lib/shared/types/index.js';
+import { getDisplayType, isObservation } from '../lib/shared/types/index.js';
 import {
   handleMcpMessage,
   parseJsonRpcRequest,
   createToolRegistry,
   defineTool,
-  jsonResult,
   errorResult,
   type ToolContext,
 } from '../lib/shared/mcp/index.js';
@@ -27,14 +27,16 @@ import type { LoggingEnv } from '../lib/shared/hono/index.js';
 
 // Service imports for direct calls
 import { generateId } from '../lib/id.js';
+import { TYPE_STARTING_CONFIDENCE } from '../services/confidence.js';
+import { getStartingConfidenceForSource, computeSystemStats, getSystemStatsSummary } from '../jobs/compute-stats.js';
 import { generateEmbedding, searchSimilar, checkDuplicate, checkDuplicateWithLLM } from '../lib/embeddings.js';
-import { storeObservationEmbeddings, storeAssumptionEmbeddings } from '../services/embedding-tables.js';
+import { storeObservationEmbeddings, storeObservationWithConditions, storeThoughtEmbeddings } from '../services/embedding-tables.js';
 import { recordVersion } from '../services/history-service.js';
 import { recordAccessBatch } from '../services/access-service.js';
 import { rowToMemory } from '../lib/transforms.js';
 import { createScoredMemory } from '../lib/scoring.js';
 import { incrementCentrality } from '../services/exposure-checker.js';
-import { challengeClassification, formatChallengeOutput } from '../services/classification-challenge.js';
+import { checkMemoryCompleteness, formatCompletenessOutput } from '../services/classification-challenge.js';
 
 type Env = BaseEnv & LoggingEnv;
 
@@ -54,16 +56,16 @@ const VALID_SOURCES = ['market', 'news', 'earnings', 'email', 'human', 'tool'] a
 // ============================================
 
 /** Format a memory for display - compact single-line format */
-function formatMemory(m: { id: string; content: string; memory_type?: string; state?: string; exposures?: number; confirmations?: number }): string {
+function formatMemory(m: { id: string; content: string; state?: string; times_tested?: number; confirmations?: number }): string {
   const stateIcon = m.state === 'violated' ? ' ⚠️' : m.state === 'confirmed' ? ' ✓' : '';
-  const confidence = m.exposures && m.exposures > 0
-    ? ` (${Math.round((m.confirmations || 0) / m.exposures * 100)}% conf, ${m.exposures} tests)`
+  const confidence = m.times_tested && m.times_tested > 0
+    ? ` (${Math.round((m.confirmations || 0) / m.times_tested * 100)}% conf, ${m.times_tested} tests)`
     : '';
   return `[${m.id}] ${m.content}${stateIcon}${confidence}`;
 }
 
 /** Format search results */
-function formatFindResults(results: Array<{ memory: { id: string; content: string; memory_type: string; state?: string }; similarity: number; confidence: number }>, query: string): string {
+function formatFindResults(results: Array<{ memory: { id: string; content: string; state?: string }; similarity: number; confidence: number }>, query: string): string {
   if (results.length === 0) return `No results for "${query}"`;
 
   const lines = results.map((r, i) => {
@@ -79,15 +81,16 @@ function formatFindResults(results: Array<{ memory: { id: string; content: strin
 /** Format recall result */
 function formatRecall(memory: MemoryRow, connections: Array<{ target_id: string; strength: number }>): string {
   const m = rowToMemory(memory);
+  const displayType = getDisplayType(m);
   const stateIcon = m.state === 'violated' ? ' ⚠️ VIOLATED' : m.state === 'confirmed' ? ' ✓ CONFIRMED' : '';
-  const confidence = m.exposures > 0
-    ? `${Math.round(m.confirmations / m.exposures * 100)}% (${m.confirmations}/${m.exposures})`
+  const confidence = m.times_tested > 0
+    ? `${Math.round(m.confirmations / m.times_tested * 100)}% (${m.confirmations}/${m.times_tested})`
     : 'untested';
 
   let text = `[${m.id}] ${m.content}\n\n`;
-  text += `Type: ${m.memory_type} | State: ${m.state}${stateIcon} | Confidence: ${confidence}\n`;
+  text += `Type: ${displayType} | State: ${m.state}${stateIcon} | Confidence: ${confidence}\n`;
 
-  if (m.memory_type === 'obs' && m.source) {
+  if (isObservation(m) && m.source) {
     text += `Source: ${m.source}\n`;
   }
 
@@ -119,7 +122,7 @@ function formatInsights(view: string, memories: MemoryRow[]): string {
 
 /** Format pending predictions */
 function formatPending(memories: Array<{ id: string; content: string; resolves_by?: number }>): string {
-  if (memories.length === 0) return 'No pending time-bound assumptions';
+  if (memories.length === 0) return 'No pending time-bound predictions';
 
   const lines = memories.map(m => {
     const deadline = m.resolves_by ? new Date(m.resolves_by).toISOString().split('T')[0] : 'no deadline';
@@ -143,150 +146,36 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
   // Write Path - Create and modify memories
   // ----------------------------------------
 
-  defineTool({
+defineTool({
     name: 'observe',
-    description: 'Record a fact from reality. Observations are ground truth - immutable anchors that can only be retracted, never edited. When stored, the system automatically checks if this observation contradicts any existing assumptions (triggering violations) or confirms them. Sources: market, news, earnings, email, human, tool.',
+    description: `Record a memory. Two modes based on origin:
+
+OBSERVATION (reality intake): Set "source" (market, news, earnings, email, human, tool)
+THOUGHT (derived belief): Set "derived_from" with source memory IDs
+
+Exactly one of "source" OR "derived_from" required (mutually exclusive).
+
+Both modes support invalidates_if/confirms_if conditions.
+For predictions: add resolves_by (timestamp) + outcome_condition.`,
     inputSchema: {
       type: 'object',
       properties: {
-        content: { type: 'string', description: 'The observation content (what was observed)' },
-        source: { type: 'string', enum: ['market', 'news', 'earnings', 'email', 'human', 'tool'], description: 'Source of the observation' },
+        content: { type: 'string', description: 'The memory content' },
+        source: { type: 'string', enum: ['market', 'news', 'earnings', 'email', 'human', 'tool'], description: 'Observation source (mutually exclusive with derived_from)' },
+        derived_from: { type: 'array', items: { type: 'string' }, description: 'Source memory IDs (mutually exclusive with source)' },
+        invalidates_if: { type: 'array', items: { type: 'string' }, description: 'Conditions that would prove this wrong' },
+        confirms_if: { type: 'array', items: { type: 'string' }, description: 'Conditions that would strengthen this' },
+        assumes: { type: 'array', items: { type: 'string' }, description: 'Underlying assumptions (thoughts only)' },
+        resolves_by: { type: 'integer', description: 'Unix timestamp deadline' },
+        outcome_condition: { type: 'string', description: 'Success/failure criteria (required if resolves_by set)' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for categorization' },
       },
-      required: ['content', 'source'],
-    },
-    handler: async (args, ctx) => {
-      const { content, source, tags } = args as { content: string; source: string; tags?: string[] };
-
-      if (!VALID_SOURCES.includes(source as typeof VALID_SOURCES[number])) {
-        return errorResult(`source must be one of: ${VALID_SOURCES.join(', ')}`);
-      }
-
-      // Generate embedding first for duplicate check
-      const embedding = await generateEmbedding(ctx.env.AI, content, config, requestId);
-
-      // Check for duplicates
-      const dupCheck = await checkDuplicate(ctx.env, embedding, requestId);
-      if (dupCheck.id && dupCheck.similarity >= config.dedupThreshold) {
-        // High confidence duplicate
-        const existing = await ctx.env.DB.prepare(
-          `SELECT content FROM memories WHERE id = ?`
-        ).bind(dupCheck.id).first<{ content: string }>();
-
-        return textResult(`⚠️ DUPLICATE DETECTED (${Math.round(dupCheck.similarity * 100)}% match)\n\nExisting: [${dupCheck.id}] ${existing?.content || '(not found)'}\n\nNew (skipped): ${content}`);
-      } else if (dupCheck.id && dupCheck.similarity >= config.dedupLowerThreshold) {
-        // Borderline - use LLM to decide
-        const existing = await ctx.env.DB.prepare(
-          `SELECT content FROM memories WHERE id = ?`
-        ).bind(dupCheck.id).first<{ content: string }>();
-
-        if (existing) {
-          const llmResult = await checkDuplicateWithLLM(ctx.env.AI, content, existing.content, config, requestId, ctx.env);
-          if (llmResult.isDuplicate && llmResult.confidence >= config.dedupConfidenceThreshold) {
-            return textResult(`⚠️ DUPLICATE DETECTED (LLM: ${Math.round(llmResult.confidence * 100)}% confidence)\n\nExisting: [${dupCheck.id}] ${existing.content}\n\nNew (skipped): ${content}\n\nReason: ${llmResult.reasoning}`);
-          }
-        }
-      }
-
-      const now = Date.now();
-      const id = generateId('obs');
-      const sessionId = ctx.sessionId;
-
-      // Store in D1
-      await ctx.env.DB.prepare(
-        `INSERT INTO memories (
-          id, memory_type, content, source,
-          confirmations, exposures, centrality, state, violations,
-          retracted, tags, session_id, created_at
-        ) VALUES (?, 'obs', ?, ?, 0, 0, 0, 'active', '[]', 0, ?, ?, ?)`
-      ).bind(
-        id,
-        content,
-        source,
-        tags ? JSON.stringify(tags) : null,
-        sessionId || null,
-        now
-      ).run();
-
-      // Record version for audit trail
-      await recordVersion(ctx.env.DB, {
-        entityId: id,
-        entityType: 'obs',
-        changeType: 'created',
-        contentSnapshot: {
-          id,
-          memory_type: 'obs',
-          content,
-          source,
-          tags,
-          confirmations: 0,
-          exposures: 0,
-          centrality: 0,
-          state: 'active',
-          violations: [],
-          retracted: false,
-        },
-        sessionId,
-        requestId,
-      });
-
-      // Store embedding (already generated for dedup check)
-      await storeObservationEmbeddings(ctx.env, ctx.env.AI, config, {
-        id,
-        content,
-        source,
-        requestId,
-        embedding, // reuse pre-generated embedding
-      });
-
-      // Queue exposure check
-      const exposureJob: ExposureCheckJob = {
-        memory_id: id,
-        memory_type: 'obs',
-        content,
-        embedding,
-        session_id: sessionId,
-        request_id: requestId,
-        timestamp: now,
-      };
-
-      await ctx.env.DETECTION_QUEUE.send(exposureJob);
-
-      // Check for classification challenge (feature toggle)
-      let challengeText = '';
-      const challenge = await challengeClassification(ctx.env, ctx.env.AI, config, {
-        content,
-        current_type: 'obs',
-        requestId,
-      });
-      if (challenge) {
-        challengeText = formatChallengeOutput(challenge, 'obs');
-      }
-
-      return textResult(`✓ Observed [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}${challengeText}`);
-    },
-  }),
-
-  defineTool({
-    name: 'assume',
-    description: 'Form a belief derived from observations or other assumptions. Must specify derived_from (source memory IDs) and invalidates_if (conditions that would prove this wrong). Optionally add confirms_if (conditions that would strengthen this). For time-bound predictions, include resolves_by (Unix timestamp) and outcome_condition. The system automatically checks new observations against these conditions.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        content: { type: 'string', description: 'The assumption content (the derived belief)' },
-        derived_from: { type: 'array', items: { type: 'string' }, description: 'IDs of source memories this assumption is based on (required)' },
-        invalidates_if: { type: 'array', items: { type: 'string' }, description: 'Conditions that would prove this wrong (tested against new observations)' },
-        confirms_if: { type: 'array', items: { type: 'string' }, description: 'Conditions that would strengthen this (optional)' },
-        assumes: { type: 'array', items: { type: 'string' }, description: 'Underlying assumptions this belief rests on (optional)' },
-        resolves_by: { type: 'integer', description: 'Unix timestamp deadline for time-bound predictions (optional)' },
-        outcome_condition: { type: 'string', description: 'What determines success/failure for time-bound predictions (required if resolves_by set)' },
-        tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for categorization' },
-      },
-      required: ['content', 'derived_from'],
+      required: ['content'],
     },
     handler: async (args, ctx) => {
       const {
         content,
+        source,
         derived_from,
         invalidates_if,
         confirms_if,
@@ -296,7 +185,8 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         tags,
       } = args as {
         content: string;
-        derived_from: string[];
+        source?: string;
+        derived_from?: string[];
         invalidates_if?: string[];
         confirms_if?: string[];
         assumes?: string[];
@@ -305,27 +195,46 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         tags?: string[];
       };
 
-      // Validate derived_from
-      if (!derived_from || derived_from.length === 0) {
-        return errorResult('derived_from is required and must be a non-empty array');
+      // Validate origin: exactly one of source XOR derived_from required
+      const hasSource = source !== undefined && source !== null;
+      const hasDerivedFrom = derived_from !== undefined && derived_from !== null && derived_from.length > 0;
+
+      if (!hasSource && !hasDerivedFrom) {
+        return errorResult('Either "source" or "derived_from" is required. Set "source" for observations, "derived_from" for thoughts.');
+      }
+
+      if (hasSource && hasDerivedFrom) {
+        return errorResult('"source" and "derived_from" are mutually exclusive. Use "source" for observations (reality intake) or "derived_from" for thoughts (derived beliefs).');
+      }
+
+      // Mode-specific validation
+      if (hasSource) {
+        // Observation mode
+        if (!VALID_SOURCES.includes(source as typeof VALID_SOURCES[number])) {
+          return errorResult(`source must be one of: ${VALID_SOURCES.join(', ')}`);
+        }
+        // Observations can't have assumes
+        if (assumes && assumes.length > 0) {
+          return errorResult('"assumes" is only valid for thoughts (derived_from mode), not observations');
+        }
+      } else {
+        // Thought mode - validate derived_from existence
+        const placeholders = derived_from!.map(() => '?').join(',');
+        const sources = await ctx.env.DB.prepare(
+          `SELECT id FROM memories WHERE id IN (${placeholders}) AND retracted = 0`
+        ).bind(...derived_from!).all<{ id: string }>();
+
+        if (!sources.results || sources.results.length !== derived_from!.length) {
+          const foundIds = new Set(sources.results?.map((r) => r.id) || []);
+          const missing = derived_from!.filter((id) => !foundIds.has(id));
+          return errorResult(`Source memories not found: ${missing.join(', ')}`);
+        }
       }
 
       // Time-bound validation
       const timeBound = resolves_by !== undefined;
       if (timeBound && !outcome_condition) {
-        return errorResult('outcome_condition is required for time-bound assumptions (when resolves_by is set)');
-      }
-
-      // Verify all source IDs exist
-      const placeholders = derived_from.map(() => '?').join(',');
-      const sources = await ctx.env.DB.prepare(
-        `SELECT id FROM memories WHERE id IN (${placeholders}) AND retracted = 0`
-      ).bind(...derived_from).all<{ id: string }>();
-
-      if (!sources.results || sources.results.length !== derived_from.length) {
-        const foundIds = new Set(sources.results?.map((r) => r.id) || []);
-        const missing = derived_from.filter((id) => !foundIds.has(id));
-        return errorResult(`Source memories not found: ${missing.join(', ')}`);
+        return errorResult('outcome_condition is required when resolves_by is set');
       }
 
       // Generate embedding first for duplicate check
@@ -353,60 +262,79 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
       }
 
       const now = Date.now();
-      const id = generateId(timeBound ? 'pred' : 'infer');
+      const id = generateId();
       const sessionId = ctx.sessionId;
 
-      // Store in D1
+      // Determine starting confidence based on mode
+      let startingConfidence: number;
+      if (hasSource) {
+        // Observation: use source-based confidence
+        startingConfidence = await getStartingConfidenceForSource(ctx.env.DB, source!);
+      } else {
+        // Thought: predictions get lower prior than general thoughts
+        startingConfidence = timeBound ? TYPE_STARTING_CONFIDENCE.predict : TYPE_STARTING_CONFIDENCE.think;
+      }
+
+      // Unified INSERT into memories table
       await ctx.env.DB.prepare(
         `INSERT INTO memories (
-          id, memory_type, content,
+          id, content, source, derived_from,
           assumes, invalidates_if, confirms_if,
           outcome_condition, resolves_by,
-          confirmations, exposures, centrality, state, violations,
+          starting_confidence, confirmations, times_tested, contradictions,
+          centrality, state, violations,
           retracted, tags, session_id, created_at
-        ) VALUES (?, 'assumption', ?, ?, ?, ?, ?, ?, 0, 0, 0, 'active', '[]', 0, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'active', '[]', 0, ?, ?, ?)`
       ).bind(
         id,
         content,
+        hasSource ? source : null,
+        hasDerivedFrom ? JSON.stringify(derived_from) : null,
         assumes ? JSON.stringify(assumes) : null,
         invalidates_if ? JSON.stringify(invalidates_if) : null,
         confirms_if ? JSON.stringify(confirms_if) : null,
         outcome_condition || null,
         resolves_by || null,
+        startingConfidence,
         tags ? JSON.stringify(tags) : null,
         sessionId || null,
         now
       ).run();
 
-      // Create derivation edges and increment centrality
-      for (const sourceId of derived_from) {
-        const edgeId = generateId('edge');
-        await ctx.env.DB.prepare(
-          `INSERT INTO edges (id, source_id, target_id, edge_type, strength, created_at)
-           VALUES (?, ?, ?, 'derived_from', 1.0, ?)`
-        ).bind(edgeId, sourceId, id, now).run();
+      // For thoughts: create derivation edges and increment centrality
+      if (hasDerivedFrom) {
+        for (const sourceId of derived_from!) {
+          const edgeId = generateId();
+          await ctx.env.DB.prepare(
+            `INSERT INTO edges (id, source_id, target_id, edge_type, strength, created_at)
+             VALUES (?, ?, ?, 'derived_from', 1.0, ?)`
+          ).bind(edgeId, sourceId, id, now).run();
 
-        await incrementCentrality(ctx.env.DB, sourceId);
+          await incrementCentrality(ctx.env.DB, sourceId);
+        }
       }
 
       // Record version for audit trail
+      const entityType = hasSource ? 'observation' : (timeBound ? 'prediction' : 'thought');
       await recordVersion(ctx.env.DB, {
         entityId: id,
-        entityType: 'assumption',
+        entityType,
         changeType: 'created',
         contentSnapshot: {
           id,
-          memory_type: 'assumption',
           content,
+          source: hasSource ? source : undefined,
+          derived_from: hasDerivedFrom ? derived_from : undefined,
           assumes,
           invalidates_if,
           confirms_if,
           outcome_condition,
           resolves_by,
           tags,
-          derived_from,
+          starting_confidence: startingConfidence,
           confirmations: 0,
-          exposures: 0,
+          times_tested: 0,
+          contradictions: 0,
           centrality: 0,
           state: 'active',
           violations: [],
@@ -417,64 +345,331 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         requestId,
       });
 
-      // Store embeddings
-      // Store embeddings (reuse pre-computed embedding for content)
-      await storeAssumptionEmbeddings(ctx.env, ctx.env.AI, config, {
-        id,
+      // Store embeddings based on mode
+      const hasConditions = (invalidates_if && invalidates_if.length > 0) ||
+        (confirms_if && confirms_if.length > 0);
+
+      if (hasSource) {
+        // Observation mode
+        if (hasConditions) {
+          await storeObservationWithConditions(ctx.env, ctx.env.AI, config, {
+            id,
+            content,
+            source: source!,
+            invalidates_if,
+            confirms_if,
+            requestId,
+            embedding,
+          });
+        } else {
+          await storeObservationEmbeddings(ctx.env, ctx.env.AI, config, {
+            id,
+            content,
+            source: source!,
+            requestId,
+            embedding,
+          });
+        }
+      } else {
+        // Thought mode
+        await storeThoughtEmbeddings(ctx.env, ctx.env.AI, config, {
+          id,
+          content,
+          invalidates_if,
+          confirms_if,
+          assumes,
+          resolves_by,
+          requestId,
+          embedding,
+        });
+      }
+
+      // Queue exposure check
+      const exposureJob: ExposureCheckJob = {
+        memory_id: id,
+        is_observation: hasSource,
         content,
+        embedding,
+        session_id: sessionId,
+        request_id: requestId,
+        timestamp: now,
+        invalidates_if: hasConditions ? invalidates_if : undefined,
+        confirms_if: hasConditions ? confirms_if : undefined,
+        time_bound: timeBound,
+      };
+
+      await ctx.env.DETECTION_QUEUE.send(exposureJob);
+
+      // Check for memory completeness (feature toggle)
+      let completenessText = '';
+      const completeness = await checkMemoryCompleteness(ctx.env, ctx.env.AI, config, {
+        content,
+        has_source: hasSource,
+        has_derived_from: hasDerivedFrom,
+        has_invalidates_if: Boolean(invalidates_if?.length),
+        has_confirms_if: Boolean(confirms_if?.length),
+        has_resolves_by: timeBound,
+        requestId,
+      });
+      if (completeness) {
+        completenessText = formatCompletenessOutput(completeness);
+      }
+
+      // Format response based on mode
+      if (hasSource) {
+        return textResult(`✓ Observed [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}${completenessText}`);
+      } else {
+        const typeLabel = timeBound ? 'Predicted' : 'Thought';
+        return textResult(`✓ ${typeLabel} [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}\n\nDerived from: ${derived_from!.map(d => `[${d}]`).join(', ')}${completenessText}`);
+      }
+    },
+  }),
+
+  defineTool({
+    name: 'update',
+    description: 'Add missing fields to a recently-created memory (within 1 hour or same session). Use after completeness suggestions to strengthen a memory without recreating it. Cannot change core identity (content, source, derived_from).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        memory_id: { type: 'string', description: 'ID of the memory to update' },
+        invalidates_if: { type: 'array', items: { type: 'string' }, description: 'Conditions to ADD (not replace)' },
+        confirms_if: { type: 'array', items: { type: 'string' }, description: 'Conditions to ADD (not replace)' },
+        assumes: { type: 'array', items: { type: 'string' }, description: 'Assumptions to ADD (thoughts only)' },
+        resolves_by: { type: 'integer', description: 'Unix timestamp deadline (cannot change if already set)' },
+        outcome_condition: { type: 'string', description: 'Success/failure criteria (cannot change if already set)' },
+        tags: { type: 'array', items: { type: 'string' }, description: 'Tags to ADD (not replace)' },
+      },
+      required: ['memory_id'],
+    },
+    handler: async (args, ctx) => {
+      const {
+        memory_id,
         invalidates_if,
         confirms_if,
         assumes,
         resolves_by,
-        requestId,
-        embedding, // reuse pre-generated embedding
-      });
+        outcome_condition,
+        tags,
+      } = args as {
+        memory_id: string;
+        invalidates_if?: string[];
+        confirms_if?: string[];
+        assumes?: string[];
+        resolves_by?: number;
+        outcome_condition?: string;
+        tags?: string[];
+      };
 
-      // Queue exposure check if conditions defined
-      const hasConditions = (invalidates_if && invalidates_if.length > 0) ||
-        (timeBound && confirms_if && confirms_if.length > 0);
+      // Fetch the memory
+      const row = await ctx.env.DB.prepare(
+        `SELECT * FROM memories WHERE id = ? AND retracted = 0`
+      ).bind(memory_id).first<MemoryRow>();
 
-      if (hasConditions) {
+      if (!row) {
+        return errorResult(`Memory not found: ${memory_id}`);
+      }
+
+      // Check time window: same session OR created within 1 hour
+      const ONE_HOUR_MS = 60 * 60 * 1000;
+      const now = Date.now();
+      const isSameSession = ctx.sessionId && row.session_id === ctx.sessionId;
+      const isWithinTimeWindow = (now - row.created_at) < ONE_HOUR_MS;
+
+      if (!isSameSession && !isWithinTimeWindow) {
+        return errorResult(`Memory [${memory_id}] is too old to update (created ${Math.round((now - row.created_at) / 1000 / 60)} minutes ago). Only memories created within 1 hour or in the same session can be updated.`);
+      }
+
+      // Determine memory type
+      const hasSource = row.source !== null;
+      const hasDerivedFrom = row.derived_from !== null;
+
+      // Validate assumes is only for thoughts
+      if (assumes && assumes.length > 0 && hasSource) {
+        return errorResult('"assumes" can only be added to thoughts (derived_from mode), not observations');
+      }
+
+      // Parse existing arrays
+      const existingInvalidatesIf: string[] = row.invalidates_if ? JSON.parse(row.invalidates_if) : [];
+      const existingConfirmsIf: string[] = row.confirms_if ? JSON.parse(row.confirms_if) : [];
+      const existingAssumes: string[] = row.assumes ? JSON.parse(row.assumes) : [];
+      const existingTags: string[] = row.tags ? JSON.parse(row.tags) : [];
+
+      // Merge arrays (ADD, not replace)
+      const newInvalidatesIf = invalidates_if ? [...existingInvalidatesIf, ...invalidates_if] : existingInvalidatesIf;
+      const newConfirmsIf = confirms_if ? [...existingConfirmsIf, ...confirms_if] : existingConfirmsIf;
+      const newAssumes = assumes ? [...existingAssumes, ...assumes] : existingAssumes;
+      const newTags = tags ? [...new Set([...existingTags, ...tags])] : existingTags;
+
+      // Handle resolves_by and outcome_condition - can only set if not already set
+      let newResolvesBy = row.resolves_by;
+      let newOutcomeCondition = row.outcome_condition;
+
+      if (resolves_by !== undefined) {
+        if (row.resolves_by !== null) {
+          return errorResult('resolves_by is already set and cannot be changed');
+        }
+        newResolvesBy = resolves_by;
+      }
+
+      if (outcome_condition !== undefined) {
+        if (row.outcome_condition !== null) {
+          return errorResult('outcome_condition is already set and cannot be changed');
+        }
+        newOutcomeCondition = outcome_condition;
+      }
+
+      // Validate time-bound consistency
+      if (newResolvesBy !== null && newOutcomeCondition === null) {
+        return errorResult('outcome_condition is required when resolves_by is set');
+      }
+
+      // Update the memory
+      await ctx.env.DB.prepare(
+        `UPDATE memories SET
+          invalidates_if = ?,
+          confirms_if = ?,
+          assumes = ?,
+          resolves_by = ?,
+          outcome_condition = ?,
+          tags = ?,
+          updated_at = ?
+        WHERE id = ?`
+      ).bind(
+        newInvalidatesIf.length > 0 ? JSON.stringify(newInvalidatesIf) : null,
+        newConfirmsIf.length > 0 ? JSON.stringify(newConfirmsIf) : null,
+        newAssumes.length > 0 ? JSON.stringify(newAssumes) : null,
+        newResolvesBy || null,
+        newOutcomeCondition || null,
+        newTags.length > 0 ? JSON.stringify(newTags) : null,
+        now,
+        memory_id
+      ).run();
+
+      // Re-embed conditions if new ones were added
+      const addedInvalidatesIf = invalidates_if || [];
+      const addedConfirmsIf = confirms_if || [];
+      const timeBound = newResolvesBy !== null;
+
+      if (addedInvalidatesIf.length > 0 || addedConfirmsIf.length > 0) {
+        // Store new condition embeddings
+        // Start index from existing array length to avoid ID collisions
+        if (addedInvalidatesIf.length > 0) {
+          const conditionVectors = await Promise.all(
+            addedInvalidatesIf.map(async (condition, idx) => {
+              const index = existingInvalidatesIf.length + idx;
+              const condEmbedding = await generateEmbedding(ctx.env.AI, condition, config, requestId);
+              return {
+                id: `${memory_id}:inv:${index}`,
+                values: condEmbedding,
+                metadata: {
+                  memory_id,
+                  condition_index: index,
+                  condition_text: condition,
+                  time_bound: timeBound,
+                },
+              };
+            })
+          );
+          await ctx.env.INVALIDATES_VECTORS.upsert(conditionVectors as any);
+        }
+
+        if (addedConfirmsIf.length > 0) {
+          const conditionVectors = await Promise.all(
+            addedConfirmsIf.map(async (condition, idx) => {
+              const index = existingConfirmsIf.length + idx;
+              const condEmbedding = await generateEmbedding(ctx.env.AI, condition, config, requestId);
+              return {
+                id: `${memory_id}:conf:${index}`,
+                values: condEmbedding,
+                metadata: {
+                  memory_id,
+                  condition_index: index,
+                  condition_text: condition,
+                  time_bound: timeBound,
+                },
+              };
+            })
+          );
+          await ctx.env.CONFIRMS_VECTORS.upsert(conditionVectors as any);
+        }
+
+        // Update MEMORY_VECTORS metadata to reflect conditions now exist
+        const existingEmbedding = await generateEmbedding(ctx.env.AI, row.content, config, requestId);
+        await ctx.env.MEMORY_VECTORS.upsert([
+          {
+            id: memory_id,
+            values: existingEmbedding,
+            metadata: {
+              type: hasSource ? 'obs' : 'thought',
+              source: row.source || undefined,
+              has_invalidates_if: newInvalidatesIf.length > 0,
+              has_confirms_if: newConfirmsIf.length > 0,
+              has_assumes: newAssumes.length > 0,
+              has_outcome: timeBound,
+              resolves_by: newResolvesBy || undefined,
+              time_bound: timeBound,
+            } as any,
+          },
+        ]);
+
+        // Re-queue exposure check with new conditions
         const exposureJob: ExposureCheckJob = {
-          memory_id: id,
-          memory_type: 'assumption',
-          content,
-          embedding,
-          session_id: sessionId,
+          memory_id,
+          is_observation: hasSource,
+          content: row.content,
+          embedding: existingEmbedding,
+          session_id: ctx.sessionId,
           request_id: requestId,
           timestamp: now,
-          invalidates_if,
-          confirms_if,
+          invalidates_if: newInvalidatesIf.length > 0 ? newInvalidatesIf : undefined,
+          confirms_if: newConfirmsIf.length > 0 ? newConfirmsIf : undefined,
           time_bound: timeBound,
         };
-
         await ctx.env.DETECTION_QUEUE.send(exposureJob);
       }
 
-      // Check for classification challenge (feature toggle)
-      let challengeText = '';
-      const challenge = await challengeClassification(ctx.env, ctx.env.AI, config, {
-        content,
-        current_type: 'assumption',
+      // Record version for audit trail
+      await recordVersion(ctx.env.DB, {
+        entityId: memory_id,
+        entityType: hasSource ? 'observation' : (timeBound ? 'prediction' : 'thought'),
+        changeType: 'updated',
+        contentSnapshot: {
+          id: memory_id,
+          content: row.content,
+          source: row.source || undefined,
+          derived_from: hasDerivedFrom ? JSON.parse(row.derived_from!) : undefined,
+          assumes: newAssumes.length > 0 ? newAssumes : undefined,
+          invalidates_if: newInvalidatesIf.length > 0 ? newInvalidatesIf : undefined,
+          confirms_if: newConfirmsIf.length > 0 ? newConfirmsIf : undefined,
+          outcome_condition: newOutcomeCondition || undefined,
+          resolves_by: newResolvesBy || undefined,
+          tags: newTags.length > 0 ? newTags : undefined,
+        },
+        sessionId: ctx.sessionId,
         requestId,
       });
-      if (challenge) {
-        challengeText = formatChallengeOutput(challenge, 'assumption');
-      }
 
-      const typeLabel = timeBound ? 'Predicted' : 'Assumed';
-      return textResult(`✓ ${typeLabel} [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}\n\nDerived from: ${derived_from.map(d => `[${d}]`).join(', ')}${challengeText}`);
+      // Build response showing what was added
+      const changes: string[] = [];
+      if (addedInvalidatesIf.length > 0) changes.push(`+${addedInvalidatesIf.length} invalidates_if`);
+      if (addedConfirmsIf.length > 0) changes.push(`+${addedConfirmsIf.length} confirms_if`);
+      if (assumes && assumes.length > 0) changes.push(`+${assumes.length} assumes`);
+      if (tags && tags.length > 0) changes.push(`+${tags.length} tags`);
+      if (resolves_by !== undefined) changes.push(`resolves_by set`);
+      if (outcome_condition !== undefined) changes.push(`outcome_condition set`);
+
+      return textResult(`✓ Updated [${memory_id}]\n${changes.join(', ')}`);
     },
   }),
 
   defineTool({
     name: 'find',
-    description: 'Search memories by meaning. Results ranked by: similarity (semantic match), confidence (survival rate under testing), and centrality (how many assumptions derive from this). Use to find related observations before forming assumptions, or to check if an assumption already exists.',
+    description: 'Search memories by meaning. Results ranked by: similarity (semantic match), confidence (survival rate under testing), and centrality (how many thoughts derive from this). Use to find related observations before forming thoughts, or to check if a thought already exists.',
     inputSchema: {
       type: 'object',
       properties: {
         query: { type: 'string', description: 'Natural language search query' },
-        types: { type: 'array', items: { type: 'string', enum: ['obs', 'assumption'] }, description: 'Filter by memory types (obs, assumption)' },
+        types: { type: 'array', items: { type: 'string', enum: ['observation', 'thought', 'prediction'] }, description: 'Filter by memory types (observation, thought, prediction)' },
         limit: { type: 'integer', description: 'Max results to return (default: 10)', minimum: 1, maximum: 100 },
         min_similarity: { type: 'number', description: 'Minimum similarity threshold (0-1)' },
       },
@@ -490,7 +685,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
       const limit = requestedLimit || config.search.defaultLimit;
       const minSimilarity = min_similarity || config.search.minSimilarity;
-      const memoryTypes = types || ['obs', 'assumption'];
+      const filterTypes = types || null; // null means no filter
 
       // Generate embedding for query
       const queryEmbedding = await generateEmbedding(ctx.env.AI, query, config, requestId);
@@ -510,9 +705,6 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
       for (const match of searchResults) {
         if (results.length >= limit) break;
 
-        const memoryType = inferMemoryType(match.id);
-        if (!memoryTypes.includes(memoryType as string)) continue;
-
         const row = await ctx.env.DB.prepare(
           `SELECT * FROM memories WHERE id = ? AND retracted = 0`
         ).bind(match.id).first<MemoryRow>();
@@ -520,6 +712,13 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         if (!row) continue;
 
         const memory = rowToMemory(row);
+
+        // Type filtering using field presence
+        if (filterTypes) {
+          const displayType = getDisplayType(memory);
+          if (!filterTypes.includes(displayType)) continue;
+        }
+
         const scoredMemory = createScoredMemory(memory, match.similarity, config);
         results.push(scoredMemory);
       }
@@ -531,7 +730,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
       if (results.length > 0) {
         const accessEvents: RecordAccessParams[] = results.map((result, index) => ({
           entityId: result.memory.id,
-          entityType: result.memory.memory_type,
+          entityType: getDisplayType(result.memory),
           accessType: 'find' as const,
           sessionId: ctx.sessionId,
           requestId,
@@ -543,7 +742,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
       }
 
       return textResult(formatFindResults(results.map(r => ({
-        memory: { id: r.memory.id, content: r.memory.content, memory_type: r.memory.memory_type, state: r.memory.state },
+        memory: { id: r.memory.id, content: r.memory.content, state: r.memory.state },
         similarity: r.similarity,
         confidence: r.confidence,
       })), query));
@@ -552,7 +751,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
   defineTool({
     name: 'recall',
-    description: 'Get a memory by ID. Returns the memory content, confidence stats (exposures, confirmations), state (active/violated/confirmed), and derivation edges. Use to inspect a specific memory before building on it.',
+    description: 'Get a memory by ID. Returns the content, confidence stats (times_tested, confirmations), state (active/violated/confirmed), and derivation edges. Use to inspect a specific memory before building on it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -588,32 +787,37 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
       properties: {},
     },
     handler: async (_args, ctx) => {
-      // Count memories by type
-      const memoryCounts = await ctx.env.DB.prepare(
-        `SELECT memory_type, COUNT(*) as count FROM memories WHERE retracted = 0 GROUP BY memory_type`
-      ).all<{ memory_type: string; count: number }>();
+      // Count memories by type using field presence
+      const obsCount = await ctx.env.DB.prepare(
+        `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND source IS NOT NULL`
+      ).first<{ count: number }>();
 
-      const counts = Object.fromEntries(
-        (memoryCounts.results || []).map(r => [r.memory_type, r.count])
-      );
+      const thoughtCount = await ctx.env.DB.prepare(
+        `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND derived_from IS NOT NULL AND resolves_by IS NULL`
+      ).first<{ count: number }>();
+
+      const predictionCount = await ctx.env.DB.prepare(
+        `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND resolves_by IS NOT NULL`
+      ).first<{ count: number }>();
 
       // Count edges
       const edgeCount = await ctx.env.DB.prepare(
         'SELECT COUNT(*) as count FROM edges'
       ).first<{ count: number }>();
 
-      const obsCount = counts.obs || 0;
-      const assumptionCount = counts.assumption || 0;
-      const total = obsCount + assumptionCount;
+      const obs = obsCount?.count || 0;
+      const thoughts = thoughtCount?.count || 0;
+      const predictions = predictionCount?.count || 0;
+      const total = obs + thoughts + predictions;
       const edges = edgeCount?.count || 0;
 
-      return textResult(`📊 Memory Stats\nObservations: ${obsCount}\nAssumptions: ${assumptionCount}\nTotal: ${total}\nConnections: ${edges}`);
+      return textResult(`📊 Memory Stats\nObservations: ${obs}\nThoughts: ${thoughts}\nPredictions: ${predictions}\nTotal: ${total}\nConnections: ${edges}`);
     },
   }),
 
   defineTool({
     name: 'pending',
-    description: 'List time-bound assumptions past their resolves_by deadline awaiting resolution. These need human review elsewhere to mark as confirmed or violated.',
+    description: 'List time-bound predictions past their resolves_by deadline awaiting resolution. These need human review to mark as confirmed or violated.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -626,10 +830,10 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
       const now = Date.now();
       const resultLimit = limit || 20;
 
+      // Predictions are memories with resolves_by set (uses field presence)
       let query = `
         SELECT * FROM memories
-        WHERE memory_type = 'assumption'
-        AND state = 'active'
+        WHERE state = 'active'
         AND retracted = 0
         AND resolves_by IS NOT NULL
       `;
@@ -652,7 +856,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
   defineTool({
     name: 'insights',
-    description: 'Analyze knowledge graph health. Views: hubs (most-connected memories), orphans (unconnected - no derivation links), untested (low exposure count - dangerous if confident), failing (have violations from contradicting observations), recent (latest memories).',
+    description: 'Analyze knowledge graph health. Views: hubs (most-connected memories), orphans (unconnected - no derivation links), untested (low times_tested - dangerous if confident), failing (have violations from contradicting observations), recent (latest memories).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -694,7 +898,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         case 'untested':
           query = `
             SELECT * FROM memories
-            WHERE retracted = 0 AND exposures < 3
+            WHERE retracted = 0 AND times_tested < 3
             ORDER BY created_at DESC
             LIMIT ${resultLimit}
           `;
@@ -729,7 +933,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
   defineTool({
     name: 'reference',
-    description: 'Follow the derivation graph from a memory. Returns memories connected by derivation edges - what this memory derives from (ancestors via direction=up) or what derives from it (descendants via direction=down). Use to trace reasoning chains and understand dependencies.',
+    description: 'Follow the derivation graph from a memory. Returns memories connected by derivation edges - what this memory derives from (ancestors via direction=up) or what derives from it (descendants via direction=down). Use to trace reasoning chains and understand thought dependencies.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -776,7 +980,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
       const rootMemory = rowToMemory(rootRow);
       nodes.set(memory_id, {
         id: memory_id,
-        type: rootMemory.memory_type,
+        type: getDisplayType(rootMemory),
         content: rootMemory.content,
         depth: 0,
       });
@@ -806,7 +1010,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
                 const sourceMemory = rowToMemory(sourceRow);
                 nodes.set(row.source_id, {
                   id: row.source_id,
-                  type: sourceMemory.memory_type,
+                  type: getDisplayType(sourceMemory),
                   content: sourceMemory.content,
                   depth: currentDepth + 1,
                 });
@@ -840,7 +1044,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
                 const targetMemory = rowToMemory(targetRow);
                 nodes.set(row.target_id, {
                   id: row.target_id,
-                  type: targetMemory.memory_type,
+                  type: getDisplayType(targetMemory),
                   content: targetMemory.content,
                   depth: currentDepth + 1,
                 });
@@ -879,7 +1083,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
   defineTool({
     name: 'roots',
-    description: 'Trace an assumption back to its root observations. Walks the derivation chain to find the original facts this belief is based on. Use to audit reasoning - every assumption should trace back to reality.',
+    description: 'Trace a thought back to its root observations. Walks the derivation chain to find the original facts this belief is based on. Use to audit reasoning - every thought should trace back to reality.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -902,7 +1106,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
       const memory = rowToMemory(row);
 
       // If already an observation, return itself
-      if (memory.memory_type === 'obs') {
+      if (isObservation(memory)) {
         return textResult(`[${memory_id}] is already an observation (ground truth)\n\n${memory.content}`);
       }
 
@@ -920,16 +1124,16 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         ).bind(memId).all<{ source_id: string }>();
 
         if (!derivedFrom.results || derivedFrom.results.length === 0) {
-          // Check if this is an observation (root)
+          // Check if this is an observation (root) - has source field set
           const obsRow = await ctx.env.DB.prepare(
-            `SELECT * FROM memories WHERE id = ? AND memory_type = 'obs' AND retracted = 0`
+            `SELECT * FROM memories WHERE id = ? AND source IS NOT NULL AND retracted = 0`
           ).bind(memId).first<MemoryRow>();
 
           if (obsRow && !roots.some(r => r.id === memId)) {
             roots.push({
               id: memId,
               content: obsRow.content,
-              type: 'obs',
+              type: 'observation',
             });
             if (depth > maxDepth) maxDepth = depth;
           }
@@ -943,12 +1147,13 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
           if (!parentRow) continue;
 
-          if (parentRow.memory_type === 'obs') {
+          // Check if parent is an observation (has source field)
+          if (parentRow.source !== null) {
             if (!roots.some(r => r.id === parent.source_id)) {
               roots.push({
                 id: parent.source_id,
                 content: parentRow.content,
-                type: 'obs',
+                type: 'observation',
               });
               if (depth + 1 > maxDepth) maxDepth = depth + 1;
             }
@@ -961,7 +1166,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
       await traceToRoots(memory_id, 0);
 
       if (roots.length === 0) {
-        return textResult(`[${memory_id}] has no traceable roots (orphan assumption)`);
+        return textResult(`[${memory_id}] has no traceable roots (orphan thought)`);
       }
 
       const rootLines = roots.map(r => `[${r.id}] ${r.content}`);
@@ -976,7 +1181,7 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
   defineTool({
     name: 'between',
-    description: 'Find memories that bridge two given memories. Discovers conceptual connections you might not have noticed. Use when you have two related ideas and want to understand what links them.',
+    description: 'Find memories that bridge two given memories. Discovers conceptual connections you might not have noticed. Use when you have two related thoughts and want to understand what links them.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1049,14 +1254,15 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
         if (inputIdSet.has(match.id)) continue;
 
         const row = await ctx.env.DB.prepare(
-          `SELECT content, memory_type FROM memories WHERE id = ? AND retracted = 0`
-        ).bind(match.id).first<{ content: string; memory_type: string }>();
+          `SELECT * FROM memories WHERE id = ? AND retracted = 0`
+        ).bind(match.id).first<MemoryRow>();
 
         if (!row) continue;
 
+        const memory = rowToMemory(row);
         bridges.push({
           id: match.id,
-          type: row.memory_type,
+          type: getDisplayType(memory),
           content: row.content,
           relevanceScore: match.similarity,
         });
@@ -1071,291 +1277,68 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
     },
   }),
 
-  // ----------------------------------------
-  // Reclassify - Convert between memory types
-  // ----------------------------------------
+  // ============================================
+  // System Stats Tool
+  // ============================================
 
   defineTool({
-    name: 'reclassify_as_observation',
-    description: 'Convert an assumption to an observation. Use when a belief turns out to be direct factual knowledge from the world. Requires specifying a source for the new observation. Removes incoming derived_from edges since observations are root nodes.',
+    name: 'refresh_stats',
+    description: 'Manually trigger system statistics recomputation. Updates max_times_tested, median_times_tested, and per-source learned_confidence values. Normally runs daily via cron, use this to force an immediate refresh.',
     inputSchema: {
       type: 'object',
       properties: {
-        memory_id: { type: 'string', description: 'ID of the assumption to convert' },
-        source: { type: 'string', enum: ['market', 'news', 'earnings', 'email', 'human', 'tool'], description: 'Source of the observation (required)' },
-        reason: { type: 'string', description: 'Why this should be an observation instead of an assumption (required)' },
+        summary_only: { type: 'boolean', description: 'If true, only return current stats without recomputing (default: false)' },
       },
-      required: ['memory_id', 'source', 'reason'],
+      required: [],
     },
     handler: async (args, ctx) => {
-      const { memory_id, source, reason } = args as { memory_id: string; source: string; reason: string };
+      const { summary_only = false } = args as { summary_only?: boolean };
 
-      if (!VALID_SOURCES.includes(source as typeof VALID_SOURCES[number])) {
-        return errorResult(`source must be one of: ${VALID_SOURCES.join(', ')}`);
+      if (summary_only) {
+        // Just return current stats
+        const summary = await getSystemStatsSummary(ctx.env.DB);
+        const lastUpdated = summary.last_updated
+          ? new Date(summary.last_updated).toISOString()
+          : 'never';
+
+        let text = `System Stats Summary (last updated: ${lastUpdated})\n\n`;
+        text += `max_times_tested: ${summary.max_times_tested ?? 'not computed'}\n`;
+        text += `median_times_tested: ${summary.median_times_tested ?? 'not computed'}\n`;
+
+        if (Object.keys(summary.source_track_records).length > 0) {
+          text += `\nSource Track Records:\n`;
+          for (const [source, confidence] of Object.entries(summary.source_track_records)) {
+            text += `  ${source}: ${Math.round(confidence * 100)}%\n`;
+          }
+        } else {
+          text += `\nNo source track records yet (need 5+ tested memories per source)`;
+        }
+
+        return textResult(text);
       }
 
-      // Get current memory state
-      const memory = await ctx.env.DB.prepare(
-        `SELECT id, memory_type, content, state, retracted FROM memories WHERE id = ?`
-      ).bind(memory_id).first<{
-        id: string;
-        memory_type: string;
-        content: string;
-        state: string;
-        retracted: number;
-      }>();
+      // Compute fresh stats
+      const result = await computeSystemStats(ctx.env, requestId);
 
-      if (!memory) {
-        return errorResult(`Memory not found: ${memory_id}`);
+      let text = `✓ Stats recomputed successfully\n\n`;
+      text += `max_times_tested: ${result.maxTimesTested}\n`;
+      text += `median_times_tested: ${result.medianTimesTested}\n`;
+      text += `total_memories: ${result.totalMemories}\n`;
+
+      if (Object.keys(result.sourceTrackRecords).length > 0) {
+        text += `\nSource Track Records Updated:\n`;
+        for (const [source, confidence] of Object.entries(result.sourceTrackRecords)) {
+          text += `  ${source}: ${Math.round(confidence * 100)}%\n`;
+        }
+      } else {
+        text += `\nNo source track records computed (need 5+ tested memories per source)`;
       }
 
-      if (memory.memory_type !== 'assumption') {
-        return errorResult(`Memory is already type '${memory.memory_type}', not 'assumption'`);
-      }
-
-      if (memory.state !== 'active') {
-        return errorResult(`Cannot reclassify memory with state '${memory.state}'. Only 'active' memories can be reclassified.`);
-      }
-
-      if (memory.retracted === 1) {
-        return errorResult('Cannot reclassify a retracted memory');
-      }
-
-      const now = Date.now();
-
-      // Delete incoming derived_from edges
-      const incomingEdges = await ctx.env.DB.prepare(
-        `SELECT source_id FROM edges WHERE target_id = ? AND edge_type = 'derived_from'`
-      ).bind(memory_id).all<{ source_id: string }>();
-
-      const edgesRemoved = incomingEdges.results?.length || 0;
-
-      // Decrement centrality for each source
-      for (const edge of incomingEdges.results || []) {
-        await ctx.env.DB.prepare(
-          `UPDATE memories SET centrality = MAX(0, centrality - 1), updated_at = ? WHERE id = ?`
-        ).bind(now, edge.source_id).run();
-      }
-
-      // Delete the edges
-      await ctx.env.DB.prepare(
-        `DELETE FROM edges WHERE target_id = ? AND edge_type = 'derived_from'`
-      ).bind(memory_id).run();
-
-      // Update memories table
-      await ctx.env.DB.prepare(
-        `UPDATE memories
-         SET memory_type = 'obs',
-             source = ?,
-             assumes = NULL,
-             invalidates_if = NULL,
-             confirms_if = NULL,
-             outcome_condition = NULL,
-             resolves_by = NULL,
-             updated_at = ?
-         WHERE id = ?`
-      ).bind(source, now, memory_id).run();
-
-      // Update embeddings
-      const { updateMemoryTypeEmbeddings } = await import('../services/embedding-tables.js');
-      await updateMemoryTypeEmbeddings(ctx.env, ctx.env.AI, config, {
-        id: memory_id,
-        content: memory.content,
-        newType: 'obs',
-        source,
-        requestId,
-      });
-
-      // Record version
-      await recordVersion(ctx.env.DB, {
-        entityId: memory_id,
-        entityType: 'obs',
-        changeType: 'reclassified_as_observation',
-        contentSnapshot: {
-          id: memory_id,
-          memory_type: 'obs',
-          content: memory.content,
-          source,
-          previous_type: 'assumption',
-          edges_removed: edgesRemoved,
-        },
-        changeReason: reason,
-        sessionId: ctx.sessionId,
-        requestId,
-      });
-
-      return textResult(`✓ Reclassified [${memory_id}] as observation\n\nPrevious: assumption\nNew: observation (source: ${source})\nEdges removed: ${edgesRemoved}\n\nReason: ${reason}`);
-    },
-  }),
-
-  defineTool({
-    name: 'reclassify_as_assumption',
-    description: 'Convert an observation to an assumption. Use when factual knowledge should actually be treated as a derived belief. Requires specifying what memories this assumption is derived from. Creates derived_from edges to source memories.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        memory_id: { type: 'string', description: 'ID of the observation to convert' },
-        derived_from: { type: 'array', items: { type: 'string' }, description: 'IDs of source memories this assumption is based on (required)' },
-        reason: { type: 'string', description: 'Why this should be an assumption instead of an observation (required)' },
-        invalidates_if: { type: 'array', items: { type: 'string' }, description: 'Conditions that would prove this wrong' },
-        confirms_if: { type: 'array', items: { type: 'string' }, description: 'Conditions that would strengthen this (for time-bound assumptions)' },
-        resolves_by: { type: 'integer', description: 'Unix timestamp deadline for time-bound predictions (optional)' },
-        outcome_condition: { type: 'string', description: 'What determines success/failure (required if resolves_by set)' },
-      },
-      required: ['memory_id', 'derived_from', 'reason'],
-    },
-    handler: async (args, ctx) => {
-      const {
-        memory_id,
-        derived_from,
-        reason,
-        invalidates_if,
-        confirms_if,
-        resolves_by,
-        outcome_condition,
-      } = args as {
-        memory_id: string;
-        derived_from: string[];
-        reason: string;
-        invalidates_if?: string[];
-        confirms_if?: string[];
-        resolves_by?: number;
-        outcome_condition?: string;
-      };
-
-      if (!derived_from || derived_from.length === 0) {
-        return errorResult('derived_from is required and must be a non-empty array');
-      }
-
-      if (derived_from.includes(memory_id)) {
-        return errorResult('derived_from cannot include the memory being reclassified');
-      }
-
-      const timeBound = resolves_by !== undefined;
-      if (timeBound && !outcome_condition) {
-        return errorResult('outcome_condition is required for time-bound assumptions (when resolves_by is set)');
-      }
-
-      // Get current memory state
-      const memory = await ctx.env.DB.prepare(
-        `SELECT id, memory_type, content, retracted FROM memories WHERE id = ?`
-      ).bind(memory_id).first<{
-        id: string;
-        memory_type: string;
-        content: string;
-        retracted: number;
-      }>();
-
-      if (!memory) {
-        return errorResult(`Memory not found: ${memory_id}`);
-      }
-
-      if (memory.memory_type !== 'obs') {
-        return errorResult(`Memory is already type '${memory.memory_type}', not 'obs'`);
-      }
-
-      if (memory.retracted === 1) {
-        return errorResult('Cannot reclassify a retracted memory');
-      }
-
-      // Verify all source IDs exist
-      const placeholders = derived_from.map(() => '?').join(',');
-      const sources = await ctx.env.DB.prepare(
-        `SELECT id FROM memories WHERE id IN (${placeholders}) AND retracted = 0`
-      ).bind(...derived_from).all<{ id: string }>();
-
-      if (!sources.results || sources.results.length !== derived_from.length) {
-        const foundIds = new Set(sources.results?.map((r) => r.id) || []);
-        const missing = derived_from.filter((id) => !foundIds.has(id));
-        return errorResult(`Source memories not found or retracted: ${missing.join(', ')}`);
-      }
-
-      const now = Date.now();
-
-      // Create derived_from edges and increment centrality
-      let edgesCreated = 0;
-      for (const sourceId of derived_from) {
-        const edgeId = generateId('edge');
-        await ctx.env.DB.prepare(
-          `INSERT INTO edges (id, source_id, target_id, edge_type, strength, created_at)
-           VALUES (?, ?, ?, 'derived_from', 1.0, ?)`
-        ).bind(edgeId, sourceId, memory_id, now).run();
-
-        await incrementCentrality(ctx.env.DB, sourceId);
-        edgesCreated++;
-      }
-
-      // Update memories table
-      await ctx.env.DB.prepare(
-        `UPDATE memories
-         SET memory_type = 'assumption',
-             source = NULL,
-             invalidates_if = ?,
-             confirms_if = ?,
-             outcome_condition = ?,
-             resolves_by = ?,
-             updated_at = ?
-         WHERE id = ?`
-      ).bind(
-        invalidates_if ? JSON.stringify(invalidates_if) : null,
-        confirms_if ? JSON.stringify(confirms_if) : null,
-        outcome_condition || null,
-        resolves_by || null,
-        now,
-        memory_id
-      ).run();
-
-      // Update embeddings
-      const { updateMemoryTypeEmbeddings } = await import('../services/embedding-tables.js');
-      await updateMemoryTypeEmbeddings(ctx.env, ctx.env.AI, config, {
-        id: memory_id,
-        content: memory.content,
-        newType: 'assumption',
-        invalidates_if,
-        confirms_if,
-        resolves_by,
-        requestId,
-      });
-
-      // Record version
-      await recordVersion(ctx.env.DB, {
-        entityId: memory_id,
-        entityType: 'assumption',
-        changeType: 'reclassified_as_assumption',
-        contentSnapshot: {
-          id: memory_id,
-          memory_type: 'assumption',
-          content: memory.content,
-          derived_from,
-          invalidates_if,
-          confirms_if,
-          outcome_condition,
-          resolves_by,
-          previous_type: 'obs',
-          edges_created: edgesCreated,
-          time_bound: timeBound,
-        },
-        changeReason: reason,
-        sessionId: ctx.sessionId,
-        requestId,
-      });
-
-      const typeLabel = timeBound ? 'time-bound assumption' : 'assumption';
-      return textResult(`✓ Reclassified [${memory_id}] as ${typeLabel}\n\nPrevious: observation\nNew: ${typeLabel}\nDerived from: ${derived_from.map(d => `[${d}]`).join(', ')}\nEdges created: ${edgesCreated}\n\nReason: ${reason}`);
+      return textResult(text);
     },
   }),
 ]);
 
-/**
- * Infer memory type from ID prefix.
- */
-function inferMemoryType(id: string): string {
-  if (id.startsWith('obs-')) return 'obs';
-  if (id.startsWith('infer-')) return 'assumption';
-  if (id.startsWith('pred-')) return 'assumption';
-  if (id.startsWith('assum-')) return 'assumption';
-  return 'obs';
-}
 
 // ============================================
 // MCP Router

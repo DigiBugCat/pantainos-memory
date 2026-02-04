@@ -30,15 +30,14 @@ app.get('/', async (c) => {
   const now = Date.now();
 
   // Get predictions from unified memories table
-  // Note: In v4, predictions are assumptions with memory_type='assumption' AND resolves_by IS NOT NULL
-  // But we also check for pred- prefix in ID for backwards compatibility
+  // Predictions are memories with resolves_by IS NOT NULL
   let query: string;
   let params: (number | string)[];
 
   if (overdueOnly) {
     query = `
       SELECT * FROM memories
-      WHERE (memory_type = 'assumption' AND resolves_by IS NOT NULL)
+      WHERE resolves_by IS NOT NULL
       AND retracted = 0
       AND resolves_by < ?
       ORDER BY resolves_by ASC
@@ -48,7 +47,7 @@ app.get('/', async (c) => {
   } else {
     query = `
       SELECT * FROM memories
-      WHERE (memory_type = 'assumption' AND resolves_by IS NOT NULL)
+      WHERE resolves_by IS NOT NULL
       AND retracted = 0
       ORDER BY resolves_by ASC
       LIMIT ?
@@ -76,7 +75,7 @@ app.get('/', async (c) => {
 
   // Get total count of predictions
   const totalResult = await c.env.DB.prepare(
-    `SELECT COUNT(*) as count FROM memories WHERE memory_type = 'assumption' AND resolves_by IS NOT NULL AND retracted = 0`
+    `SELECT COUNT(*) as count FROM memories WHERE resolves_by IS NOT NULL AND retracted = 0`
   ).first<{ count: number }>();
 
   const response: PendingResponse = {

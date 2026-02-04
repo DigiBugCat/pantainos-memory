@@ -9,7 +9,7 @@
  * - /pending - List overdue predictions
  * - /insights/:view - Analytical views
  * - /knowledge - Topic depth assessment
- * - /brittle - Low-exposure assumptions
+ * - /brittle - Low-exposure thoughts
  * - /graveyard - Retracted/violated memories
  * - /collisions - Duplicate detection
  * - /roots/:id - Find root observations

@@ -14,11 +14,15 @@ import type { LoggingEnv } from '../lib/shared/hono/index.js';
 import type { Env as BaseEnv, MemoryRow, ScoredMemory, RecordAccessParams } from '../types/index.js';
 import type { Config } from '../lib/config.js';
 import type { ExposureCheckJob } from '../lib/shared/types/index.js';
+import { getDisplayType } from '../lib/shared/types/index.js';
 
 // Service imports for direct calls
 import { generateId } from '../lib/id.js';
 import { generateEmbedding, searchSimilar } from '../lib/embeddings.js';
-import { storeObservationEmbeddings } from '../services/embedding-tables.js';
+import { storeObservationEmbeddings, storeObservationWithConditions, storeThoughtEmbeddings } from '../services/embedding-tables.js';
+import { incrementCentrality } from '../services/exposure-checker.js';
+import { TYPE_STARTING_CONFIDENCE } from '../services/confidence.js';
+import { getStartingConfidenceForSource } from '../jobs/compute-stats.js';
 import { recordVersion } from '../services/history-service.js';
 import { recordAccessBatch } from '../services/access-service.js';
 import { rowToMemory } from '../lib/transforms.js';
@@ -44,12 +48,16 @@ function errorResponse(c: { json: (data: unknown, status?: number) => Response }
   return c.json({ success: false, error: message }, status);
 }
 
-function inferMemoryType(id: string): string {
-  if (id.startsWith('obs-')) return 'obs';
-  if (id.startsWith('infer-')) return 'assumption';
-  if (id.startsWith('pred-')) return 'assumption';
-  if (id.startsWith('assum-')) return 'assumption';
-  return 'obs';
+/**
+ * Get the filter type from a memory row based on field presence.
+ * Maps to the types used in find filters: 'obs' or 'thought'.
+ * Predictions are a subtype of thought for filtering purposes.
+ */
+function getFilterType(row: MemoryRow): 'obs' | 'thought' {
+  // Observation: has source
+  if (row.source != null) return 'obs';
+  // Thought (including predictions): has derived_from
+  return 'thought';
 }
 
 // =============================================================================
@@ -58,81 +66,196 @@ function inferMemoryType(id: string): string {
 
 /**
  * POST /internal/observe
- * Record an observation from reality.
+ * Unified memory creation endpoint.
+ * Creates either observation (has source) or thought (has derived_from).
  */
 internalRouter.post('/observe', async (c) => {
   const body = await c.req.json<{
     content: string;
-    source: string;
+    source?: string;
+    derived_from?: string[];
+    assumes?: string[];
+    invalidates_if?: string[];
+    confirms_if?: string[];
+    outcome_condition?: string;
+    resolves_by?: number;
     tags?: string[];
     session_id?: string;
   }>();
 
-  const { content, source, tags, session_id: sessionId } = body;
+  const {
+    content,
+    source,
+    derived_from,
+    assumes,
+    invalidates_if,
+    confirms_if,
+    outcome_condition,
+    resolves_by,
+    tags,
+    session_id: sessionId,
+  } = body;
 
-  if (!content || !source) {
-    return errorResponse(c, 'content and source are required');
+  if (!content) {
+    return errorResponse(c, 'content is required');
   }
 
-  if (!VALID_SOURCES.includes(source as typeof VALID_SOURCES[number])) {
-    return errorResponse(c, `source must be one of: ${VALID_SOURCES.join(', ')}`);
+  // Validate origin: exactly one of source XOR derived_from
+  const hasSource = source !== undefined && source !== null;
+  const hasDerivedFrom = derived_from !== undefined && derived_from !== null && derived_from.length > 0;
+
+  if (!hasSource && !hasDerivedFrom) {
+    return errorResponse(c, 'Either "source" or "derived_from" is required');
+  }
+
+  if (hasSource && hasDerivedFrom) {
+    return errorResponse(c, '"source" and "derived_from" are mutually exclusive');
+  }
+
+  // Mode-specific validation
+  if (hasSource) {
+    if (!VALID_SOURCES.includes(source as typeof VALID_SOURCES[number])) {
+      return errorResponse(c, `source must be one of: ${VALID_SOURCES.join(', ')}`);
+    }
+    if (assumes && assumes.length > 0) {
+      return errorResponse(c, '"assumes" is only valid for thoughts, not observations');
+    }
+  }
+
+  // Time-bound validation
+  const timeBound = resolves_by !== undefined;
+  if (timeBound && !outcome_condition) {
+    return errorResponse(c, 'outcome_condition is required when resolves_by is set');
   }
 
   const config = c.get('config');
   const requestId = c.get('requestId') || `internal-${Date.now()}`;
   const now = Date.now();
-  const id = generateId('obs');
+  const id = generateId();
 
-  // Store in D1
+  // Determine starting confidence
+  let startingConfidence: number;
+  if (hasSource) {
+    startingConfidence = await getStartingConfidenceForSource(c.env.DB, source!);
+  } else {
+    startingConfidence = timeBound ? TYPE_STARTING_CONFIDENCE.predict : TYPE_STARTING_CONFIDENCE.think;
+  }
+
+  // Unified INSERT into memories table
   await c.env.DB.prepare(
     `INSERT INTO memories (
-      id, memory_type, content, source,
-      confirmations, exposures, centrality, state, violations,
+      id, content, source, derived_from,
+      assumes, invalidates_if, confirms_if,
+      outcome_condition, resolves_by,
+      starting_confidence, confirmations, times_tested, contradictions,
+      centrality, state, violations,
       retracted, tags, session_id, created_at
-    ) VALUES (?, 'obs', ?, ?, 0, 0, 0, 'active', '[]', 0, ?, ?, ?)`
-  )
-    .bind(id, content, source, tags ? JSON.stringify(tags) : null, sessionId || null, now)
-    .run();
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'active', '[]', 0, ?, ?, ?)`
+  ).bind(
+    id,
+    content,
+    hasSource ? source : null,
+    hasDerivedFrom ? JSON.stringify(derived_from) : null,
+    assumes ? JSON.stringify(assumes) : null,
+    invalidates_if ? JSON.stringify(invalidates_if) : null,
+    confirms_if ? JSON.stringify(confirms_if) : null,
+    outcome_condition || null,
+    resolves_by || null,
+    startingConfidence,
+    tags ? JSON.stringify(tags) : null,
+    sessionId || null,
+    now
+  ).run();
+
+  // For thoughts: create derivation edges and increment centrality
+  if (hasDerivedFrom) {
+    for (const sourceId of derived_from!) {
+      const edgeId = generateId();
+      await c.env.DB.prepare(
+        `INSERT INTO edges (id, source_id, target_id, edge_type, strength, created_at)
+         VALUES (?, ?, ?, 'derived_from', 1.0, ?)`
+      ).bind(edgeId, sourceId, id, now).run();
+
+      await incrementCentrality(c.env.DB, sourceId);
+    }
+  }
 
   // Record version for audit trail
+  const entityType = hasSource ? 'observation' : (timeBound ? 'prediction' : 'thought');
   await recordVersion(c.env.DB, {
     entityId: id,
-    entityType: 'obs',
+    entityType,
     changeType: 'created',
     contentSnapshot: {
       id,
-      memory_type: 'obs',
       content,
-      source,
+      source: hasSource ? source : undefined,
+      derived_from: hasDerivedFrom ? derived_from : undefined,
+      assumes,
+      invalidates_if,
+      confirms_if,
+      outcome_condition,
+      resolves_by,
       tags,
-      confirmations: 0,
-      exposures: 0,
-      centrality: 0,
-      state: 'active',
-      violations: [],
-      retracted: false,
+      starting_confidence: startingConfidence,
     },
     sessionId,
     requestId,
   });
 
-  // Generate embedding and store
-  const { embedding } = await storeObservationEmbeddings(c.env, c.env.AI, config, {
-    id,
-    content,
-    source,
-    requestId,
-  });
+  // Store embeddings based on mode
+  const hasConditions = (invalidates_if && invalidates_if.length > 0) ||
+    (confirms_if && confirms_if.length > 0);
+
+  let embedding: number[];
+
+  if (hasSource) {
+    // Observation mode
+    if (hasConditions) {
+      const result = await storeObservationWithConditions(c.env, c.env.AI, config, {
+        id,
+        content,
+        source: source!,
+        invalidates_if,
+        confirms_if,
+        requestId,
+      });
+      embedding = result.embedding;
+    } else {
+      const result = await storeObservationEmbeddings(c.env, c.env.AI, config, {
+        id,
+        content,
+        source: source!,
+        requestId,
+      });
+      embedding = result.embedding;
+    }
+  } else {
+    // Thought mode
+    const result = await storeThoughtEmbeddings(c.env, c.env.AI, config, {
+      id,
+      content,
+      invalidates_if,
+      confirms_if,
+      assumes,
+      resolves_by,
+      requestId,
+    });
+    embedding = result.embedding;
+  }
 
   // Queue exposure check
   const exposureJob: ExposureCheckJob = {
     memory_id: id,
-    memory_type: 'obs',
+    is_observation: hasSource,
     content,
     embedding,
     session_id: sessionId,
     request_id: requestId,
     timestamp: now,
+    invalidates_if: hasConditions ? invalidates_if : undefined,
+    confirms_if: hasConditions ? confirms_if : undefined,
+    time_bound: timeBound,
   };
 
   await c.env.DETECTION_QUEUE.send(exposureJob);
@@ -140,120 +263,8 @@ internalRouter.post('/observe', async (c) => {
   return c.json({
     success: true,
     id,
+    time_bound: timeBound || undefined,
     exposure_check: 'queued',
-  });
-});
-
-/**
- * POST /internal/assume
- * Create an assumption (derived belief that can be tested).
- */
-internalRouter.post('/assume', async (c) => {
-  const body = await c.req.json<{
-    content: string;
-    derived_from?: string[];
-    invalidates_if?: string;
-    confirms_if?: string;
-    resolves_by?: number;
-    tags?: string[];
-    session_id?: string;
-  }>();
-
-  const { content, derived_from, invalidates_if, confirms_if, resolves_by, tags, session_id: sessionId } = body;
-
-  if (!content) {
-    return errorResponse(c, 'content is required');
-  }
-
-  const config = c.get('config');
-  const requestId = c.get('requestId') || `internal-${Date.now()}`;
-  const now = Date.now();
-  // Use 'pred' for time-bound assumptions (with deadline), 'infer' for general
-  const id = generateId(resolves_by ? 'pred' : 'infer');
-
-  // Store in D1
-  await c.env.DB.prepare(
-    `INSERT INTO memories (
-      id, memory_type, content,
-      invalidates_if, confirms_if, resolves_by,
-      confirmations, exposures, centrality, state, violations,
-      retracted, tags, session_id, created_at
-    ) VALUES (?, 'assumption', ?, ?, ?, ?, 0, 0, 0, 'active', '[]', 0, ?, ?, ?)`
-  )
-    .bind(
-      id,
-      content,
-      invalidates_if || null,
-      confirms_if || null,
-      resolves_by || null,
-      tags ? JSON.stringify(tags) : null,
-      sessionId || null,
-      now
-    )
-    .run();
-
-  // Create edges for derivations
-  if (derived_from && derived_from.length > 0) {
-    for (const sourceId of derived_from) {
-      await c.env.DB.prepare(
-        `INSERT INTO edges (source_id, target_id, strength, created_at)
-        VALUES (?, ?, 1.0, ?)`
-      )
-        .bind(sourceId, id, now)
-        .run();
-    }
-  }
-
-  // Record version
-  await recordVersion(c.env.DB, {
-    entityId: id,
-    entityType: 'assumption',
-    changeType: 'created',
-    contentSnapshot: { id, content, derived_from, invalidates_if, confirms_if, resolves_by, tags },
-    sessionId,
-    requestId,
-  });
-
-  // Generate embedding and store
-  const embedding = await generateEmbedding(c.env.AI, content, config, requestId);
-
-  // Store in MEMORY_VECTORS
-  await c.env.MEMORY_VECTORS.upsert([
-    {
-      id,
-      values: embedding,
-      metadata: { type: 'assumption' },
-    },
-  ]);
-
-  // Store invalidates_if in INVALIDATES_VECTORS if present
-  if (invalidates_if) {
-    const invEmbedding = await generateEmbedding(c.env.AI, invalidates_if, config, requestId);
-    await c.env.INVALIDATES_VECTORS.upsert([
-      {
-        id: `${id}:inv`,
-        values: invEmbedding,
-        metadata: { memory_id: id },
-      },
-    ]);
-  }
-
-  // Store confirms_if in CONFIRMS_VECTORS if present
-  if (confirms_if) {
-    const confEmbedding = await generateEmbedding(c.env.AI, confirms_if, config, requestId);
-    await c.env.CONFIRMS_VECTORS.upsert([
-      {
-        id: `${id}:conf`,
-        values: confEmbedding,
-        metadata: { memory_id: id },
-      },
-    ]);
-  }
-
-  return c.json({
-    success: true,
-    id,
-    derived_from: derived_from || [],
   });
 });
 
@@ -281,7 +292,7 @@ internalRouter.post('/find', async (c) => {
 
   const limit = requestedLimit || config.search.defaultLimit;
   const minSimilarity = min_similarity || config.search.minSimilarity;
-  const memoryTypes = types || ['obs', 'assumption'];
+  const memoryTypes = types || ['obs', 'thought'];
 
   // Generate embedding for query
   const queryEmbedding = await generateEmbedding(c.env.AI, query, config, requestId);
@@ -295,14 +306,15 @@ internalRouter.post('/find', async (c) => {
   for (const match of searchResults) {
     if (results.length >= limit) break;
 
-    const memoryType = inferMemoryType(match.id);
-    if (!memoryTypes.includes(memoryType as string)) continue;
-
     const row = await c.env.DB.prepare(`SELECT * FROM memories WHERE id = ? AND retracted = 0`)
       .bind(match.id)
       .first<MemoryRow>();
 
     if (!row) continue;
+
+    // Filter by type using field presence
+    const filterType = getFilterType(row);
+    if (!memoryTypes.includes(filterType)) continue;
 
     const memory = rowToMemory(row);
     const scoredMemory = createScoredMemory(memory, match.similarity, config);
@@ -316,7 +328,7 @@ internalRouter.post('/find', async (c) => {
   if (results.length > 0) {
     const accessEvents: RecordAccessParams[] = results.map((result, index) => ({
       entityId: result.memory.id,
-      entityType: result.memory.memory_type,
+      entityType: getDisplayType(result.memory),
       accessType: 'find' as const,
       sessionId,
       requestId,
@@ -331,7 +343,7 @@ internalRouter.post('/find', async (c) => {
     results: results.map((r) => ({
       id: r.memory.id,
       content: r.memory.content,
-      type: r.memory.memory_type,
+      type: getDisplayType(r.memory),
       score: r.score,
       similarity: r.similarity,
       confidence: r.confidence,
@@ -377,21 +389,32 @@ internalRouter.post('/recall', async (c) => {
  * Get memory statistics.
  */
 internalRouter.get('/stats', async (c) => {
-  // Count memories by type
-  const memoryCounts = await c.env.DB.prepare(
-    `SELECT memory_type, COUNT(*) as count FROM memories WHERE retracted = 0 GROUP BY memory_type`
-  ).all<{ memory_type: string; count: number }>();
+  // Count memories by type using field presence
+  const obsCount = await c.env.DB.prepare(
+    `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND source IS NOT NULL`
+  ).first<{ count: number }>();
 
-  const counts = Object.fromEntries((memoryCounts.results || []).map((r) => [r.memory_type, r.count]));
+  const thoughtCount = await c.env.DB.prepare(
+    `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND derived_from IS NOT NULL AND resolves_by IS NULL`
+  ).first<{ count: number }>();
+
+  const predictionCount = await c.env.DB.prepare(
+    `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND resolves_by IS NOT NULL`
+  ).first<{ count: number }>();
 
   // Count edges
   const edgeCount = await c.env.DB.prepare('SELECT COUNT(*) as count FROM edges').first<{ count: number }>();
 
+  const obs = obsCount?.count || 0;
+  const thoughts = thoughtCount?.count || 0;
+  const predictions = predictionCount?.count || 0;
+
   return c.json({
     memories: {
-      obs: counts.obs || 0,
-      assumption: counts.assumption || 0,
-      total: Object.values(counts).reduce((a, b) => a + b, 0),
+      observation: obs,
+      thought: thoughts,
+      prediction: predictions,
+      total: obs + thoughts + predictions,
     },
     edges: edgeCount?.count || 0,
   });

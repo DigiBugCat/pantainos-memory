@@ -8,19 +8,22 @@
  */
 
 import { Hono } from 'hono';
-import type { Env, EntityType } from '../types/index.js';
+import type { Env } from '../types/index.js';
 
 const app = new Hono<{ Bindings: Env }>();
+
+/** Display type for graph nodes */
+type DisplayType = 'observation' | 'thought' | 'prediction';
 
 interface GraphEntity {
   id: string;
   content: string;
-  type: EntityType;
+  type: DisplayType;
   tags: string[];
   created_at: number;
   source?: string;
   state?: string;
-  exposures: number;
+  times_tested: number;
   confirmations: number;
   edge_count: number;
   access_count: number;
@@ -43,10 +46,17 @@ app.get('/', async (c) => {
     edgeCounts,
     accessCounts,
   ] = await Promise.all([
-    // All active memories
+    // All active memories - derive type from field presence
     c.env.DB.prepare(`
-      SELECT id, content, memory_type as type, source, state, tags,
-             exposures, confirmations, created_at
+      SELECT id, content,
+             CASE
+               WHEN source IS NOT NULL THEN 'observation'
+               WHEN resolves_by IS NOT NULL THEN 'prediction'
+               WHEN derived_from IS NOT NULL THEN 'thought'
+               ELSE 'observation'
+             END as type,
+             source, state, tags,
+             times_tested, confirmations, created_at
       FROM memories
       WHERE retracted = 0
       ORDER BY created_at DESC
@@ -54,11 +64,11 @@ app.get('/', async (c) => {
     `).all<{
       id: string;
       content: string;
-      type: string;
+      type: DisplayType;
       source: string | null;
       state: string;
       tags: string | null;
-      exposures: number;
+      times_tested: number;
       confirmations: number;
       created_at: number;
     }>(),
@@ -99,11 +109,11 @@ app.get('/', async (c) => {
   const entities: GraphEntity[] = (memories.results || []).map(row => ({
     id: row.id,
     content: row.content,
-    type: row.type as EntityType,
+    type: row.type,
     source: row.source || undefined,
     state: row.state,
     tags: row.tags ? JSON.parse(row.tags) : [],
-    exposures: row.exposures,
+    times_tested: row.times_tested,
     confirmations: row.confirmations,
     created_at: row.created_at,
     edge_count: edgeCountMap.get(row.id) || 0,

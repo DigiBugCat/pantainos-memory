@@ -1,117 +1,138 @@
 -- ============================================
--- Cassandra Memory - Consolidated Schema
+-- Pantainos Memory - Unified Memory Model
 -- ============================================
--- This is the complete schema for a fresh database.
--- Uses IF NOT EXISTS for idempotent deployments.
+-- Clean slate schema. No memory_type column.
+-- Everything is a memory. Fields determine semantics:
+--   - source IS NOT NULL → observation (intake from reality)
+--   - derived_from IS NOT NULL → thought (derived belief)
+--   - resolves_by IS NOT NULL → time-bound thought (prediction)
 --
--- Environment behavior:
---   Staging: reset.sql runs first (wipes tables), then schema.sql
---   Production: only schema.sql runs (additive changes only)
---
--- Architecture: 2-primitive cognitive loop
---   1. Observations (obs) - raw reality intake
---   2. Assumptions (assumption) - compressed beliefs
---      - Without deadline → general assumption (was: inference)
---      - With deadline → time-bound assumption (was: prediction)
+-- IDs are plain nanoids: a1b2c3d4e5 (no prefixes)
 
 -- ============================================
 -- MEMORIES (Unified Entity Table)
 -- ============================================
--- Single table for both primitives: obs, assumption
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY,
-  memory_type TEXT NOT NULL CHECK(memory_type IN ('obs', 'assumption')),
   content TEXT NOT NULL,
 
-  -- Source tracking (obs only)
+  -- Origin fields (mutually exclusive in practice)
   source TEXT CHECK(source IN ('market', 'news', 'earnings', 'email', 'human', 'tool')),
+  derived_from TEXT,         -- JSON array of source memory IDs
 
-  -- Assumption fields
-  assumes TEXT,           -- JSON array of underlying assumptions
-  invalidates_if TEXT,    -- JSON array ["condition that would damage this"]
+  -- Thought fields (only meaningful when derived_from is set)
+  assumes TEXT,              -- JSON array of underlying assumptions
+  invalidates_if TEXT,       -- JSON array of conditions that would damage this
 
-  -- Time-bound assumption fields (optional - presence determines time-bound)
-  confirms_if TEXT,       -- JSON array ["condition that would strengthen this"]
-  outcome_condition TEXT, -- What determines success/failure
-  resolves_by INTEGER,    -- Deadline timestamp (presence = time-bound)
+  -- Time-bound thought fields (only meaningful when resolves_by is set)
+  confirms_if TEXT,          -- JSON array of conditions that would confirm this
+  outcome_condition TEXT,    -- What determines success/failure
+  resolves_by INTEGER,       -- Deadline timestamp
 
   -- Confidence model
-  confirmations INTEGER DEFAULT 0,  -- Times it held under test
-  exposures INTEGER DEFAULT 0,      -- Times it was tested
-  -- confidence = confirmations / max(exposures, 1)
+  starting_confidence REAL DEFAULT 0.5,
+  confirmations INTEGER DEFAULT 0,
+  times_tested INTEGER DEFAULT 0,
+  contradictions INTEGER DEFAULT 0,
 
-  -- Centrality (cached, updated on edge changes)
-  centrality INTEGER DEFAULT 0,  -- Count of memories that depend on this one
+  -- Graph
+  centrality INTEGER DEFAULT 0,
 
-  -- Violations as data (mark, don't delete)
-  violations TEXT DEFAULT '[]',  -- JSON: [{condition, timestamp, obs_id, damage_level}]
-
-  -- Soft delete for observations
-  retracted INTEGER DEFAULT 0,      -- 1 = retracted
-  retracted_at INTEGER,
-  retraction_reason TEXT,
-
-  -- State machine
+  -- State
+  violations TEXT DEFAULT '[]',
   state TEXT DEFAULT 'active' CHECK(state IN ('active', 'confirmed', 'violated', 'resolved')),
   outcome TEXT CHECK(outcome IN ('correct', 'incorrect', 'voided')),
   resolved_at INTEGER,
+  retracted INTEGER DEFAULT 0,
+  retracted_at INTEGER,
+  retraction_reason TEXT,
 
-  -- Exposure check tracking
+  -- Processing
   exposure_check_status TEXT DEFAULT 'pending'
     CHECK(exposure_check_status IN ('pending', 'processing', 'completed', 'skipped')),
   exposure_check_completed_at INTEGER,
-
-  -- Cascade tracking (for enhanced confidence calculation)
-  cascade_boosts INTEGER DEFAULT 0,   -- Times boosted via cascade from downstream
-  cascade_damages INTEGER DEFAULT 0,  -- Times damaged via cascade from downstream
+  cascade_boosts INTEGER DEFAULT 0,
+  cascade_damages INTEGER DEFAULT 0,
   last_cascade_at INTEGER,
 
   -- Metadata
-  tags TEXT,              -- JSON array
+  tags TEXT,
   session_id TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER
 );
 
 -- Core indices
-CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id, created_at);
 
+-- Observations (source IS NOT NULL)
+CREATE INDEX IF NOT EXISTS idx_memories_observations ON memories(source, created_at DESC)
+  WHERE source IS NOT NULL AND retracted = 0;
+
+-- Thoughts (derived_from IS NOT NULL)
+CREATE INDEX IF NOT EXISTS idx_memories_thoughts ON memories(created_at DESC)
+  WHERE derived_from IS NOT NULL AND retracted = 0;
+
+-- Predictions (resolves_by IS NOT NULL)
+CREATE INDEX IF NOT EXISTS idx_memories_predictions ON memories(resolves_by)
+  WHERE resolves_by IS NOT NULL AND retracted = 0;
+
 -- Confidence-based ranking
 CREATE INDEX IF NOT EXISTS idx_memories_confidence ON memories(
-  (CAST(confirmations AS REAL) / CASE WHEN exposures = 0 THEN 1 ELSE exposures END) DESC
+  (CAST(confirmations AS REAL) / CASE WHEN times_tested = 0 THEN 1 ELSE times_tested END) DESC
 ) WHERE retracted = 0;
 
--- Brittle memories: high confidence but low exposure
-CREATE INDEX IF NOT EXISTS idx_memories_brittle ON memories(exposures, confirmations)
-  WHERE exposures < 10 AND confirmations > 0 AND retracted = 0;
+-- Brittle memories: high confidence but low times_tested
+CREATE INDEX IF NOT EXISTS idx_memories_brittle ON memories(times_tested, confirmations)
+  WHERE times_tested < 10 AND confirmations > 0 AND retracted = 0;
 
--- Pending time-bound assumptions past deadline
-CREATE INDEX IF NOT EXISTS idx_memories_pending ON memories(resolves_by)
-  WHERE memory_type = 'assumption' AND resolves_by IS NOT NULL AND retracted = 0;
+-- Contradictions index for detecting conflicted thoughts
+CREATE INDEX IF NOT EXISTS idx_memories_contradictions ON memories(contradictions DESC)
+  WHERE retracted = 0 AND contradictions > 0;
+
+-- Starting confidence index (for debugging/inspection)
+CREATE INDEX IF NOT EXISTS idx_memories_starting_confidence ON memories(starting_confidence)
+  WHERE retracted = 0;
 
 -- Centrality for hub detection
 CREATE INDEX IF NOT EXISTS idx_memories_centrality ON memories(centrality DESC)
   WHERE retracted = 0;
 
--- Source filtering for observations
-CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source)
-  WHERE memory_type = 'obs';
-
 -- Active memories filter
-CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(memory_type, created_at DESC)
+CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(created_at DESC)
   WHERE retracted = 0;
 
 -- State machine indices
 CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state) WHERE retracted = 0;
-CREATE INDEX IF NOT EXISTS idx_memories_state_type ON memories(state, memory_type, created_at DESC) WHERE retracted = 0;
 
 -- Exposure check tracking indices
 CREATE INDEX IF NOT EXISTS idx_memories_exposure_check ON memories(exposure_check_status)
   WHERE retracted = 0 AND exposure_check_status != 'completed';
 CREATE INDEX IF NOT EXISTS idx_memories_cascade_tracking ON memories(last_cascade_at DESC)
   WHERE retracted = 0 AND (cascade_boosts > 0 OR cascade_damages > 0);
+
+
+-- ============================================
+-- SYSTEM STATS (Dynamic Thresholds)
+-- ============================================
+-- Stores precomputed statistics updated by daily background job.
+-- Used for confidence model normalization and learned priors.
+CREATE TABLE IF NOT EXISTS system_stats (
+  key TEXT PRIMARY KEY,
+  value REAL NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+-- Keys stored:
+-- 'max_times_tested'                    - Global max for log-scale normalization
+-- 'median_times_tested'                 - For insights
+-- 'source:market:learned_confidence'    - Track record for market source
+-- 'source:news:learned_confidence'      - Track record for news source
+-- 'source:earnings:learned_confidence'  - Track record for earnings source
+-- 'source:email:learned_confidence'     - Track record for email source
+-- 'source:human:learned_confidence'     - Track record for human source
+-- 'source:tool:learned_confidence'      - Track record for tool source
 
 
 -- ============================================
@@ -187,28 +208,15 @@ CREATE TABLE IF NOT EXISTS memory_events (
   event_type TEXT NOT NULL CHECK(event_type IN (
     -- Direct violations/confirmations
     'violation',
-    'assumption_confirmed',
-    'assumption_resolved',
+    'thought_confirmed',
+    'thought_resolved',
     -- Cascade events (mark for review, don't auto-modify)
-    'assumption:cascade_review',
-    'assumption:cascade_boost',
-    'assumption:cascade_damage',
+    'thought:cascade_review',
+    'thought:cascade_boost',
+    'thought:cascade_damage',
     -- Upward propagation events (evidence validated/invalidated in upstream memories)
-    'assumption:evidence_validated',
-    'assumption:evidence_invalidated',
-    -- Legacy event types (for migration compatibility)
-    'prediction_confirmed',
-    'prediction_resolved',
-    'inference:cascade_review',
-    'inference:cascade_boost',
-    'inference:cascade_damage',
-    'prediction:cascade_review',
-    'prediction:cascade_boost',
-    'prediction:cascade_damage',
-    'inference:evidence_validated',
-    'inference:evidence_invalidated',
-    'prediction:evidence_validated',
-    'prediction:evidence_invalidated'
+    'thought:evidence_validated',
+    'thought:evidence_invalidated'
   )),
   memory_id TEXT NOT NULL,
   violated_by TEXT,              -- ID of observation that caused violation
@@ -234,7 +242,7 @@ CREATE INDEX IF NOT EXISTS idx_events_workflow ON memory_events(workflow_id) WHE
 CREATE TABLE IF NOT EXISTS entity_versions (
   id TEXT PRIMARY KEY,
   entity_id TEXT NOT NULL,
-  entity_type TEXT,  -- obs, infer, pred, edge
+  entity_type TEXT,  -- 'observation', 'thought', 'edge'
   version_number INTEGER NOT NULL,
   content_snapshot TEXT NOT NULL,  -- JSON of full entity at this version
   change_type TEXT NOT NULL CHECK(change_type IN (

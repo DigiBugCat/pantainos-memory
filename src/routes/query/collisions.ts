@@ -9,8 +9,9 @@
  */
 
 import { Hono } from 'hono';
-import type { Env, MemoryRow, MemoryType, Violation } from '../../types/index.js';
+import type { Env, Violation } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
+import { getDisplayType } from '../../lib/shared/types/index.js';
 
 type Variables = {
   config: Config;
@@ -18,9 +19,12 @@ type Variables = {
   sessionId: string | undefined;
 };
 
+/** Display type for memory entities */
+type DisplayType = 'observation' | 'thought' | 'prediction';
+
 export interface CollisionInfo {
   memoryId: string;
-  memoryType: MemoryType;
+  memoryType: DisplayType;
   content: string;
   violation: Violation;
 }
@@ -37,13 +41,13 @@ app.get('/', async (c) => {
 
   // Get memories that have violations
   const result = await c.env.DB.prepare(`
-    SELECT id, memory_type, content, violations
+    SELECT id, content, violations, source, derived_from, resolves_by
     FROM memories
     WHERE retracted = 0
     AND violations != '[]'
     ORDER BY updated_at DESC
     LIMIT ?
-  `).bind(limit * 2).all<Pick<MemoryRow, 'id' | 'memory_type' | 'content' | 'violations'>>();
+  `).bind(limit * 2).all<{ id: string; content: string; violations: string; source: string | null; derived_from: string | null; resolves_by: number | null }>();
 
   const collisions: CollisionInfo[] = [];
 
@@ -54,7 +58,7 @@ app.get('/', async (c) => {
     for (const violation of violations) {
       collisions.push({
         memoryId: row.id,
-        memoryType: row.memory_type as MemoryType,
+        memoryType: getDisplayType(row),
         content: row.content,
         violation,
       });

@@ -1,10 +1,10 @@
 /**
- * Data Transforms - Cognitive Loop Architecture (v3)
+ * Data Transforms - Unified Memory Model
  *
  * Convert between database row types and API types.
  */
 
-import type { Memory, MemoryRow, MemoryType, MemoryState, ObservationSource, ExposureCheckStatus } from './shared/types/index.js';
+import type { Memory, MemoryRow, MemoryState, ObservationSource, ExposureCheckStatus } from './shared/types/index.js';
 
 /**
  * Convert a MemoryRow from D1 to a Memory object for API responses.
@@ -12,16 +12,19 @@ import type { Memory, MemoryRow, MemoryType, MemoryState, ObservationSource, Exp
 export function rowToMemory(row: MemoryRow): Memory {
   return {
     id: row.id,
-    memory_type: row.memory_type as MemoryType,
     content: row.content,
     source: (row.source as ObservationSource) || undefined,
+    derived_from: row.derived_from ? JSON.parse(row.derived_from) : undefined,
     assumes: row.assumes ? JSON.parse(row.assumes) : undefined,
     invalidates_if: row.invalidates_if ? JSON.parse(row.invalidates_if) : undefined,
     confirms_if: row.confirms_if ? JSON.parse(row.confirms_if) : undefined,
     outcome_condition: row.outcome_condition || undefined,
     resolves_by: row.resolves_by || undefined,
+    // Confidence model
+    starting_confidence: row.starting_confidence ?? 0.5,
     confirmations: row.confirmations,
-    exposures: row.exposures,
+    times_tested: row.times_tested,
+    contradictions: row.contradictions ?? 0,
     centrality: row.centrality,
     state: (row.state as MemoryState) || 'active',
     violations: row.violations ? JSON.parse(row.violations) : [],
@@ -48,16 +51,19 @@ export function rowToMemory(row: MemoryRow): Memory {
 export function memoryToRow(memory: Memory): Partial<MemoryRow> {
   return {
     id: memory.id,
-    memory_type: memory.memory_type,
     content: memory.content,
     source: memory.source,
+    derived_from: memory.derived_from ? JSON.stringify(memory.derived_from) : null,
     assumes: memory.assumes ? JSON.stringify(memory.assumes) : null,
     invalidates_if: memory.invalidates_if ? JSON.stringify(memory.invalidates_if) : null,
     confirms_if: memory.confirms_if ? JSON.stringify(memory.confirms_if) : null,
     outcome_condition: memory.outcome_condition,
     resolves_by: memory.resolves_by,
+    // Confidence model
+    starting_confidence: memory.starting_confidence,
     confirmations: memory.confirmations,
-    exposures: memory.exposures,
+    times_tested: memory.times_tested,
+    contradictions: memory.contradictions,
     centrality: memory.centrality,
     state: memory.state,
     violations: memory.violations ? JSON.stringify(memory.violations) : '[]',

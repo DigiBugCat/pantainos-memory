@@ -6,9 +6,10 @@
  */
 
 import { Hono } from 'hono';
-import type { Env, MemoryRow, EdgeRow, Memory, MemoryType } from '../../types/index.js';
+import type { Env, MemoryRow, EdgeRow, Memory } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
 import { rowToMemory } from '../../lib/transforms.js';
+import { getDisplayType, isObservation } from '../../lib/shared/types/index.js';
 
 type Variables = {
   config: Config;
@@ -16,10 +17,13 @@ type Variables = {
   sessionId: string | undefined;
 };
 
+/** Display type for memory entities */
+type DisplayType = 'observation' | 'thought' | 'prediction';
+
 export interface RootsResponse {
   memory: {
     id: string;
-    type: MemoryType;
+    type: DisplayType;
     content: string;
   };
   roots: Memory[];
@@ -47,11 +51,11 @@ app.get('/:id', async (c) => {
   const memory = rowToMemory(row);
 
   // If this is already an observation, return it as its own root
-  if (memory.memory_type === 'obs') {
+  if (isObservation(memory)) {
     const response: RootsResponse = {
       memory: {
         id,
-        type: 'obs',
+        type: 'observation',
         content: memory.content,
       },
       roots: [memory],
@@ -72,7 +76,7 @@ app.get('/:id', async (c) => {
   const response: RootsResponse = {
     memory: {
       id,
-      type: memory.memory_type,
+      type: getDisplayType(memory),
       content: memory.content,
     },
     roots,
@@ -103,9 +107,9 @@ async function traceToRoots(
 
   // If no parents, check if this is an observation (root)
   if (!derivedFrom.results || derivedFrom.results.length === 0) {
-    // Check if this is an observation
+    // Check if this is an observation (source IS NOT NULL)
     const row = await db.prepare(
-      `SELECT * FROM memories WHERE id = ? AND memory_type = 'obs' AND retracted = 0`
+      `SELECT * FROM memories WHERE id = ? AND source IS NOT NULL AND retracted = 0`
     ).bind(memoryId).first<MemoryRow>();
 
     if (row && !roots.some(r => r.id === memoryId)) {
@@ -124,10 +128,11 @@ async function traceToRoots(
 
     if (!parentRow) continue;
 
-    if (parentRow.memory_type === 'obs') {
+    const parentMemory = rowToMemory(parentRow);
+    if (isObservation(parentMemory)) {
       // It's an observation, so it's a root
       if (!roots.some(r => r.id === parent.source_id)) {
-        roots.push(rowToMemory(parentRow));
+        roots.push(parentMemory);
         updateMaxDepth(depth + 1);
       }
     } else {

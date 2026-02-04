@@ -17,6 +17,7 @@ import type { Config } from '../../lib/config.js';
 import { recordAccess } from '../../services/access-service.js';
 import { rowToMemory } from '../../lib/transforms.js';
 import { getConfidenceStats } from '../../services/confidence.js';
+import { getDisplayType } from '../../lib/shared/types/index.js';
 
 type Variables = {
   config: Config;
@@ -86,7 +87,7 @@ app.get('/:id', async (c) => {
   // Record access event for audit trail
   await recordAccess(c.env.DB, {
     entityId: id,
-    entityType: memory.memory_type,
+    entityType: getDisplayType(memory),
     accessType: 'recall',
     sessionId,
     requestId,

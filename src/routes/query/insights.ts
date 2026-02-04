@@ -8,15 +8,16 @@
  *   - orphans: Observations with no derived inferences
  *   - recent: Newly created entities
  *   - pending_exposure: Memories waiting for exposure check
- *   - untested: Completed exposure check but <3 exposures (still untested tier)
+ *   - untested: Completed exposure check but <3 times_tested (still untested tier)
  *
  * Query params:
  *   - limit: max entities to return (default: 20)
  */
 
 import { Hono } from 'hono';
-import type { Env, EntityType } from '../../types/index.js';
+import type { Env } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
+import { getDisplayType } from '../../lib/shared/types/index.js';
 
 type Variables = {
   config: Config;
@@ -26,9 +27,12 @@ type Variables = {
 
 export type InsightView = 'hubs' | 'orphans' | 'recent' | 'pending_exposure' | 'untested';
 
+/** Display type for memory entities */
+type DisplayType = 'observation' | 'thought' | 'prediction';
+
 export interface InsightEntity {
   id: string;
-  type: EntityType;
+  type: DisplayType;
   content: string;
   metric?: number; // view-specific metric (e.g., connection count for hubs)
   createdAt: string;
@@ -86,7 +90,7 @@ app.get('/:view', async (c) => {
 
 /**
  * Get most connected entities (hubs) by counting edges.
- * v3: uses edges table (no type columns - infer type from ID prefix)
+ * v4: uses field presence to determine type
  */
 async function getHubs(
   db: D1Database,
@@ -106,15 +110,15 @@ async function getHubs(
       ORDER BY connection_count DESC
       LIMIT ?
     )
-    SELECT c.id, c.connection_count, m.content, m.memory_type, m.created_at
+    SELECT c.id, c.connection_count, m.content, m.source, m.derived_from, m.resolves_by, m.created_at
     FROM counts c
     JOIN memories m ON m.id = c.id
     WHERE m.retracted = 0
-  `).bind(limit).all<{ id: string; connection_count: number; content: string; memory_type: string; created_at: number }>();
+  `).bind(limit).all<{ id: string; connection_count: number; content: string; source: string | null; derived_from: string | null; resolves_by: number | null; created_at: number }>();
 
   const entities: InsightEntity[] = (result.results || []).map(row => ({
     id: row.id,
-    type: row.memory_type as EntityType,
+    type: getDisplayType(row),
     content: row.content,
     metric: row.connection_count,
     createdAt: new Date(row.created_at).toISOString(),
@@ -125,26 +129,26 @@ async function getHubs(
 
 /**
  * Get orphan observations (no derived inferences).
- * v3: uses memories and edges tables
+ * v4: uses field presence (source IS NOT NULL) to identify observations
  */
 async function getOrphans(
   db: D1Database,
   limit: number
 ): Promise<{ entities: InsightEntity[]; total: number }> {
   const result = await db.prepare(`
-    SELECT m.id, m.content, m.created_at, m.memory_type
+    SELECT m.id, m.content, m.created_at, m.source, m.derived_from, m.resolves_by
     FROM memories m
     LEFT JOIN edges e ON e.source_id = m.id
-    WHERE m.memory_type = 'obs'
+    WHERE m.source IS NOT NULL
       AND m.retracted = 0
       AND e.source_id IS NULL
     ORDER BY m.created_at DESC
     LIMIT ?
-  `).bind(limit).all<{ id: string; content: string; created_at: number; memory_type: string }>();
+  `).bind(limit).all<{ id: string; content: string; created_at: number; source: string | null; derived_from: string | null; resolves_by: number | null }>();
 
   const entities: InsightEntity[] = (result.results || []).map(row => ({
     id: row.id,
-    type: row.memory_type as EntityType,
+    type: getDisplayType(row),
     content: row.content,
     createdAt: new Date(row.created_at).toISOString(),
   }));
@@ -154,7 +158,7 @@ async function getOrphans(
     SELECT COUNT(*) as count
     FROM memories m
     LEFT JOIN edges e ON e.source_id = m.id
-    WHERE m.memory_type = 'obs'
+    WHERE m.source IS NOT NULL
       AND m.retracted = 0
       AND e.source_id IS NULL
   `).first<{ count: number }>();
@@ -164,23 +168,23 @@ async function getOrphans(
 
 /**
  * Get recently created entities.
- * v3: single query on memories table
+ * v4: uses field presence to determine type
  */
 async function getRecent(
   db: D1Database,
   limit: number
 ): Promise<{ entities: InsightEntity[]; total: number }> {
   const result = await db.prepare(`
-    SELECT id, content, created_at, memory_type
+    SELECT id, content, created_at, source, derived_from, resolves_by
     FROM memories
     WHERE retracted = 0
     ORDER BY created_at DESC
     LIMIT ?
-  `).bind(limit).all<{ id: string; content: string; created_at: number; memory_type: string }>();
+  `).bind(limit).all<{ id: string; content: string; created_at: number; source: string | null; derived_from: string | null; resolves_by: number | null }>();
 
   const entities: InsightEntity[] = (result.results || []).map(row => ({
     id: row.id,
-    type: row.memory_type as EntityType,
+    type: getDisplayType(row),
     content: row.content,
     createdAt: new Date(row.created_at).toISOString(),
   }));
@@ -197,17 +201,17 @@ async function getPendingExposure(
   limit: number
 ): Promise<{ entities: InsightEntity[]; total: number }> {
   const result = await db.prepare(`
-    SELECT id, content, created_at, memory_type, exposure_check_status
+    SELECT id, content, created_at, source, derived_from, resolves_by, exposure_check_status
     FROM memories
     WHERE retracted = 0
       AND exposure_check_status IN ('pending', 'processing')
     ORDER BY created_at ASC
     LIMIT ?
-  `).bind(limit).all<{ id: string; content: string; created_at: number; memory_type: string; exposure_check_status: string }>();
+  `).bind(limit).all<{ id: string; content: string; created_at: number; source: string | null; derived_from: string | null; resolves_by: number | null; exposure_check_status: string }>();
 
   const entities: InsightEntity[] = (result.results || []).map(row => ({
     id: row.id,
-    type: row.memory_type as EntityType,
+    type: getDisplayType(row),
     content: row.content,
     createdAt: new Date(row.created_at).toISOString(),
   }));
@@ -225,29 +229,30 @@ async function getPendingExposure(
 
 /**
  * Get memories that completed exposure check but are still untested.
- * These are memories with exposure_check_status = 'completed' AND exposures < 3.
+ * These are memories with exposure_check_status = 'completed' AND times_tested < 3.
  * They've been checked but haven't been tested enough to have meaningful robustness.
+ * v4: uses field presence (derived_from IS NOT NULL) to identify thoughts
  */
 async function getUntested(
   db: D1Database,
   limit: number
 ): Promise<{ entities: InsightEntity[]; total: number }> {
   const result = await db.prepare(`
-    SELECT id, content, created_at, memory_type, exposures
+    SELECT id, content, created_at, source, derived_from, resolves_by, times_tested
     FROM memories
     WHERE retracted = 0
-      AND memory_type = 'assumption'
+      AND derived_from IS NOT NULL
       AND exposure_check_status = 'completed'
-      AND exposures < 3
+      AND times_tested < 3
     ORDER BY created_at DESC
     LIMIT ?
-  `).bind(limit).all<{ id: string; content: string; created_at: number; memory_type: string; exposures: number }>();
+  `).bind(limit).all<{ id: string; content: string; created_at: number; source: string | null; derived_from: string | null; resolves_by: number | null; times_tested: number }>();
 
   const entities: InsightEntity[] = (result.results || []).map(row => ({
     id: row.id,
-    type: row.memory_type as EntityType,
+    type: getDisplayType(row),
     content: row.content,
-    metric: row.exposures,
+    metric: row.times_tested,
     createdAt: new Date(row.created_at).toISOString(),
   }));
 
@@ -256,9 +261,9 @@ async function getUntested(
     SELECT COUNT(*) as count
     FROM memories
     WHERE retracted = 0
-      AND memory_type = 'assumption'
+      AND derived_from IS NOT NULL
       AND exposure_check_status = 'completed'
-      AND exposures < 3
+      AND times_tested < 3
   `).first<{ count: number }>();
 
   return { entities, total: countResult?.count || entities.length };

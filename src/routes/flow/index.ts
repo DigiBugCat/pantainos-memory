@@ -1,12 +1,16 @@
 /**
- * Flow Routes - Cognitive Loop Architecture (v4)
+ * Flow Routes - Unified Memory Model
  *
- * Write path for the 2-primitive model:
- * - /observe - Create observations (intake from reality)
- * - /assume - Create assumptions (unified: general or time-bound)
+ * Write path for the memory system:
+ * - /observe - Create memories (unified: observations OR thoughts based on field presence)
  * - /confirm/:id - Manual confirmation
  * - /violate/:id - Manual violation
  * - /retract/:id - Retract an observation
+ *
+ * Memory type is determined by field presence:
+ * - source → observation
+ * - derived_from → thought
+ * - derived_from + resolves_by → time-bound thought (prediction)
  */
 
 import { Hono } from 'hono';
@@ -14,14 +18,11 @@ import { bodyLimitPresets, memoryFieldLimits } from '../../lib/shared/middleware
 import type { Env } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
 import observeRoute from './observe.js';
-import assumeRoute from './assume.js';
 import confirmRoute from './confirm.js';
 import violateRoute from './violate.js';
 import retractRoute from './retract.js';
 import cascadeEventsRoute from './cascade-events.js';
 import cascadeApplyRoute from './cascade-apply.js';
-import reclassifyToObservationRoute from './reclassify-to-observation.js';
-import reclassifyToAssumptionRoute from './reclassify-to-assumption.js';
 
 type Variables = {
   config: Config;
@@ -44,9 +45,9 @@ app.use('*', bodyLimitPresets.memory());
 // Content is limited to 10K chars, which is ~40KB of embedding data
 app.use('*', memoryFieldLimits);
 
-// Mount flow routes (v4 architecture)
+// Mount flow routes
+// /observe handles both observations (source) and thoughts (derived_from)
 app.route('/observe', observeRoute);
-app.route('/assume', assumeRoute);
 app.route('/confirm', confirmRoute);
 app.route('/violate', violateRoute);
 app.route('/retract', retractRoute);
@@ -54,9 +55,5 @@ app.route('/retract', retractRoute);
 // Cascade routes (for processing cascade events)
 app.route('/cascade', cascadeEventsRoute);
 app.route('/cascade', cascadeApplyRoute);
-
-// Reclassify routes (for converting between memory types)
-app.route('/reclassify-to-observation', reclassifyToObservationRoute);
-app.route('/reclassify-to-assumption', reclassifyToAssumptionRoute);
 
 export default app;

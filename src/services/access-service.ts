@@ -12,7 +12,7 @@ import type {
   AccessEventRow,
   AccessLogResponse,
   AccessType,
-  EntityType,
+  HistoryEntityType,
 } from '../types/index.js';
 
 /**
@@ -157,7 +157,7 @@ export async function getAccessLog(
   const recentEvents: AccessEvent[] = (rows.results ?? []).map(row => ({
     id: row.id,
     entityId: row.entity_id,
-    entityType: row.entity_type as EntityType,
+    entityType: row.entity_type as HistoryEntityType,
     accessType: row.access_type as AccessType,
     sessionId: row.session_id ?? undefined,
     requestId: row.request_id ?? undefined,
@@ -220,7 +220,7 @@ export async function queryAccessEvents(
   return (rows.results ?? []).map(row => ({
     id: row.id,
     entityId: row.entity_id,
-    entityType: row.entity_type as EntityType,
+    entityType: row.entity_type as HistoryEntityType,
     accessType: row.access_type as AccessType,
     sessionId: row.session_id ?? undefined,
     requestId: row.request_id ?? undefined,
@@ -236,15 +236,11 @@ export async function queryAccessEvents(
 
 /**
  * Infer entity type from ID prefix.
- * v4: Both infer- and pred- prefixes map to 'assumption' type.
+ * Note: With unified model, IDs no longer have prefixes.
+ * This function is kept for legacy compatibility only.
  */
-function inferEntityType(id: string): EntityType | null {
-  if (id.startsWith('obs-')) return 'obs';
-  // Both infer- and pred- prefixes are assumptions
-  if (id.startsWith('infer-')) return 'assumption';
-  if (id.startsWith('pred-')) return 'assumption';
-  // Legacy prefixes
-  if (id.startsWith('thought-') || id.startsWith('note-')) return 'assumption';
-  if (id.startsWith('mem-')) return 'obs';
+function inferEntityType(_id: string): HistoryEntityType | null {
+  // With unified model, we can't infer type from ID
+  // Return null to indicate lookup is required
   return null;
 }

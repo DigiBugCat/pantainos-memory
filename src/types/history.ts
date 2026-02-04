@@ -1,10 +1,11 @@
 /**
- * History & Audit Tracking Types - Cognitive Loop Architecture (v3)
+ * History & Audit Tracking Types - Unified Memory Model
  *
- * Updated for 3-primitive model: obs, infer, pred
+ * Three semantic types (determined by field presence):
+ * - observation: has source field
+ * - thought: has derived_from field (no resolves_by)
+ * - prediction: has resolves_by field
  */
-
-import type { MemoryType } from '../lib/shared/types/index.js';
 
 // ============================================
 // Entity Types for History Tracking
@@ -12,9 +13,9 @@ import type { MemoryType } from '../lib/shared/types/index.js';
 
 /**
  * Entity types tracked in history.
- * Maps to memory_type plus 'edge' for graph edges.
+ * Display types plus 'edge' for graph edges.
  */
-export type HistoryEntityType = MemoryType | 'edge';
+export type HistoryEntityType = 'observation' | 'thought' | 'prediction' | 'edge';
 
 // ============================================
 // Version History Types
@@ -29,7 +30,7 @@ export type ChangeType =
   | 'retracted'
   | 'resolved'
   | 'reclassified_as_observation'
-  | 'reclassified_as_assumption';
+  | 'reclassified_as_thought';
 
 export interface EntityVersion {
   id: string;

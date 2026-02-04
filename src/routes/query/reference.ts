@@ -6,9 +6,10 @@
  */
 
 import { Hono } from 'hono';
-import type { Env, EdgeRow, MemoryRow, MemoryType, EdgeType } from '../../types/index.js';
+import type { Env, EdgeRow, MemoryRow, EdgeType } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
 import { rowToMemory } from '../../lib/transforms.js';
+import { getDisplayType } from '../../lib/shared/types/index.js';
 
 type Variables = {
   config: Config;
@@ -16,9 +17,12 @@ type Variables = {
   sessionId: string | undefined;
 };
 
+/** Display type for memory entities */
+type DisplayType = 'observation' | 'thought' | 'prediction';
+
 interface GraphNode {
   id: string;
-  type: MemoryType;
+  type: DisplayType;
   content: string;
   depth: number;
 }
@@ -58,7 +62,7 @@ app.get('/:id', async (c) => {
 
   nodes.set(id, {
     id,
-    type: rootMemory.memory_type,
+    type: getDisplayType(rootMemory),
     content: rootMemory.content,
     depth: 0,
   });
@@ -105,7 +109,7 @@ async function traverse(
           const sourceMemory = rowToMemory(sourceRow);
           nodes.set(row.source_id, {
             id: row.source_id,
-            type: sourceMemory.memory_type,
+            type: getDisplayType(sourceMemory),
             content: sourceMemory.content,
             depth: currentDepth + 1,
           });
@@ -139,7 +143,7 @@ async function traverse(
           const targetMemory = rowToMemory(targetRow);
           nodes.set(row.target_id, {
             id: row.target_id,
-            type: targetMemory.memory_type,
+            type: getDisplayType(targetMemory),
             content: targetMemory.content,
             depth: currentDepth + 1,
           });

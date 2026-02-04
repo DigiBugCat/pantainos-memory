@@ -10,15 +10,19 @@
  */
 
 import { Hono } from 'hono';
-import type { Env, EntityType } from '../../types/index.js';
+import type { Env } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
 import { generateEmbedding, searchSimilar } from '../../lib/embeddings.js';
+import { getDisplayType } from '../../lib/shared/types/index.js';
 
 type Variables = {
   config: Config;
   requestId: string;
   sessionId: string | undefined;
 };
+
+/** Display type for memory entities */
+type DisplayType = 'observation' | 'thought' | 'prediction';
 
 export interface KnowledgeAssessment {
   topic: string;
@@ -27,7 +31,7 @@ export interface KnowledgeAssessment {
   isolatedCount: number; // memories with no connections
   keyMemories: Array<{
     id: string;
-    type: EntityType;
+    type: DisplayType;
     content: string;
     similarity: number;
     connectionCount: number;
@@ -136,23 +140,23 @@ async function countConnections(db: D1Database, entityId: string): Promise<numbe
 
 /**
  * Get entity details from memories table.
- * v3: single unified table for all memory types
+ * v4: uses field presence to determine type
  */
 async function getEntityDetails(
   db: D1Database,
   id: string
-): Promise<{ content: string; type: EntityType } | null> {
+): Promise<{ content: string; type: DisplayType } | null> {
   const result = await db.prepare(`
-    SELECT content, memory_type
+    SELECT content, source, derived_from, resolves_by
     FROM memories
     WHERE id = ? AND retracted = 0
-  `).bind(id).first<{ content: string; memory_type: string }>();
+  `).bind(id).first<{ content: string; source: string | null; derived_from: string | null; resolves_by: number | null }>();
 
   if (!result) return null;
 
   return {
     content: result.content,
-    type: result.memory_type as EntityType,
+    type: getDisplayType(result),
   };
 }
 

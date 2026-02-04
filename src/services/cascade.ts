@@ -32,7 +32,7 @@ function getLog() {
 
 export type CascadeReason =
   | 'derived_prediction_resolved'  // A prediction derived from this resolved
-  | 'shared_assumption_violated'   // A shared assumption was violated
+  | 'shared_thought_violated'   // A shared thought was violated
   | 'supporting_evidence_changed'  // Evidence this depends on changed
   | 'related_prediction_resolved'  // A related prediction resolved
   // Upward propagation reasons
@@ -46,7 +46,7 @@ export interface CascadeEffect {
   source_id: string;
   source_outcome: 'correct' | 'incorrect' | 'void';
   edge_type: string;
-  suggested_action: 'review' | 'boost_confidence' | 'damage_confidence';
+  suggested_action: 'review';
 }
 
 export interface CascadeResult {
@@ -69,7 +69,9 @@ interface EdgeRow {
 
 interface MemoryRow {
   id: string;
-  memory_type: string;
+  source: string | null;
+  derived_from: string | null;
+  resolves_by: number | null;
   content: string;
   state: string | null;
 }
@@ -89,20 +91,20 @@ async function findConnectedMemories(
   // Find outgoing edges (this memory → other)
   const outgoing = await db.prepare(`
     SELECT e.id, e.source_id, e.target_id, e.edge_type,
-           m.id as memory_id, m.memory_type, m.content, m.state
+           m.id as memory_id, m.source, m.derived_from, m.resolves_by, m.content, m.state
     FROM edges e
     JOIN memories m ON m.id = e.target_id
     WHERE e.source_id = ? AND m.retracted = 0
-  `).bind(memoryId).all<EdgeRow & { memory_id: string; memory_type: string; content: string; state: string | null }>();
+  `).bind(memoryId).all<EdgeRow & { memory_id: string; source: string | null; derived_from: string | null; resolves_by: number | null; content: string; state: string | null }>();
 
   // Find incoming edges (other → this memory)
   const incoming = await db.prepare(`
     SELECT e.id, e.source_id, e.target_id, e.edge_type,
-           m.id as memory_id, m.memory_type, m.content, m.state
+           m.id as memory_id, m.source, m.derived_from, m.resolves_by, m.content, m.state
     FROM edges e
     JOIN memories m ON m.id = e.source_id
     WHERE e.target_id = ? AND m.retracted = 0
-  `).bind(memoryId).all<EdgeRow & { memory_id: string; memory_type: string; content: string; state: string | null }>();
+  `).bind(memoryId).all<EdgeRow & { memory_id: string; source: string | null; derived_from: string | null; resolves_by: number | null; content: string; state: string | null }>();
 
   const results: { memory: MemoryRow; edge: EdgeRow; direction: 'incoming' | 'outgoing' }[] = [];
 
@@ -110,7 +112,9 @@ async function findConnectedMemories(
     results.push({
       memory: {
         id: row.memory_id,
-        memory_type: row.memory_type,
+        source: row.source,
+        derived_from: row.derived_from,
+        resolves_by: row.resolves_by,
         content: row.content,
         state: row.state,
       },
@@ -128,7 +132,9 @@ async function findConnectedMemories(
     results.push({
       memory: {
         id: row.memory_id,
-        memory_type: row.memory_type,
+        source: row.source,
+        derived_from: row.derived_from,
+        resolves_by: row.resolves_by,
         content: row.content,
         state: row.state,
       },
@@ -152,21 +158,17 @@ async function findConnectedMemories(
 /**
  * Determine cascade effects when a prediction/inference resolves.
  *
+ * All effects use suggested_action = 'review'. Confidence is fully derived
+ * from the exposure checker (confirmations/times_tested), so there's nothing
+ * to boost or damage manually.
+ *
  * Downstream propagation (things derived FROM resolved memory):
- * - If prediction resolved CORRECT:
- *   - Inferences that derived_from this → boost_confidence
- *   - Other predictions sharing assumptions → review
- * - If prediction resolved INCORRECT:
- *   - Inferences that derived_from this → damage_confidence
- *   - Other predictions sharing assumptions → review (may be invalid)
+ * - derived_prediction_resolved → review
  *
  * Upstream propagation (things resolved memory was derived FROM):
- * - If prediction resolved CORRECT:
- *   - The inference/prediction this was derived_from gets evidence_validated
- *   - (Its prediction came true, strengthening the original reasoning)
- * - If prediction resolved INCORRECT:
- *   - The inference/prediction this was derived_from gets evidence_invalidated
- *   - (Its prediction failed, questioning the original reasoning)
+ * - derived_evidence_validated (correct outcome)
+ * - derived_evidence_invalidated (incorrect outcome)
+ * - supporting_evidence_changed (void outcome)
  *
  * Observations are never affected (facts don't change).
  *
@@ -181,35 +183,26 @@ export function determineCascadeEffects(
 
   for (const { memory, edge, direction } of connections) {
     // Skip observations - facts don't cascade
-    if (memory.memory_type === 'obs') continue;
+    if (memory.source != null) continue;
 
     // Skip already-resolved memories
     if (memory.state === 'resolved') continue;
 
     // Determine effect based on relationship
     let reason: CascadeReason;
-    let suggestedAction: 'review' | 'boost_confidence' | 'damage_confidence';
+    const suggestedAction: 'review' = 'review';
 
     if (direction === 'incoming' && edge.edge_type === 'derived_from') {
       // DOWNSTREAM: This memory derived_from the resolved prediction
-      // If the source was correct, this memory's derivation was sound
-      // If the source was incorrect, this memory's foundation is weakened
       reason = 'derived_prediction_resolved';
-      suggestedAction = sourceOutcome === 'correct' ? 'boost_confidence' : 'damage_confidence';
     } else if (direction === 'outgoing' && edge.edge_type === 'derived_from') {
       // UPSTREAM: The resolved prediction derived_from this memory
-      // This memory contributed to a prediction that resolved
-      // Propagate evidence validation/invalidation upward
       if (sourceOutcome === 'correct') {
         reason = 'derived_evidence_validated';
-        suggestedAction = 'boost_confidence'; // Evidence this produced was validated
       } else if (sourceOutcome === 'incorrect') {
         reason = 'derived_evidence_invalidated';
-        suggestedAction = 'review'; // Evidence this produced was invalidated, needs review
       } else {
-        // void outcome - just review
         reason = 'supporting_evidence_changed';
-        suggestedAction = 'review';
       }
     } else if (edge.edge_type === 'confirmed_by' || edge.edge_type === 'violated_by') {
       // Already processed through exposure checking
@@ -217,12 +210,18 @@ export function determineCascadeEffects(
     } else {
       // Generic relationship
       reason = 'related_prediction_resolved';
-      suggestedAction = 'review';
     }
+
+    // Derive display type from field presence
+    const targetType = memory.source != null
+      ? 'observation'
+      : memory.resolves_by != null
+        ? 'prediction'
+        : 'thought';
 
     effects.push({
       target_id: memory.id,
-      target_type: memory.memory_type,
+      target_type: targetType,
       reason,
       source_id: sourceId,
       source_outcome: sourceOutcome,
@@ -243,12 +242,8 @@ export function determineCascadeEffects(
  * These events are batched and sent to the resolver agent.
  *
  * Maps effects to event types:
- * - Downstream (derived_prediction_resolved):
- *   - boost_confidence → cascade_boost
- *   - damage_confidence → cascade_damage
- * - Upstream (derived_evidence_validated/invalidated):
- *   - boost_confidence → evidence_validated
- *   - review → evidence_invalidated (or cascade_review)
+ * - Upstream: evidence_validated / evidence_invalidated (informational)
+ * - Everything else: cascade_review
  */
 async function queueCascadeEvents(
   env: Env,
@@ -258,26 +253,17 @@ async function queueCascadeEvents(
   let queued = 0;
 
   for (const effect of effects) {
-    // Map suggested_action + reason to event_type
+    // Map reason to event_type
     let eventType: SignificantEventType;
 
-    // Check if this is an upward propagation event
+    // Check if this is an upward propagation event (informational)
     if (effect.reason === 'derived_evidence_validated') {
-      eventType = 'assumption:evidence_validated';
+      eventType = 'thought:evidence_validated';
     } else if (effect.reason === 'derived_evidence_invalidated') {
-      eventType = 'assumption:evidence_invalidated';
+      eventType = 'thought:evidence_invalidated';
     } else {
-      // Standard downstream cascade
-      switch (effect.suggested_action) {
-        case 'boost_confidence':
-          eventType = 'assumption:cascade_boost';
-          break;
-        case 'damage_confidence':
-          eventType = 'assumption:cascade_damage';
-          break;
-        default:
-          eventType = 'assumption:cascade_review';
-      }
+      // All cascade effects are review-only
+      eventType = 'thought:cascade_review';
     }
 
     try {

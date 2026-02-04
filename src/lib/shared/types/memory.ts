@@ -1,25 +1,18 @@
 /**
- * Memory system types - Cognitive Loop Architecture (v4)
+ * Memory system types - Unified Memory Model
  *
- * Two primitives:
- *   1. Observations (obs) - intake from the world
- *   2. Assumptions (assumption) - compressed beliefs with optional deadlines
- *      - Without deadline → general assumption (was: inference)
- *      - With deadline → time-bound assumption (was: prediction)
+ * Everything is a memory. Fields determine semantics:
+ *   - source IS NOT NULL → observation (intake from reality)
+ *   - derived_from IS NOT NULL → thought (derived belief)
+ *   - resolves_by IS NOT NULL → time-bound thought (prediction)
  *
  * Core principle: Memories are weighted bets, not facts.
- * Confidence = survival rate under test (confirmations / exposures)
+ * Confidence = survival rate under test (confirmations / times_tested)
  */
 
 // ============================================
-// Memory Types
+// Source and Edge Types
 // ============================================
-
-/** Memory type in the cognitive loop */
-export type MemoryType = 'obs' | 'assumption';
-
-/** @deprecated Use 'assumption' type - kept for migration compatibility */
-export type LegacyMemoryType = 'obs' | 'infer' | 'pred';
 
 /** Source of an observation */
 export type ObservationSource =
@@ -70,7 +63,7 @@ export interface Violation {
   timestamp: number;
   /** The observation that caused the violation */
   obs_id: string;
-  /** How central was the violated assumption */
+  /** How central was the violated thought */
   damage_level: DamageLevel;
   /** Source type: direct observation match or cascade from related memory */
   source_type: ViolationSource;
@@ -82,27 +75,36 @@ export interface Violation {
 // Core Memory Entity
 // ============================================
 
-/** Unified memory entity (obs, infer, or pred) */
+/**
+ * Unified memory entity.
+ *
+ * Memory type is determined by field presence:
+ *   - source → observation
+ *   - derived_from → thought
+ *   - derived_from + resolves_by → time-bound thought (prediction)
+ */
 export interface Memory {
   id: string;
-  memory_type: MemoryType;
   content: string;
 
-  // Source tracking (obs only)
+  // Origin fields (mutually exclusive in practice)
   source?: ObservationSource;
+  derived_from?: string[];
 
-  // Inference fields (infer + pred)
+  // Thought fields
   assumes?: string[];
   invalidates_if?: string[];
 
-  // Prediction fields (pred only)
+  // Time-bound thought fields
   confirms_if?: string[];
   outcome_condition?: string;
   resolves_by?: number;
 
-  // Confidence model
+  // Confidence model (Subjective Logic)
+  starting_confidence: number;
   confirmations: number;
-  exposures: number;
+  times_tested: number;
+  contradictions: number;
   centrality: number;
 
   // State machine
@@ -126,7 +128,7 @@ export interface Memory {
   last_cascade_at?: number;
 
   // Metadata
-  tags: string[];
+  tags?: string[];
   session_id?: string;
   created_at: number;
   updated_at?: number;
@@ -135,16 +137,19 @@ export interface Memory {
 /** Database row representation */
 export interface MemoryRow {
   id: string;
-  memory_type: string;
   content: string;
   source: string | null;
+  derived_from: string | null;
   assumes: string | null;
   invalidates_if: string | null;
   confirms_if: string | null;
   outcome_condition: string | null;
   resolves_by: number | null;
+  // Confidence model
+  starting_confidence: number;
   confirmations: number;
-  exposures: number;
+  times_tested: number;
+  contradictions: number;
   centrality: number;
   state: string;
   violations: string;
@@ -163,6 +168,47 @@ export interface MemoryRow {
   session_id: string | null;
   created_at: number;
   updated_at: number | null;
+}
+
+// ============================================
+// Helper Functions for Memory Type Detection
+// ============================================
+
+/**
+ * Minimal fields needed for type detection.
+ * Allows partial queries to still determine memory type.
+ */
+export interface TypeDetectable {
+  source?: string | null;
+  derived_from?: string | string[] | null;
+  resolves_by?: number | null;
+}
+
+/** Check if a memory is an observation (has source) */
+export function isObservation(memory: TypeDetectable): boolean {
+  return memory.source != null;
+}
+
+/** Check if a memory is a thought (has derived_from) */
+export function isThought(memory: TypeDetectable): boolean {
+  return memory.derived_from != null;
+}
+
+/** Check if a memory is a time-bound thought (has resolves_by) */
+export function isTimeBound(memory: TypeDetectable): boolean {
+  return memory.resolves_by != null;
+}
+
+/**
+ * Get display type for a memory.
+ * Used for UI display and analytics, not for logic.
+ * Accepts partial objects with just the type-determining fields.
+ */
+export function getDisplayType(memory: TypeDetectable): 'observation' | 'thought' | 'prediction' {
+  if (memory.source != null) return 'observation';
+  if (memory.resolves_by != null) return 'prediction';
+  if (isThought(memory)) return 'thought';
+  return 'observation'; // fallback
 }
 
 // ============================================
@@ -195,14 +241,18 @@ export interface EdgeRow {
 
 /** Confidence statistics for a memory */
 export interface ConfidenceStats {
-  /** Raw confidence: confirmations / max(exposures, 1) */
-  confidence: number;
-  /** Robustness tier based on exposure history */
+  /** Starting confidence (prior belief based on source/type) */
+  starting_confidence: number;
+  /** Effective confidence (blended prior + evidence) */
+  effective_confidence: number;
+  /** Robustness tier based on testing history */
   robustness: Robustness;
   /** Number of times tested */
-  exposures: number;
+  times_tested: number;
   /** Number of times survived testing */
   confirmations: number;
+  /** Number of times contradicted */
+  contradictions: number;
   /** Number of memories that depend on this one */
   centrality: number;
   /** Number of recorded violations */
@@ -232,49 +282,39 @@ export interface ScoredMemory {
 export interface ObserveRequest {
   content: string;
   source: ObservationSource;
+  /** Conditions that would prove this wrong (optional for observations) */
+  invalidates_if?: string[];
+  /** Conditions that would strengthen this (optional for observations) */
+  confirms_if?: string[];
   tags?: string[];
   timestamp?: number;
 }
 
 /**
- * Create an assumption (unified type for inferences and predictions)
+ * Unified memory creation request.
+ * Memory type is determined by field presence:
+ * - source IS NOT NULL → observation
+ * - derived_from IS NOT NULL → thought
+ * - derived_from + resolves_by → time-bound thought (prediction)
  *
- * The presence of optional fields determines behavior:
- * - Without resolves_by → general assumption (was: inference)
- * - With resolves_by → time-bound assumption (was: prediction)
+ * Exactly one of source OR derived_from is required (mutually exclusive).
  */
-export interface AssumptionRequest {
+export interface MemoryRequest {
   content: string;
-  derived_from: string[];
-  assumes?: string[];
+  /** Source of observation (mutually exclusive with derived_from) */
+  source?: ObservationSource;
+  /** IDs of source memories this thought is based on (mutually exclusive with source) */
+  derived_from?: string[];
+  /** Conditions that would prove this wrong */
   invalidates_if?: string[];
-  /** Conditions that would confirm this assumption (time-bound only) */
+  /** Conditions that would strengthen this */
   confirms_if?: string[];
-  /** What determines success/failure (time-bound only) */
-  outcome_condition?: string;
-  /** Unix timestamp deadline - presence makes this time-bound */
+  /** Underlying thoughts this belief rests on (thoughts only) */
+  assumes?: string[];
+  /** Unix timestamp deadline for time-bound predictions */
   resolves_by?: number;
-  tags?: string[];
-}
-
-/** @deprecated Use AssumptionRequest - kept for migration */
-export interface InferRequest {
-  content: string;
-  derived_from: string[];
-  assumes?: string[];
-  invalidates_if?: string[];
-  tags?: string[];
-}
-
-/** @deprecated Use AssumptionRequest with resolves_by - kept for migration */
-export interface PredictRequest {
-  content: string;
-  derived_from: string[];
-  assumes?: string[];
-  invalidates_if?: string[];
-  confirms_if?: string[];
-  outcome_condition: string;
-  resolves_by: number;
+  /** What determines success/failure (required if resolves_by set) */
+  outcome_condition?: string;
   tags?: string[];
 }
 
@@ -307,36 +347,14 @@ export interface RetractRequest {
 // Write Path - Response Types
 // ============================================
 
-/** Response from observe endpoint */
+/** Response from unified observe endpoint (handles both observations and thoughts) */
 export interface ObserveResponse {
   success: true;
   id: string;
+  /** Whether this is a time-bound thought (has resolves_by) - only present for thoughts */
+  time_bound?: boolean;
   /** Async exposure checking status */
   exposure_check: 'queued';
-  /** Classification challenge (only present if challenge triggered) */
-  challenge?: ClassificationChallenge;
-}
-
-/** Response from assume endpoint */
-export interface AssumptionResponse {
-  success: true;
-  id: string;
-  /** Whether this is a time-bound assumption (has resolves_by) */
-  time_bound: boolean;
-  /** Classification challenge (only present if challenge triggered) */
-  challenge?: ClassificationChallenge;
-}
-
-/** @deprecated Use AssumptionResponse - kept for migration */
-export interface InferResponse {
-  success: true;
-  id: string;
-}
-
-/** @deprecated Use AssumptionResponse - kept for migration */
-export interface PredictResponse {
-  success: true;
-  id: string;
 }
 
 /** Response from confirm endpoint */
@@ -354,7 +372,6 @@ export interface ViolateResponse {
   /** Downstream memories flagged for review */
   affected: Array<{
     id: string;
-    memory_type: MemoryType;
   }>;
 }
 
@@ -364,7 +381,6 @@ export interface RetractResponse {
   observation_id: string;
   affected: Array<{
     id: string;
-    memory_type: MemoryType;
   }>;
 }
 
@@ -375,7 +391,15 @@ export interface RetractResponse {
 /** Semantic search request */
 export interface FindRequest {
   query: string;
-  types?: MemoryType[];
+  /** Filter by memory characteristics */
+  filter?: {
+    /** Only observations */
+    observations_only?: boolean;
+    /** Only thoughts */
+    thoughts_only?: boolean;
+    /** Only time-bound thoughts */
+    predictions_only?: boolean;
+  };
   limit?: number;
   min_similarity?: number;
   /** Include retracted memories */
@@ -522,7 +546,7 @@ export interface KnowledgeResponse {
 // ============================================
 
 export interface BulkCreateRequest {
-  memories: Array<ObserveRequest | AssumptionRequest>;
+  memories: Array<MemoryRequest>;
   skip_dedup?: boolean;
 }
 
@@ -539,12 +563,8 @@ export type MemoryEventType =
   | 'observation:retracted'
   | 'memory:violated'
   | 'memory:confirmed'
-  | 'assumption:auto_confirmed'
-  | 'assumption:created'
-  // Legacy event types for backwards compatibility
-  | 'inference:created'
-  | 'prediction:created'
-  | 'prediction:auto_confirmed';
+  | 'thought:auto_confirmed'
+  | 'thought:created';
 
 /**
  * Memory event for coordinator batching/dispatch.
@@ -573,14 +593,12 @@ export interface MemoryEvent {
 /**
  * Job queued for async exposure checking.
  * Supports bi-directional checking:
- * - When memory_type is 'obs': check if this observation violates existing assumptions
- * - When memory_type is 'assumption': check if existing observations would violate this
+ * - When source is set: check if this observation violates existing thoughts
+ * - When derived_from is set: check if existing observations would violate this
  */
 export interface ExposureCheckJob {
   /** The memory being checked */
   memory_id: string;
-  /** Type of memory ('obs' or 'assumption') */
-  memory_type: MemoryType;
   /** Content of the memory */
   content: string;
   /** Embedding of the memory content */
@@ -592,30 +610,26 @@ export interface ExposureCheckJob {
   /** When the job was created */
   timestamp: number;
   /**
-   * For assumptions: the invalidates_if conditions to check against existing observations.
+   * For thoughts: the invalidates_if conditions to check against existing observations.
    * Already embedded separately but included for LLM judging.
    */
   invalidates_if?: string[];
   /**
-   * For time-bound assumptions: the confirms_if conditions to check against existing observations.
+   * For time-bound thoughts: the confirms_if conditions to check against existing observations.
    * Already embedded separately but included for LLM judging.
    */
   confirms_if?: string[];
   /**
-   * Whether this is a time-bound assumption (has resolves_by deadline).
+   * Whether this is a time-bound thought (has resolves_by deadline).
    * Used to determine confirms_if behavior.
    */
   time_bound?: boolean;
-}
-
-/** Legacy job format for backwards compatibility */
-export interface LegacyExposureCheckJob {
-  observation_id: string;
-  observation_content: string;
-  embedding: number[];
-  session_id?: string;
-  request_id: string;
-  timestamp: number;
+  /**
+   * Whether this is an observation (has source).
+   * If true, we check if it violates existing thoughts.
+   * If false, we check if existing observations would violate it.
+   */
+  is_observation?: boolean;
 }
 
 /** Result of exposure checking */
@@ -655,7 +669,9 @@ export interface MemoryHealthStatus {
 
 export interface MemoryStatsResponse {
   total_memories: number;
-  by_type: Record<MemoryType, number>;
+  observations: number;
+  thoughts: number;
+  predictions: number;
   total_edges: number;
   avg_confidence: number;
   avg_exposures: number;
@@ -665,79 +681,4 @@ export interface MemoryStatsResponse {
 export interface TagInfo {
   name: string;
   count: number;
-}
-
-// ============================================
-// Reclassify Types
-// ============================================
-
-/** Request to reclassify an assumption as an observation */
-export interface ReclassifyToObservationRequest {
-  /** Source of the observation (required) */
-  source: ObservationSource;
-  /** Reason for reclassification (required) */
-  reason: string;
-}
-
-/** Response from reclassify-to-observation endpoint */
-export interface ReclassifyToObservationResponse {
-  success: true;
-  memory_id: string;
-  previous_type: 'assumption';
-  new_type: 'obs';
-  source: ObservationSource;
-  /** Number of incoming derived_from edges removed */
-  edges_removed: number;
-}
-
-/** Request to reclassify an observation as an assumption */
-export interface ReclassifyToAssumptionRequest {
-  /** Source memory IDs this assumption is based on (required) */
-  derived_from: string[];
-  /** Reason for reclassification (required) */
-  reason: string;
-  /** Conditions that would prove this wrong */
-  invalidates_if?: string[];
-  /** Conditions that would strengthen this */
-  confirms_if?: string[];
-  /** Unix timestamp deadline for time-bound assumptions */
-  resolves_by?: number;
-  /** What determines success/failure (required if resolves_by set) */
-  outcome_condition?: string;
-}
-
-/** Response from reclassify-to-assumption endpoint */
-export interface ReclassifyToAssumptionResponse {
-  success: true;
-  memory_id: string;
-  previous_type: 'obs';
-  new_type: 'assumption';
-  derived_from: string[];
-  /** Whether this is a time-bound assumption */
-  time_bound: boolean;
-  /** Number of edges created */
-  edges_created: number;
-}
-
-// ============================================
-// Classification Challenge Types
-// ============================================
-
-/** Classification challenge suggestion */
-export interface ClassificationChallenge {
-  /** Suggested correct type */
-  suggested_type: MemoryType;
-  /** Confidence in the suggestion (0-1) */
-  confidence: number;
-  /** Explanation for the suggestion */
-  reasoning: string;
-  /** Suggested fields if reclassifying */
-  suggested_fields?: {
-    /** If suggesting obs */
-    source?: ObservationSource;
-    /** If suggesting assumption */
-    derived_from?: string[];
-    /** If suggesting assumption */
-    invalidates_if?: string[];
-  };
 }

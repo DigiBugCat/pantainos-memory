@@ -6,9 +6,13 @@
  */
 
 import { Hono } from 'hono';
-import type { Env, EntityType } from '../types/index.js';
+import type { Env } from '../types/index.js';
+import { getDisplayType } from '../lib/shared/types/index.js';
 
 const app = new Hono<{ Bindings: Env }>();
+
+/** Display type for memory entities */
+type DisplayType = 'observation' | 'thought' | 'prediction';
 
 interface TagWithCount {
   name: string;
@@ -18,7 +22,7 @@ interface TagWithCount {
 interface TaggedEntity {
   id: string;
   content: string;
-  type: EntityType;
+  type: DisplayType;
   tags: string[];
   created_at: number;
 }
@@ -74,7 +78,7 @@ app.get('/:tag', async (c) => {
 
   // Query unified memories table
   const result = await c.env.DB.prepare(`
-    SELECT id, content, memory_type as type, tags, created_at
+    SELECT id, content, source, derived_from, resolves_by, tags, created_at
     FROM memories
     WHERE retracted = 0 AND (
       tags LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\' OR
@@ -85,7 +89,9 @@ app.get('/:tag', async (c) => {
   `).bind(...tagPatterns, limit, offset).all<{
     id: string;
     content: string;
-    type: string;
+    source: string | null;
+    derived_from: string | null;
+    resolves_by: number | null;
     tags: string | null;
     created_at: number;
   }>();
@@ -93,7 +99,7 @@ app.get('/:tag', async (c) => {
   const entities: TaggedEntity[] = (result.results || []).map(row => ({
     id: row.id,
     content: row.content,
-    type: row.type as EntityType,
+    type: getDisplayType(row),
     tags: row.tags ? JSON.parse(row.tags) : [],
     created_at: row.created_at,
   }));

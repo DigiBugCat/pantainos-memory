@@ -33,12 +33,14 @@ import {
   findInactiveSessions,
   getPendingEvents,
   markEventsDispatched,
+  findOverduePredictions,
 } from './services/event-queue.js';
 import {
   dispatchToResolver,
   type ViolationEvent,
   type ConfirmationEvent,
   type CascadeEvent,
+  type OverduePredictionEvent,
 } from './services/resolver.js';
 import { computeSystemStats } from './jobs/compute-stats.js';
 
@@ -611,11 +613,10 @@ async function dispatchSessionEvents(
     .filter((e) => e.event_type.includes(':cascade_'))
     .map((e) => {
       const context = JSON.parse(e.context || '{}');
-      const [, cascadeAction] = e.event_type.split(':cascade_');
       return {
         id: e.id,
         memory_id: e.memory_id,
-        cascade_type: cascadeAction as 'review' | 'boost' | 'damage',
+        cascade_type: 'review' as const,
         memory_type: 'thought' as const,
         context: {
           reason: context.reason || '',
@@ -623,6 +624,23 @@ async function dispatchSessionEvents(
           source_outcome: context.source_outcome || 'void',
           edge_type: context.edge_type || '',
           suggested_action: context.suggested_action || 'review',
+        },
+      };
+    });
+
+  const overduePredictions: OverduePredictionEvent[] = events
+    .filter((e) => e.event_type === 'thought:pending_resolution')
+    .map((e) => {
+      const context = JSON.parse(e.context || '{}');
+      return {
+        id: e.id,
+        memory_id: e.memory_id,
+        context: {
+          content: context.content || '',
+          outcome_condition: context.outcome_condition || null,
+          resolves_by: context.resolves_by || 0,
+          invalidates_if: context.invalidates_if,
+          confirms_if: context.confirms_if,
         },
       };
     });
@@ -636,10 +654,12 @@ async function dispatchSessionEvents(
     violations,
     confirmations,
     cascades,
+    overduePredictions,
     summary: {
       violationCount: violations.length,
       confirmationCount: confirmations.length,
       cascadeCount: cascades.length,
+      overduePredictionCount: overduePredictions.length,
       affectedMemories: [...new Set(events.map((e) => e.memory_id))],
     },
   });
@@ -655,6 +675,7 @@ async function dispatchSessionEvents(
     violations: violations.length,
     confirmations: confirmations.length,
     cascades: cascades.length,
+    overdue_predictions: overduePredictions.length,
   });
 }
 
@@ -729,6 +750,34 @@ export default {
         });
       } catch (error) {
         log.error('daily_stats_computation_failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+
+      // Find overdue predictions and dispatch for resolution
+      try {
+        const overdue = await findOverduePredictions(env);
+        if (overdue.length > 0) {
+          log.info('overdue_predictions_found', { count: overdue.length });
+
+          for (const prediction of overdue) {
+            await queueSignificantEvent(env, {
+              event_type: 'thought:pending_resolution',
+              memory_id: prediction.id,
+              context: {
+                content: prediction.content,
+                outcome_condition: prediction.outcome_condition,
+                resolves_by: prediction.resolves_by,
+                invalidates_if: prediction.invalidates_if ? JSON.parse(prediction.invalidates_if) : undefined,
+                confirms_if: prediction.confirms_if ? JSON.parse(prediction.confirms_if) : undefined,
+              },
+            });
+          }
+
+          log.info('overdue_predictions_queued', { count: overdue.length });
+        }
+      } catch (error) {
+        log.error('overdue_prediction_dispatch_failed', {
           error: error instanceof Error ? error.message : String(error),
         });
       }

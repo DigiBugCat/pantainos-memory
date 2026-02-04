@@ -151,15 +151,11 @@ export async function getVersion(
 
 /**
  * Infer entity type from ID prefix.
- * v4: Both infer- and pred- prefixes map to 'assumption' type.
+ * Note: With unified model, IDs no longer have prefixes.
+ * This function is kept for edge IDs only.
  */
-function inferEntityType(id: string): HistoryEntityType | null {
-  if (id.startsWith('obs-')) return 'obs';
-  // Both infer- and pred- prefixes are assumptions
-  if (id.startsWith('infer-')) return 'assumption';
-  if (id.startsWith('pred-')) return 'assumption';
-  if (id.startsWith('edge-')) return 'edge';
-  // Legacy support
-  if (id.startsWith('thought-') || id.startsWith('note-')) return 'assumption';
+function inferEntityType(_id: string): HistoryEntityType | null {
+  // With unified model, we can't infer type from ID
+  // Caller should provide entityType explicitly
   return null;
 }

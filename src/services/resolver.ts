@@ -41,8 +41,7 @@ export interface ConfirmationEvent {
 export interface CascadeEvent {
   id: string;
   memory_id: string;
-  cascade_type: 'review' | 'boost' | 'damage';
-  // v4: Unified thought type (time_bound indicates pred-like behavior)
+  cascade_type: 'review';
   memory_type: 'thought';
   context: {
     reason: string;
@@ -53,16 +52,30 @@ export interface CascadeEvent {
   };
 }
 
+export interface OverduePredictionEvent {
+  id: string;
+  memory_id: string;
+  context: {
+    content: string;
+    outcome_condition: string | null;
+    resolves_by: number;
+    invalidates_if?: string[];
+    confirms_if?: string[];
+  };
+}
+
 export interface ResolverPayload {
   batchId: string;
   sessionId: string;
   violations: ViolationEvent[];
   confirmations: ConfirmationEvent[];
   cascades: CascadeEvent[];
+  overduePredictions: OverduePredictionEvent[];
   summary: {
     violationCount: number;
     confirmationCount: number;
     cascadeCount: number;
+    overduePredictionCount: number;
     affectedMemories: string[];
   };
 }
@@ -89,6 +102,7 @@ export async function dispatchToResolver(env: Env, payload: ResolverPayload): Pr
     session_id: payload.sessionId,
     violations: payload.summary.violationCount,
     confirmations: payload.summary.confirmationCount,
+    overdue_predictions: payload.summary.overduePredictionCount,
   });
 
   switch (resolverType) {
@@ -158,6 +172,7 @@ async function dispatchViaGitHub(env: Env, payload: ResolverPayload): Promise<vo
   if (summary.violationCount > 0) parts.push(`${summary.violationCount} violation${summary.violationCount > 1 ? 's' : ''}`);
   if (summary.confirmationCount > 0) parts.push(`${summary.confirmationCount} confirmation${summary.confirmationCount > 1 ? 's' : ''}`);
   if (summary.cascadeCount > 0) parts.push(`${summary.cascadeCount} cascade${summary.cascadeCount > 1 ? 's' : ''}`);
+  if (summary.overduePredictionCount > 0) parts.push(`${summary.overduePredictionCount} overdue prediction${summary.overduePredictionCount > 1 ? 's' : ''}`);
   const title = `Memory Resolver: ${parts.join(', ')}`;
 
   const body = formatGitHubIssueBody(payload);
@@ -225,12 +240,29 @@ function formatGitHubIssueBody(payload: ResolverPayload): string {
 
   if (payload.cascades.length > 0) {
     sections.push(`### Cascades (${payload.cascades.length})\n`);
-    sections.push(`| Memory ID | Type | Source | Action |`);
-    sections.push(`|-----------|------|--------|--------|`);
+    sections.push(`| Memory ID | Source | Reason |`);
+    sections.push(`|-----------|--------|--------|`);
     for (const c of payload.cascades) {
-      sections.push(`| \`${c.memory_id}\` | ${c.cascade_type} | \`${c.context.source_id}\` | ${c.context.suggested_action} |`);
+      sections.push(`| \`${c.memory_id}\` | \`${c.context.source_id}\` | ${c.context.reason} |`);
     }
     sections.push('');
+  }
+
+  if (payload.overduePredictions.length > 0) {
+    sections.push(`### Overdue Predictions (${payload.overduePredictions.length})\n`);
+    for (const p of payload.overduePredictions) {
+      sections.push(`#### \`${p.memory_id}\`\n`);
+      sections.push(`- **Content:** ${p.context.content}`);
+      sections.push(`- **Outcome Condition:** ${p.context.outcome_condition || 'N/A'}`);
+      sections.push(`- **Deadline:** ${new Date(p.context.resolves_by).toISOString()}`);
+      if (p.context.invalidates_if && p.context.invalidates_if.length > 0) {
+        sections.push(`- **Invalidates If:** ${p.context.invalidates_if.join('; ')}`);
+      }
+      if (p.context.confirms_if && p.context.confirms_if.length > 0) {
+        sections.push(`- **Confirms If:** ${p.context.confirms_if.join('; ')}`);
+      }
+      sections.push('');
+    }
   }
 
   sections.push(`<details>\n<summary>Raw Payload</summary>\n`);

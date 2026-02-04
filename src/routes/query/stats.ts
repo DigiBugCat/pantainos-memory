@@ -25,16 +25,16 @@ export interface StatsResponse {
   memory_counts: {
     total: number;
     obs: number;
-    assumption: number;
-    /** Time-bound assumptions (have resolves_by) */
+    thought: number;
+    /** Time-bound thoughts (have resolves_by) */
     time_bound: number;
-    /** General assumptions (no resolves_by) */
+    /** General thoughts (no resolves_by) */
     general: number;
     retracted: number;
   };
   // Exposure check status distribution
   exposure_status: Record<ExposureCheckStatus, number>;
-  // Robustness tier distribution (for assumptions only)
+  // Robustness tier distribution (for thoughts only)
   robustness_tiers: Record<Robustness, number>;
   // Cascade event counts
   cascade_events: {
@@ -42,7 +42,7 @@ export interface StatsResponse {
     total_boosts: number;
     total_damages: number;
   };
-  // State distribution (for assumptions)
+  // State distribution (for thoughts)
   state_distribution: {
     active: number;
     confirmed: number;
@@ -58,20 +58,20 @@ app.get('/', async (c) => {
   const config = c.get('config');
   const thresholds = getRobustnessThresholds(config);
 
-  // Memory counts by type
+  // Memory counts by type (using field presence)
   const memoryCounts = await c.env.DB.prepare(`
     SELECT
       COUNT(*) as total,
-      SUM(CASE WHEN memory_type = 'obs' AND retracted = 0 THEN 1 ELSE 0 END) as obs,
-      SUM(CASE WHEN memory_type = 'assumption' AND retracted = 0 THEN 1 ELSE 0 END) as assumption,
-      SUM(CASE WHEN memory_type = 'assumption' AND resolves_by IS NOT NULL AND retracted = 0 THEN 1 ELSE 0 END) as time_bound,
-      SUM(CASE WHEN memory_type = 'assumption' AND resolves_by IS NULL AND retracted = 0 THEN 1 ELSE 0 END) as general,
+      SUM(CASE WHEN source IS NOT NULL AND retracted = 0 THEN 1 ELSE 0 END) as obs,
+      SUM(CASE WHEN derived_from IS NOT NULL AND retracted = 0 THEN 1 ELSE 0 END) as thought,
+      SUM(CASE WHEN resolves_by IS NOT NULL AND retracted = 0 THEN 1 ELSE 0 END) as time_bound,
+      SUM(CASE WHEN derived_from IS NOT NULL AND resolves_by IS NULL AND retracted = 0 THEN 1 ELSE 0 END) as general,
       SUM(CASE WHEN retracted = 1 THEN 1 ELSE 0 END) as retracted
     FROM memories
   `).first<{
     total: number;
     obs: number;
-    assumption: number;
+    thought: number;
     time_bound: number;
     general: number;
     retracted: number;
@@ -98,24 +98,24 @@ app.get('/', async (c) => {
     exposureStatusMap[status] = row.count;
   }
 
-  // Robustness tier distribution (for assumptions only)
+  // Robustness tier distribution (for thoughts only)
   // Uses configurable thresholds
   const robustnessTiers = await c.env.DB.prepare(`
     SELECT
       CASE
-        WHEN exposures < ? THEN 'untested'
-        WHEN exposures < ? THEN 'brittle'
-        WHEN (CAST(confirmations AS REAL) / CASE WHEN exposures = 0 THEN 1 ELSE exposures END) >= ? THEN 'robust'
+        WHEN times_tested < ? THEN 'untested'
+        WHEN times_tested < ? THEN 'brittle'
+        WHEN (CAST(confirmations AS REAL) / CASE WHEN times_tested = 0 THEN 1 ELSE times_tested END) >= ? THEN 'robust'
         ELSE 'tested'
       END as tier,
       COUNT(*) as count
     FROM memories
     WHERE retracted = 0
-      AND memory_type = 'assumption'
+      AND derived_from IS NOT NULL
     GROUP BY tier
   `).bind(
-    thresholds.UNTESTED_MAX_EXPOSURES,
-    thresholds.BRITTLE_MAX_EXPOSURES,
+    thresholds.UNTESTED_MAX_TIMES_TESTED,
+    thresholds.BRITTLE_MAX_TIMES_TESTED,
     thresholds.ROBUST_MIN_CONFIDENCE
   ).all<{ tier: string; count: number }>();
 
@@ -146,13 +146,13 @@ app.get('/', async (c) => {
     WHERE retracted = 0
   `).first<{ total_boosts: number; total_damages: number }>();
 
-  // State distribution (for assumptions)
+  // State distribution (for thoughts)
   const stateDistribution = await c.env.DB.prepare(`
     SELECT
       state,
       COUNT(*) as count
     FROM memories
-    WHERE memory_type = 'assumption'
+    WHERE derived_from IS NOT NULL
     GROUP BY state
   `).all<{ state: string; count: number }>();
 
@@ -173,7 +173,7 @@ app.get('/', async (c) => {
     memory_counts: {
       total: memoryCounts?.total || 0,
       obs: memoryCounts?.obs || 0,
-      assumption: memoryCounts?.assumption || 0,
+      thought: memoryCounts?.thought || 0,
       time_bound: memoryCounts?.time_bound || 0,
       general: memoryCounts?.general || 0,
       retracted: memoryCounts?.retracted || 0,

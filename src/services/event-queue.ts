@@ -17,22 +17,18 @@ export type SignificantEventType =
   | 'thought_confirmed'
   | 'thought_resolved'
   | 'thought:cascade_review'
-  | 'thought:cascade_boost'
-  | 'thought:cascade_damage'
-  // Upward propagation events (evidence validated/invalidated in upstream memories)
+  // Upward propagation events (informational, not action-oriented)
   | 'thought:evidence_validated'
   | 'thought:evidence_invalidated'
+  // Overdue prediction resolution
+  | 'thought:pending_resolution'
   // Legacy event types (for migration compatibility)
   | 'prediction_confirmed'
   | 'prediction_resolved'
   | 'assumption_confirmed'
   | 'assumption_resolved'
   | 'prediction:cascade_review'
-  | 'prediction:cascade_boost'
-  | 'prediction:cascade_damage'
   | 'assumption:cascade_review'
-  | 'assumption:cascade_boost'
-  | 'assumption:cascade_damage'
   | 'prediction:evidence_validated'
   | 'prediction:evidence_invalidated'
   | 'assumption:evidence_validated'
@@ -127,6 +123,44 @@ export async function markEventsDispatched(
     SET dispatched = 1, dispatched_at = ?, workflow_id = ?
     WHERE id IN (${placeholders})
   `).bind(Date.now(), workflowId, ...eventIds).run();
+}
+
+/**
+ * Find overdue predictions that haven't been dispatched yet.
+ * Used by the daily cron to queue pending_resolution events.
+ */
+export async function findOverduePredictions(env: Env): Promise<{
+  id: string;
+  content: string;
+  outcome_condition: string | null;
+  resolves_by: number;
+  invalidates_if: string | null;
+  confirms_if: string | null;
+}[]> {
+  const now = Date.now();
+
+  const result = await env.DB.prepare(`
+    SELECT m.id, m.content, m.outcome_condition, m.resolves_by, m.invalidates_if, m.confirms_if
+    FROM memories m
+    WHERE m.resolves_by IS NOT NULL
+      AND m.resolves_by < ?
+      AND m.state = 'active'
+      AND m.retracted = 0
+      AND m.id NOT IN (
+        SELECT me.memory_id FROM memory_events me
+        WHERE me.event_type = 'thought:pending_resolution'
+        AND me.dispatched = 1
+      )
+  `).bind(now).all<{
+    id: string;
+    content: string;
+    outcome_condition: string | null;
+    resolves_by: number;
+    invalidates_if: string | null;
+    confirms_if: string | null;
+  }>();
+
+  return result.results || [];
 }
 
 /**
