@@ -645,32 +645,84 @@ async function dispatchSessionEvents(
       };
     });
 
-  const batchId = `batch-${crypto.randomUUID().slice(0, 8)}`;
+  // Build separate payloads for parallel dispatch:
+  // - One batch for violations + cascades + confirmations (related context)
+  // - One issue per overdue prediction (independent, can resolve in parallel)
+  const dispatches: { payload: Parameters<typeof dispatchToResolver>[1]; eventIds: string[] }[] = [];
 
-  // Dispatch to resolver
-  await dispatchToResolver(env, {
-    batchId,
-    sessionId,
-    violations,
-    confirmations,
-    cascades,
-    overduePredictions,
-    summary: {
-      violationCount: violations.length,
-      confirmationCount: confirmations.length,
-      cascadeCount: cascades.length,
-      overduePredictionCount: overduePredictions.length,
-      affectedMemories: [...new Set(events.map((e) => e.memory_id))],
-    },
-  });
+  // Batch violations/cascades/confirmations together (if any)
+  const coreEvents = [...violations, ...confirmations, ...cascades];
+  if (coreEvents.length > 0) {
+    const batchId = `batch-${crypto.randomUUID().slice(0, 8)}`;
+    dispatches.push({
+      payload: {
+        batchId,
+        sessionId,
+        violations,
+        confirmations,
+        cascades,
+        overduePredictions: [],
+        summary: {
+          violationCount: violations.length,
+          confirmationCount: confirmations.length,
+          cascadeCount: cascades.length,
+          overduePredictionCount: 0,
+          affectedMemories: [...new Set(coreEvents.map((e) => e.memory_id))],
+        },
+      },
+      eventIds: coreEvents.map((e) => e.id),
+    });
+  }
 
-  // Mark events as dispatched
-  const eventIds = events.map((e) => e.id);
-  await markEventsDispatched(env, eventIds, batchId);
+  // Separate issue per overdue prediction (parallel resolution)
+  for (const prediction of overduePredictions) {
+    const batchId = `batch-${crypto.randomUUID().slice(0, 8)}`;
+    dispatches.push({
+      payload: {
+        batchId,
+        sessionId,
+        violations: [],
+        confirmations: [],
+        cascades: [],
+        overduePredictions: [prediction],
+        summary: {
+          violationCount: 0,
+          confirmationCount: 0,
+          cascadeCount: 0,
+          overduePredictionCount: 1,
+          affectedMemories: [prediction.memory_id],
+        },
+      },
+      eventIds: [prediction.id],
+    });
+  }
+
+  // Dispatch all in parallel
+  const results = await Promise.allSettled(
+    dispatches.map(async ({ payload, eventIds }) => {
+      await dispatchToResolver(env, payload);
+      await markEventsDispatched(env, eventIds, payload.batchId);
+      return payload.batchId;
+    })
+  );
+
+  const succeeded = results.filter((r) => r.status === 'fulfilled').length;
+  const failed = results.filter((r) => r.status === 'rejected');
+
+  for (const f of failed) {
+    if (f.status === 'rejected') {
+      log.error('dispatch_failed', {
+        session_id: sessionId,
+        error: f.reason instanceof Error ? f.reason.message : String(f.reason),
+      });
+    }
+  }
 
   log.info('session_dispatch_complete', {
     session_id: sessionId,
-    batch_id: batchId,
+    dispatches_total: dispatches.length,
+    dispatches_succeeded: succeeded,
+    dispatches_failed: failed.length,
     event_count: events.length,
     violations: violations.length,
     confirmations: confirmations.length,
@@ -716,14 +768,19 @@ export default {
 
         log.info('found_inactive_sessions', { count: inactiveSessions.length });
 
-        // Dispatch events for each inactive session
-        for (const session of inactiveSessions) {
-          try {
-            await dispatchSessionEvents(env, session.session_id, log);
-          } catch (error) {
+        // Dispatch events for all inactive sessions in parallel
+        const sessionResults = await Promise.allSettled(
+          inactiveSessions.map((session) =>
+            dispatchSessionEvents(env, session.session_id, log)
+          )
+        );
+
+        for (let i = 0; i < sessionResults.length; i++) {
+          const result = sessionResults[i];
+          if (result.status === 'rejected') {
             log.error('session_dispatch_failed', {
-              session_id: session.session_id,
-              error: error instanceof Error ? error.message : String(error),
+              session_id: inactiveSessions[i].session_id,
+              error: result.reason instanceof Error ? result.reason.message : String(result.reason),
             });
           }
         }
