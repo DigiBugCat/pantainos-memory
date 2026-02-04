@@ -1,14 +1,12 @@
 # Pantainos Memory - Zettelkasten Knowledge Graph
 #
 # Authentication: MCP OAuth 2.0 backed by Cloudflare Access
-# Configure CF_ACCESS_TEAM and CF_ACCESS_AUD for your Zero Trust application.
 #
-# Environments:
-#   Local:      pnpm dev (uses dev resources with --remote flag)
-#   Dev:        wrangler deploy --env dev
-#   Production: wrangler deploy
+# IMPORTANT: Terraform (infra/) is the source of truth for production.
+# This file is used for `pnpm dev` (local) and `--env dev` only.
+# Production deploys go through `tofu apply` which reads dist/index.js directly.
 
-name = "memory"
+name = "pantainos-memory"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
@@ -24,22 +22,22 @@ crons = ["* * * * *", "0 3 * * *"]
 # D1 Database
 [[d1_databases]]
 binding = "DB"
-database_name = "memory"
-database_id = "TODO"
+database_name = "pantainos-memory"
+database_id = "22be27c1-7e29-4fac-81e2-cd96ceadafa2"
 migrations_dir = "migrations"
 
 # Vectorize Indexes (768 dimensions, embeddinggemma-300m)
 [[vectorize]]
 binding = "MEMORY_VECTORS"
-index_name = "memory-vectors"
+index_name = "pantainos-memory-vectors"
 
 [[vectorize]]
 binding = "INVALIDATES_VECTORS"
-index_name = "memory-invalidates"
+index_name = "pantainos-memory-invalidates"
 
 [[vectorize]]
 binding = "CONFIRMS_VECTORS"
-index_name = "memory-confirms"
+index_name = "pantainos-memory-confirms"
 
 # Workers AI
 [ai]
@@ -53,15 +51,15 @@ dataset = "memory_prod"
 # OAuth KV (for MCP authentication state)
 [[kv_namespaces]]
 binding = "OAUTH_KV"
-id = "TODO"
+id = "44a53cd6bcbd4aadae45c51d1769b204"
 
 # Detection Queue
 [[queues.producers]]
-queue = "memory-detection"
+queue = "pantainos-memory-detection"
 binding = "DETECTION_QUEUE"
 
 [[queues.consumers]]
-queue = "memory-detection"
+queue = "pantainos-memory-detection"
 max_batch_size = 10
 max_batch_timeout = 5
 
@@ -86,7 +84,7 @@ LLM_JUDGE_URL = "https://claude-proxy.pantainos.workers.dev/v1/chat/completions"
 # Dev Environment
 # ============================================
 [env.dev]
-name = "memory-dev"
+name = "pantainos-memory-dev"
 
 [env.dev.ai]
 binding = "AI"
@@ -113,28 +111,28 @@ MAX_CANDIDATES = "30"
 
 [[env.dev.d1_databases]]
 binding = "DB"
-database_name = "memory-dev"
+database_name = "pantainos-memory-dev"
 database_id = "cddfba98-685d-4139-933d-1160a00427c2"
 migrations_dir = "migrations"
 
 [[env.dev.vectorize]]
 binding = "MEMORY_VECTORS"
-index_name = "memory-dev-vectors"
+index_name = "pantainos-memory-dev-vectors"
 
 [[env.dev.vectorize]]
 binding = "INVALIDATES_VECTORS"
-index_name = "memory-dev-invalidates"
+index_name = "pantainos-memory-dev-invalidates"
 
 [[env.dev.vectorize]]
 binding = "CONFIRMS_VECTORS"
-index_name = "memory-dev-confirms"
+index_name = "pantainos-memory-dev-confirms"
 
 [[env.dev.queues.producers]]
-queue = "memory-dev-detection"
+queue = "pantainos-memory-dev-detection"
 binding = "DETECTION_QUEUE"
 
 [[env.dev.queues.consumers]]
-queue = "memory-dev-detection"
+queue = "pantainos-memory-dev-detection"
 max_batch_size = 10
 max_batch_timeout = 5
 

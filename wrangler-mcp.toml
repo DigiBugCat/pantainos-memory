@@ -5,11 +5,11 @@
 # - MCP OAuth handles the protocol auth flow
 # - Shares D1/Vectorize bindings with API worker
 #
-# Environments:
-#   Dev:        wrangler deploy --config wrangler-mcp.toml --env dev
-#   Production: wrangler deploy --config wrangler-mcp.toml
+# IMPORTANT: Terraform (infra/) is the source of truth for production.
+# This file is used for `pnpm dev` (local) and `--env dev` only.
+# Production deploys go through `tofu apply` which reads dist/mcp-index.js directly.
 
-name = "memory-mcp"
+name = "pantainos-memory-mcp"
 main = "src/mcp-index.ts"
 compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
@@ -21,21 +21,21 @@ compatibility_flags = ["nodejs_compat"]
 # D1 Database (shared with API worker)
 [[d1_databases]]
 binding = "DB"
-database_name = "memory"
-database_id = "TODO"
+database_name = "pantainos-memory"
+database_id = "22be27c1-7e29-4fac-81e2-cd96ceadafa2"
 
 # Vectorize Indexes (shared with API worker)
 [[vectorize]]
 binding = "MEMORY_VECTORS"
-index_name = "memory-vectors"
+index_name = "pantainos-memory-vectors"
 
 [[vectorize]]
 binding = "INVALIDATES_VECTORS"
-index_name = "memory-invalidates"
+index_name = "pantainos-memory-invalidates"
 
 [[vectorize]]
 binding = "CONFIRMS_VECTORS"
-index_name = "memory-confirms"
+index_name = "pantainos-memory-confirms"
 
 # Workers AI
 [ai]
@@ -44,7 +44,7 @@ binding = "AI"
 # OAuth KV (for MCP authentication state)
 [[kv_namespaces]]
 binding = "OAUTH_KV"
-id = "TODO"
+id = "44a53cd6bcbd4aadae45c51d1769b204"
 
 # Analytics Engine
 [[analytics_engine_datasets]]
@@ -72,7 +72,7 @@ LLM_JUDGE_URL = "https://claude-proxy.pantainos.workers.dev/v1/chat/completions"
 # Dev Environment
 # ============================================
 [env.dev]
-name = "memory-mcp-dev"
+name = "pantainos-memory-mcp-dev"
 
 [env.dev.ai]
 binding = "AI"
@@ -99,21 +99,21 @@ MAX_CANDIDATES = "30"
 # D1 Database (shared with API worker)
 [[env.dev.d1_databases]]
 binding = "DB"
-database_name = "memory-dev"
+database_name = "pantainos-memory-dev"
 database_id = "cddfba98-685d-4139-933d-1160a00427c2"
 
 # Vectorize Indexes (shared with API worker)
 [[env.dev.vectorize]]
 binding = "MEMORY_VECTORS"
-index_name = "memory-dev-vectors"
+index_name = "pantainos-memory-dev-vectors"
 
 [[env.dev.vectorize]]
 binding = "INVALIDATES_VECTORS"
-index_name = "memory-dev-invalidates"
+index_name = "pantainos-memory-dev-invalidates"
 
 [[env.dev.vectorize]]
 binding = "CONFIRMS_VECTORS"
-index_name = "memory-dev-confirms"
+index_name = "pantainos-memory-dev-confirms"
 
 # OAuth KV (shared with API worker)
 [[env.dev.kv_namespaces]]
