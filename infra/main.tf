@@ -234,6 +234,22 @@ resource "terraform_data" "queue_consumer" {
 }
 
 # =============================================================================
+# Cron Triggers (scheduled event handlers on API worker)
+# =============================================================================
+
+resource "cloudflare_workers_cron_trigger" "api" {
+  account_id  = var.account_id
+  script_name = cloudflare_worker.api.name
+
+  schedules = [
+    { cron = "* * * * *" },     # Every minute: dispatch inactive session events
+    { cron = "0 3 * * *" },     # Daily 3AM UTC: compute stats + queue overdue predictions
+  ]
+
+  depends_on = [cloudflare_workers_deployment.api]
+}
+
+# =============================================================================
 # MCP Worker (v5 pattern: worker + version + deployment)
 # =============================================================================
 
