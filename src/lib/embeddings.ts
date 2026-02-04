@@ -21,16 +21,23 @@ function getGatewayOptions(config: Config): { gateway: { id: string } } | undefi
 /**
  * Call external LLM endpoint (OpenAI-compatible).
  * Used when LLM_JUDGE_URL is configured to route LLM calls through n8n or other services.
+ * Supports CF Access service token auth (for claude-proxy) and/or Bearer token auth.
  */
-async function callExternalLLM(
+export async function callExternalLLM(
   url: string,
   prompt: string,
   apiKey?: string,
-  requestId?: string
+  requestId?: string,
+  cfClientId?: string,
+  cfClientSecret?: string
 ): Promise<string> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   };
+  if (cfClientId && cfClientSecret) {
+    headers['CF-Access-Client-Id'] = cfClientId;
+    headers['CF-Access-Client-Secret'] = cfClientSecret;
+  }
   if (apiKey) {
     headers['Authorization'] = `Bearer ${apiKey}`;
   }
@@ -169,7 +176,7 @@ Respond with ONLY a JSON object (no markdown, no explanation): {"verdict": "dupl
   // Use external LLM endpoint if configured
   if (env?.LLM_JUDGE_URL) {
     responseContent = await withRetry(
-      () => callExternalLLM(env.LLM_JUDGE_URL!, prompt, env.LLM_JUDGE_API_KEY, requestId),
+      () => callExternalLLM(env.LLM_JUDGE_URL!, prompt, env.LLM_JUDGE_API_KEY, requestId, env.LLM_JUDGE_CF_CLIENT_ID, env.LLM_JUDGE_CF_CLIENT_SECRET),
       { retries: 2, delay: 100, name: 'checkDuplicateWithLLM_external', requestId }
     );
   } else {

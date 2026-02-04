@@ -18,6 +18,7 @@ import type { Config } from '../lib/config.js';
 import type { ObservationSource } from '../lib/shared/types/index.js';
 import { createLazyLogger } from '../lib/lazy-logger.js';
 import { withRetry } from '../lib/retry.js';
+import { callExternalLLM } from '../lib/embeddings.js';
 
 const getLog = createLazyLogger('ClassificationChallenge', 'classification-init');
 
@@ -211,7 +212,7 @@ function extractContent(response: unknown): string {
  * @returns Challenge object if misclassification detected above threshold, null otherwise
  */
 export async function challengeClassification(
-  _env: Env, // Reserved for future external LLM endpoint support
+  env: Env,
   ai: Ai,
   config: Config,
   params: {
@@ -228,59 +229,78 @@ export async function challengeClassification(
   const prompt = buildClassificationPrompt(params.content, params.current_type);
 
   try {
-    const response = await withRetry(
-      async () => {
-        const model = config.classification.challengeModel;
-        const isGptOss = model.includes('gpt-oss');
+    let responseText: string;
 
-        // AI Gateway config for observability (optional)
-        const gatewayConfig = config.aiGatewayId
-          ? {
-              gateway: {
-                id: config.aiGatewayId,
-                metadata: {
-                  service: 'pantainos-memory',
-                  operation: 'classification_challenge',
-                  model,
+    if (env.LLM_JUDGE_URL) {
+      // Route through external LLM endpoint (e.g., claude-proxy)
+      responseText = await withRetry(
+        () => callExternalLLM(
+          env.LLM_JUDGE_URL!,
+          prompt,
+          env.LLM_JUDGE_API_KEY,
+          params.requestId,
+          env.LLM_JUDGE_CF_CLIENT_ID,
+          env.LLM_JUDGE_CF_CLIENT_SECRET
+        ),
+        { retries: 2, delay: 100 }
+      );
+    } else {
+      // Fall back to Workers AI
+      const response = await withRetry(
+        async () => {
+          const model = config.classification.challengeModel;
+          const isGptOss = model.includes('gpt-oss');
+
+          // AI Gateway config for observability (optional)
+          const gatewayConfig = config.aiGatewayId
+            ? {
+                gateway: {
+                  id: config.aiGatewayId,
+                  metadata: {
+                    service: 'pantainos-memory',
+                    operation: 'classification_challenge',
+                    model,
+                  },
                 },
-              },
-            }
-          : undefined;
+              }
+            : undefined;
 
-        if (isGptOss) {
-          // GPT-OSS uses Responses API format with structured output
-          return await ai.run(
-            model as Parameters<typeof ai.run>[0],
-            {
-              input: prompt,
-              instructions: 'Return only valid JSON matching the schema',
-              response_format: {
-                type: 'json_schema',
-                json_schema: {
-                  name: 'classification_check',
-                  strict: true,
-                  schema: CLASSIFICATION_SCHEMA,
+          if (isGptOss) {
+            // GPT-OSS uses Responses API format with structured output
+            return await ai.run(
+              model as Parameters<typeof ai.run>[0],
+              {
+                input: prompt,
+                instructions: 'Return only valid JSON matching the schema',
+                response_format: {
+                  type: 'json_schema',
+                  json_schema: {
+                    name: 'classification_check',
+                    strict: true,
+                    schema: CLASSIFICATION_SCHEMA,
+                  },
                 },
-              },
-            } as Parameters<typeof ai.run>[1],
-            gatewayConfig
-          );
-        } else {
-          // Chat completion format for other models
-          return await ai.run(
-            model as Parameters<typeof ai.run>[0],
-            {
-              messages: [{ role: 'user', content: prompt }],
-              max_tokens: 300,
-            } as Parameters<typeof ai.run>[1],
-            gatewayConfig
-          );
-        }
-      },
-      { retries: 2, delay: 100 }
-    );
+              } as Parameters<typeof ai.run>[1],
+              gatewayConfig
+            );
+          } else {
+            // Chat completion format for other models
+            return await ai.run(
+              model as Parameters<typeof ai.run>[0],
+              {
+                messages: [{ role: 'user', content: prompt }],
+                max_tokens: 300,
+              } as Parameters<typeof ai.run>[1],
+              gatewayConfig
+            );
+          }
+        },
+        { retries: 2, delay: 100 }
+      );
 
-    const responseText = extractContent(response);
+      responseText = extractContent(response);
+    }
+
     const result = parseClassificationResponse(responseText);
 
     if (!result) {
@@ -530,7 +550,7 @@ function parseCompletenessResponse(responseText: string): MemoryCompleteness | n
  * @returns MemoryCompleteness object with suggestions, or null if complete/disabled
  */
 export async function checkMemoryCompleteness(
-  _env: Env, // Reserved for future external LLM endpoint support
+  env: Env,
   ai: Ai,
   config: Config,
   params: {
@@ -557,59 +577,78 @@ export async function checkMemoryCompleteness(
   });
 
   try {
-    const response = await withRetry(
-      async () => {
-        const model = config.classification.challengeModel;
-        const isGptOss = model.includes('gpt-oss');
+    let responseText: string;
 
-        // AI Gateway config for observability (optional)
-        const gatewayConfig = config.aiGatewayId
-          ? {
-              gateway: {
-                id: config.aiGatewayId,
-                metadata: {
-                  service: 'pantainos-memory',
-                  operation: 'completeness_check',
-                  model,
+    if (env.LLM_JUDGE_URL) {
+      // Route through external LLM endpoint (e.g., claude-proxy)
+      responseText = await withRetry(
+        () => callExternalLLM(
+          env.LLM_JUDGE_URL!,
+          prompt,
+          env.LLM_JUDGE_API_KEY,
+          params.requestId,
+          env.LLM_JUDGE_CF_CLIENT_ID,
+          env.LLM_JUDGE_CF_CLIENT_SECRET
+        ),
+        { retries: 2, delay: 100 }
+      );
+    } else {
+      // Fall back to Workers AI
+      const response = await withRetry(
+        async () => {
+          const model = config.classification.challengeModel;
+          const isGptOss = model.includes('gpt-oss');
+
+          // AI Gateway config for observability (optional)
+          const gatewayConfig = config.aiGatewayId
+            ? {
+                gateway: {
+                  id: config.aiGatewayId,
+                  metadata: {
+                    service: 'pantainos-memory',
+                    operation: 'completeness_check',
+                    model,
+                  },
                 },
-              },
-            }
-          : undefined;
+              }
+            : undefined;
 
-        if (isGptOss) {
-          // GPT-OSS uses Responses API format with structured output
-          return await ai.run(
-            model as Parameters<typeof ai.run>[0],
-            {
-              input: prompt,
-              instructions: 'Return only valid JSON matching the schema',
-              response_format: {
-                type: 'json_schema',
-                json_schema: {
-                  name: 'completeness_check',
-                  strict: true,
-                  schema: COMPLETENESS_SCHEMA,
+          if (isGptOss) {
+            // GPT-OSS uses Responses API format with structured output
+            return await ai.run(
+              model as Parameters<typeof ai.run>[0],
+              {
+                input: prompt,
+                instructions: 'Return only valid JSON matching the schema',
+                response_format: {
+                  type: 'json_schema',
+                  json_schema: {
+                    name: 'completeness_check',
+                    strict: true,
+                    schema: COMPLETENESS_SCHEMA,
+                  },
                 },
-              },
-            } as Parameters<typeof ai.run>[1],
-            gatewayConfig
-          );
-        } else {
-          // Chat completion format for other models
-          return await ai.run(
-            model as Parameters<typeof ai.run>[0],
-            {
-              messages: [{ role: 'user', content: prompt }],
-              max_tokens: 400,
-            } as Parameters<typeof ai.run>[1],
-            gatewayConfig
-          );
-        }
-      },
-      { retries: 2, delay: 100 }
-    );
+              } as Parameters<typeof ai.run>[1],
+              gatewayConfig
+            );
+          } else {
+            // Chat completion format for other models
+            return await ai.run(
+              model as Parameters<typeof ai.run>[0],
+              {
+                messages: [{ role: 'user', content: prompt }],
+                max_tokens: 400,
+              } as Parameters<typeof ai.run>[1],
+              gatewayConfig
+            );
+          }
+        },
+        { retries: 2, delay: 100 }
+      );
 
-    const responseText = extractContent(response);
+      responseText = extractContent(response);
+    }
+
     const result = parseCompletenessResponse(responseText);
 
     if (!result) {

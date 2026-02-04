@@ -77,6 +77,9 @@ locals {
     { type = "plain_text", name = "RESOLVER_TYPE", text = "none" },
     { type = "plain_text", name = "CF_ACCESS_TEAM", text = var.cf_access_team },
     { type = "plain_text", name = "CLASSIFICATION_CHALLENGE_ENABLED", text = "true" },
+    { type = "plain_text", name = "LLM_JUDGE_URL", text = var.llm_judge_url },
+    { type = "secret_text", name = "LLM_JUDGE_CF_CLIENT_ID", text = var.llm_judge_cf_client_id },
+    { type = "secret_text", name = "LLM_JUDGE_CF_CLIENT_SECRET", text = var.llm_judge_cf_client_secret },
   ]
 }
 
@@ -92,7 +95,8 @@ resource "cloudflare_d1_database" "memory" {
   name       = local.d1_name
 
   lifecycle {
-    ignore_changes = [primary_location_hint, read_replication]
+    prevent_destroy = true
+    ignore_changes  = [primary_location_hint, read_replication]
   }
 }
 

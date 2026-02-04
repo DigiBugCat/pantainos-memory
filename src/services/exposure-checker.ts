@@ -710,6 +710,10 @@ async function checkConditionMatch(
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
       };
+      if (env.LLM_JUDGE_CF_CLIENT_ID && env.LLM_JUDGE_CF_CLIENT_SECRET) {
+        headers['CF-Access-Client-Id'] = env.LLM_JUDGE_CF_CLIENT_ID;
+        headers['CF-Access-Client-Secret'] = env.LLM_JUDGE_CF_CLIENT_SECRET;
+      }
       if (env.LLM_JUDGE_API_KEY) {
         headers['Authorization'] = `Bearer ${env.LLM_JUDGE_API_KEY}`;
       }

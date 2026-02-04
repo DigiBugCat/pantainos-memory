@@ -74,6 +74,7 @@ DEDUP_LOWER_THRESHOLD = "0.70"
 DEDUP_CONFIDENCE_THRESHOLD = "0.8"
 RESOLVER_TYPE = "none"
 CLASSIFICATION_CHALLENGE_ENABLED = "true"
+LLM_JUDGE_URL = "https://claude-proxy.pantainos.workers.dev/v1/chat/completions"
 
 # ============================================
 # Dev Environment
@@ -92,6 +93,7 @@ DEDUP_LOWER_THRESHOLD = "0.70"
 DEDUP_CONFIDENCE_THRESHOLD = "0.8"
 RESOLVER_TYPE = "none"
 CLASSIFICATION_CHALLENGE_ENABLED = "true"
+LLM_JUDGE_URL = "https://claude-proxy-dev.pantainos.workers.dev/v1/chat/completions"
 # Exposure check thresholds (lower = more sensitive)
 MIN_SIMILARITY = "0.35"
 VIOLATION_CONFIDENCE_THRESHOLD = "0.6"
