@@ -210,13 +210,16 @@ CREATE TABLE IF NOT EXISTS memory_events (
     'violation',
     'thought_confirmed',
     'thought_resolved',
-    -- Cascade events (mark for review, don't auto-modify)
+    -- Cascade events (review-only)
     'thought:cascade_review',
-    'thought:cascade_boost',
-    'thought:cascade_damage',
-    -- Upward propagation events (evidence validated/invalidated in upstream memories)
+    -- Upward propagation events
     'thought:evidence_validated',
-    'thought:evidence_invalidated'
+    'thought:evidence_invalidated',
+    -- Overdue prediction resolution
+    'thought:pending_resolution',
+    -- Deprecated (kept for existing data)
+    'thought:cascade_boost',
+    'thought:cascade_damage'
   )),
   memory_id TEXT NOT NULL,
   violated_by TEXT,              -- ID of observation that caused violation
