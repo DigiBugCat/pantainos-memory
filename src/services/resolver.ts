@@ -254,7 +254,9 @@ function formatGitHubIssueBody(payload: ResolverPayload): string {
       sections.push(`#### \`${p.memory_id}\`\n`);
       sections.push(`- **Content:** ${p.context.content}`);
       sections.push(`- **Outcome Condition:** ${p.context.outcome_condition || 'N/A'}`);
-      sections.push(`- **Deadline:** ${new Date(p.context.resolves_by).toISOString()}`);
+      // resolves_by is stored as Unix seconds, Date() expects milliseconds
+      const deadlineMs = p.context.resolves_by < 1e12 ? p.context.resolves_by * 1000 : p.context.resolves_by;
+      sections.push(`- **Deadline:** ${new Date(deadlineMs).toISOString()}`);
       if (p.context.invalidates_if && p.context.invalidates_if.length > 0) {
         sections.push(`- **Invalidates If:** ${p.context.invalidates_if.join('; ')}`);
       }
