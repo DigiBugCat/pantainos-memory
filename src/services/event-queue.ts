@@ -149,7 +149,6 @@ export async function findOverduePredictions(env: Env): Promise<{
       AND m.id NOT IN (
         SELECT me.memory_id FROM memory_events me
         WHERE me.event_type = 'thought:pending_resolution'
-        AND me.dispatched = 1
       )
   `).bind(now).all<{
     id: string;

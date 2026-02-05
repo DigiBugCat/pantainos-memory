@@ -38,3 +38,9 @@ variable "resolver_github_repo" {
   type        = string
   default     = "DigiBugCat/Cassandra-Finance"
 }
+
+variable "resolver_github_token" {
+  description = "GitHub PAT for resolver issue creation (requires issues:write scope)"
+  type        = string
+  sensitive   = true
+}

@@ -76,7 +76,7 @@ locals {
     { type = "plain_text", name = "DEDUP_THRESHOLD", text = "0.85" },
     { type = "plain_text", name = "RESOLVER_TYPE", text = "github" },
     { type = "plain_text", name = "RESOLVER_GITHUB_REPO", text = var.resolver_github_repo },
-    # RESOLVER_GITHUB_TOKEN is managed via `wrangler secret put` (not Terraform)
+    { type = "secret_text", name = "RESOLVER_GITHUB_TOKEN", text = var.resolver_github_token },
     { type = "plain_text", name = "CF_ACCESS_TEAM", text = var.cf_access_team },
     { type = "plain_text", name = "CLASSIFICATION_CHALLENGE_ENABLED", text = "true" },
     { type = "service", name = "CLAUDE_PROXY", service = var.claude_proxy_worker_name },

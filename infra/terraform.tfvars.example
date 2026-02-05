@@ -10,3 +10,7 @@ allowed_emails = [
   "your-email@example.com",
   # Add more emails as needed
 ]
+
+# GitHub PAT for memory resolver (requires issues:write scope)
+# Can also be set via TF_VAR_resolver_github_token env var
+resolver_github_token = "ghp_your_token_here"
