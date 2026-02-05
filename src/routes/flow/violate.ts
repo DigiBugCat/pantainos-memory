@@ -66,7 +66,7 @@ app.post('/:id', async (c) => {
   }
 
   // Perform violation
-  const violation = await manualViolate(c.env.DB, memoryId, body.condition, body.observation_id);
+  const violation = await manualViolate(c.env, memoryId, body.condition, body.observation_id);
 
   // Get updated memory
   const row = await c.env.DB.prepare(

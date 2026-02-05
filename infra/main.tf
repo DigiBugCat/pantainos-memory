@@ -48,8 +48,9 @@ locals {
   env_suffix = local.is_prod ? "" : "-${var.environment}"
 
   # Resource names (base: pantainos-memory)
-  api_worker_name = local.is_prod ? "pantainos-memory" : "pantainos-memory-${var.environment}"
-  mcp_worker_name = local.is_prod ? "pantainos-memory-mcp" : "pantainos-memory-mcp-${var.environment}"
+  api_worker_name   = local.is_prod ? "pantainos-memory" : "pantainos-memory-${var.environment}"
+  mcp_worker_name   = local.is_prod ? "pantainos-memory-mcp" : "pantainos-memory-mcp-${var.environment}"
+  admin_worker_name = local.is_prod ? "pantainos-memory-admin" : "pantainos-memory-admin-${var.environment}"
   d1_name         = local.is_prod ? "pantainos-memory" : "pantainos-memory-${var.environment}"
   kv_name         = "${local.api_worker_name}-oauth"
   queue_name      = "${local.api_worker_name}-detection"
@@ -60,8 +61,9 @@ locals {
   vectorize_confirms    = "${local.api_worker_name}-confirms"
 
   # Worker URLs
-  api_url = "${local.api_worker_name}.pantainos.workers.dev"
-  mcp_url = "${local.mcp_worker_name}.pantainos.workers.dev"
+  api_url   = "${local.api_worker_name}.pantainos.workers.dev"
+  mcp_url   = "${local.mcp_worker_name}.pantainos.workers.dev"
+  admin_url = "${local.admin_worker_name}.pantainos.workers.dev"
 
   # Common bindings for workers
   common_bindings = [
@@ -298,6 +300,123 @@ resource "cloudflare_workers_deployment" "mcp" {
   versions = [{
     version_id = cloudflare_worker_version.mcp.id
     percentage = 100
+  }]
+}
+
+# =============================================================================
+# Admin Worker (admin MCP server for maintenance)
+# =============================================================================
+
+resource "cloudflare_worker" "admin" {
+  account_id = var.account_id
+  name       = local.admin_worker_name
+
+  subdomain = {
+    enabled = true
+  }
+}
+
+resource "cloudflare_worker_version" "admin" {
+  account_id  = var.account_id
+  worker_id   = cloudflare_worker.admin.id
+  main_module = "admin-index.js"
+
+  modules = [{
+    name         = "admin-index.js"
+    content_file = "${path.module}/../dist/admin-index.js"
+    content_type = "application/javascript+module"
+  }]
+
+  bindings = concat(local.common_bindings, [
+    { type = "analytics_engine", name = "ANALYTICS", dataset = "pantainos_memory_admin_${var.environment}" },
+    { type = "plain_text", name = "CF_ACCESS_AUD", text = cloudflare_zero_trust_access_application.admin.aud },
+  ])
+
+  compatibility_date  = "2024-12-01"
+  compatibility_flags = ["nodejs_compat"]
+
+  depends_on = [
+    terraform_data.queue,
+    terraform_data.vectorize_vectors,
+    terraform_data.vectorize_invalidates,
+    terraform_data.vectorize_confirms,
+  ]
+}
+
+resource "cloudflare_workers_deployment" "admin" {
+  account_id  = var.account_id
+  script_name = cloudflare_worker.admin.name
+  strategy    = "percentage"
+
+  versions = [{
+    version_id = cloudflare_worker_version.admin.id
+    percentage = 100
+  }]
+}
+
+# =============================================================================
+# CF Access - Admin Worker (full domain enforcement, OAuth only)
+# =============================================================================
+#
+# Admin MCP server for maintenance/diagnostics. No service token access.
+# Two CF Access apps:
+# - /authorize → Google login (like MCP worker)
+# - /mcp → Bypass for OAuth Bearer tokens (no service token fallback)
+
+resource "cloudflare_zero_trust_access_application" "admin" {
+  account_id = var.account_id
+  name       = "Pantainos Memory Admin${local.is_prod ? "" : " (${title(var.environment)})"}"
+  type       = "self_hosted"
+
+  # PATH-BASED: Only protect /authorize endpoint
+  domain = "${local.admin_url}/authorize"
+
+  allowed_idps              = [local.google_id]
+  auto_redirect_to_identity = true
+  session_duration          = "24h"
+  app_launcher_visible      = false
+
+  enable_binding_cookie      = true
+  http_only_cookie_attribute = true
+  same_site_cookie_attribute = "lax"
+
+  policies = [{
+    name       = "Allow authorized users"
+    decision   = "allow"
+    precedence = 1
+    include = [{
+      group = {
+        id = cloudflare_zero_trust_access_group.memory_users.id
+      }
+    }]
+  }]
+}
+
+# CF Access app for admin /mcp endpoint - bypass for OAuth Bearer tokens
+resource "cloudflare_zero_trust_access_application" "admin_endpoint" {
+  account_id = var.account_id
+  name       = "Pantainos Memory Admin Endpoint${local.is_prod ? "" : " (${title(var.environment)})"}"
+  type       = "self_hosted"
+
+  domain = "${local.admin_url}/mcp"
+
+  allowed_idps              = [local.google_id]
+  auto_redirect_to_identity = false
+  session_duration          = "24h"
+  app_launcher_visible      = false
+
+  enable_binding_cookie      = true
+  http_only_cookie_attribute = true
+  same_site_cookie_attribute = "lax"
+
+  # Bypass only - admin uses OAuth Bearer tokens, no service token
+  policies = [{
+    name       = "Bypass for OAuth"
+    decision   = "bypass"
+    precedence = 1
+    include = [{
+      everyone = {}
+    }]
   }]
 }
 

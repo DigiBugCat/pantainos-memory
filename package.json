@@ -9,7 +9,7 @@
     "dev:down": "./scripts/dev-down.sh",
     "deploy": "wrangler deploy",
     "deploy:dev": "wrangler deploy --env dev",
-    "build": "wrangler deploy --dry-run --outdir=dist && wrangler deploy --config wrangler-mcp.toml --dry-run --outdir=dist",
+    "build": "wrangler deploy --dry-run --outdir=dist && wrangler deploy --config wrangler-mcp.toml --dry-run --outdir=dist && wrangler deploy --config wrangler-admin.toml --dry-run --outdir=dist",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

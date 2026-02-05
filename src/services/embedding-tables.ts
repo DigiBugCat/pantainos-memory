@@ -460,6 +460,30 @@ export async function deleteMemoryEmbeddings(
   }
 }
 
+/**
+ * Delete only condition vectors for a memory (invalidates_if + confirms_if).
+ * Unlike deleteMemoryEmbeddings, this preserves the content vector in MEMORY_VECTORS
+ * so the memory remains searchable. Called when a memory transitions to
+ * violated/resolved/confirmed state to prevent future exposure check matches.
+ */
+export async function deleteConditionVectors(
+  env: Env,
+  memoryId: string,
+  invalidatesCount: number = 10,
+  confirmsCount: number = 10
+): Promise<void> {
+  const invalidateIds = Array.from({ length: invalidatesCount }, (_, i) => `${memoryId}:inv:${i}`);
+  const confirmIds = Array.from({ length: confirmsCount }, (_, i) => `${memoryId}:conf:${i}`);
+
+  if (invalidateIds.length > 0) {
+    await env.INVALIDATES_VECTORS.deleteByIds(invalidateIds);
+  }
+
+  if (confirmIds.length > 0) {
+    await env.CONFIRMS_VECTORS.deleteByIds(confirmIds);
+  }
+}
+
 // ============================================
 // Update Operations (for reclassification)
 // ============================================

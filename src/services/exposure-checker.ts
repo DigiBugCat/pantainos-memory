@@ -27,6 +27,7 @@ import {
   searchInvalidatesConditions,
   searchConfirmsConditions,
   searchObservationsForViolation,
+  deleteConditionVectors,
 } from './embedding-tables.js';
 import { propagateResolution } from './cascade.js';
 import type { Env } from '../types/index.js';
@@ -353,6 +354,16 @@ export async function checkExposures(
     const memory = await getMemoryById(env.DB, candidate.memory_id);
     if (!memory) continue;
 
+    // Skip memories that are no longer active (already violated/resolved/confirmed)
+    if (memory.state !== 'active') {
+      getLog().debug('skipping_non_active_memory', {
+        memory_id: candidate.memory_id,
+        state: memory.state,
+        condition: candidate.condition_text,
+      });
+      continue;
+    }
+
     // LLM-judge this specific condition
     const match = await checkConditionMatch(
       env,
@@ -382,7 +393,7 @@ export async function checkExposures(
         condition_type: 'invalidates_if',
       });
 
-      await recordViolation(env.DB, candidate.memory_id, {
+      await recordViolation(env, candidate.memory_id, {
         condition: candidate.condition_text,
         timestamp: Date.now(),
         obs_id: observationId,
@@ -437,6 +448,15 @@ export async function checkExposures(
     // Only process predictions (have resolves_by set)
     if (!memory || memory.resolves_by == null) continue;
 
+    // Skip predictions that are no longer active (already resolved/confirmed)
+    if (memory.state !== 'active') {
+      getLog().debug('skipping_non_active_prediction', {
+        memory_id: candidate.memory_id,
+        state: memory.state,
+      });
+      continue;
+    }
+
     // LLM-judge this specific condition
     const match = await checkConditionMatch(
       env,
@@ -454,7 +474,7 @@ export async function checkExposures(
         confidence: match.confidence,
       });
 
-      await autoConfirmThought(env.DB, candidate.memory_id, observationId);
+      await autoConfirmThought(env, candidate.memory_id, observationId);
 
       // Propagate resolution to related memories (mark for review, don't auto-modify)
       try {
@@ -570,7 +590,7 @@ export async function checkExposuresForNewThought(
           condition_type: 'invalidates_if',
         });
 
-        await recordViolation(env.DB, memoryId, {
+        await recordViolation(env, memoryId, {
           condition,
           timestamp: Date.now(),
           obs_id: obsCandidate.id,
@@ -632,7 +652,7 @@ export async function checkExposuresForNewThought(
             confidence: match.confidence,
           });
 
-          await autoConfirmThought(env.DB, memoryId, obsCandidate.id);
+          await autoConfirmThought(env, memoryId, obsCandidate.id);
           processedObs.add(obsCandidate.id);
           break;
         }
@@ -781,12 +801,12 @@ async function checkConditionMatch(
  * If damage_level is 'core', auto-resolves the memory as incorrect.
  */
 async function recordViolation(
-  db: D1Database,
+  env: Env,
   memoryId: string,
   violation: Violation
 ): Promise<void> {
   // Get current violations
-  const row = await db
+  const row = await env.DB
     .prepare('SELECT violations, times_tested FROM memories WHERE id = ?')
     .bind(memoryId)
     .first<{ violations: string; times_tested: number }>();
@@ -796,13 +816,23 @@ async function recordViolation(
   }
 
   const violations: Violation[] = JSON.parse(row.violations || '[]');
+
+  // Dedup: skip if this observation already violated this memory
+  if (violation.obs_id && violations.some(v => v.obs_id === violation.obs_id)) {
+    getLog().debug('duplicate_violation_skipped', {
+      memory_id: memoryId,
+      obs_id: violation.obs_id,
+    });
+    return;
+  }
+
   violations.push(violation);
 
   const now = Date.now();
 
   // If core damage, auto-resolve as incorrect
   if (violation.damage_level === 'core') {
-    await db
+    await env.DB
       .prepare(
         `
       UPDATE memories
@@ -820,7 +850,7 @@ async function recordViolation(
       .run();
   } else {
     // Non-core violations don't auto-resolve
-    await db
+    await env.DB
       .prepare(
         `
       UPDATE memories
@@ -835,6 +865,14 @@ async function recordViolation(
       .bind(JSON.stringify(violations), now, memoryId)
       .run();
   }
+
+  // Clean up condition vectors so this memory can't be re-matched
+  await deleteConditionVectors(env, memoryId).catch(err => {
+    getLog().warn('condition_vector_cleanup_failed', {
+      memory_id: memoryId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
 }
 
 /**
@@ -862,13 +900,13 @@ async function recordConfirmation(
  * Creates edge, updates stats, and resolves the thought as correct.
  */
 async function autoConfirmThought(
-  db: D1Database,
+  env: Env,
   thoughtId: string,
   observationId: string
 ): Promise<void> {
   const now = Date.now();
 
-  await db
+  await env.DB
     .prepare(
       `
     UPDATE memories
@@ -884,7 +922,15 @@ async function autoConfirmThought(
     .bind(now, now, thoughtId)
     .run();
 
-  await createEdge(db, observationId, thoughtId, 'confirmed_by');
+  await createEdge(env.DB, observationId, thoughtId, 'confirmed_by');
+
+  // Clean up condition vectors — resolved thought shouldn't match future exposure checks
+  await deleteConditionVectors(env, thoughtId).catch(err => {
+    getLog().warn('condition_vector_cleanup_failed', {
+      memory_id: thoughtId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
 }
 
 /**
@@ -944,13 +990,13 @@ export async function manualConfirm(
  * If damage_level is 'core', auto-resolves as incorrect.
  */
 export async function manualViolate(
-  db: D1Database,
+  env: Env,
   memoryId: string,
   condition: string,
   observationId?: string
 ): Promise<Violation> {
   // Get memory to determine damage level
-  const row = await db
+  const row = await env.DB
     .prepare('SELECT centrality, violations FROM memories WHERE id = ?')
     .bind(memoryId)
     .first<{ centrality: number; violations: string }>();
@@ -975,7 +1021,7 @@ export async function manualViolate(
 
   // If core damage, auto-resolve as incorrect
   if (damageLevel === 'core') {
-    await db
+    await env.DB
       .prepare(
         `
       UPDATE memories
@@ -993,7 +1039,7 @@ export async function manualViolate(
       .run();
   } else {
     // Non-core violations don't auto-resolve
-    await db
+    await env.DB
       .prepare(
         `
       UPDATE memories
@@ -1009,9 +1055,17 @@ export async function manualViolate(
       .run();
   }
 
+  // Clean up condition vectors so this memory can't be re-matched
+  await deleteConditionVectors(env, memoryId).catch(err => {
+    getLog().warn('condition_vector_cleanup_failed', {
+      memory_id: memoryId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+
   // Create edge if observation provided
   if (observationId) {
-    await createEdge(db, observationId, memoryId, 'violated_by');
+    await createEdge(env.DB, observationId, memoryId, 'violated_by');
   }
 
   return violation;
