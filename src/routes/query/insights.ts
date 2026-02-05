@@ -42,6 +42,8 @@ export interface InsightsResponse {
   view: InsightView;
   entities: InsightEntity[];
   total: number;
+  offset: number;
+  limit: number;
 }
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -49,6 +51,7 @@ const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 app.get('/:view', async (c) => {
   const view = c.req.param('view') as InsightView;
   const limit = parseInt(c.req.query('limit') || '20', 10);
+  const offset = parseInt(c.req.query('offset') || '0', 10);
 
   const validViews: InsightView[] = ['hubs', 'orphans', 'recent', 'pending_exposure', 'untested'];
   if (!validViews.includes(view)) {
@@ -63,19 +66,19 @@ app.get('/:view', async (c) => {
 
   switch (view) {
     case 'hubs':
-      ({ entities, total } = await getHubs(c.env.DB, limit));
+      ({ entities, total } = await getHubs(c.env.DB, limit, offset));
       break;
     case 'orphans':
-      ({ entities, total } = await getOrphans(c.env.DB, limit));
+      ({ entities, total } = await getOrphans(c.env.DB, limit, offset));
       break;
     case 'recent':
-      ({ entities, total } = await getRecent(c.env.DB, limit));
+      ({ entities, total } = await getRecent(c.env.DB, limit, offset));
       break;
     case 'pending_exposure':
-      ({ entities, total } = await getPendingExposure(c.env.DB, limit));
+      ({ entities, total } = await getPendingExposure(c.env.DB, limit, offset));
       break;
     case 'untested':
-      ({ entities, total } = await getUntested(c.env.DB, limit));
+      ({ entities, total } = await getUntested(c.env.DB, limit, offset));
       break;
   }
 
@@ -83,6 +86,8 @@ app.get('/:view', async (c) => {
     view,
     entities,
     total,
+    offset,
+    limit,
   };
 
   return c.json(response);
@@ -94,7 +99,8 @@ app.get('/:view', async (c) => {
  */
 async function getHubs(
   db: D1Database,
-  limit: number
+  limit: number,
+  offset: number
 ): Promise<{ entities: InsightEntity[]; total: number }> {
   // Count edges where entity is source OR target
   const result = await db.prepare(`
@@ -108,13 +114,13 @@ async function getHubs(
       FROM all_ids
       GROUP BY id
       ORDER BY connection_count DESC
-      LIMIT ?
+      LIMIT ? OFFSET ?
     )
     SELECT c.id, c.connection_count, m.content, m.source, m.derived_from, m.resolves_by, m.created_at
     FROM counts c
     JOIN memories m ON m.id = c.id
     WHERE m.retracted = 0
-  `).bind(limit).all<{ id: string; connection_count: number; content: string; source: string | null; derived_from: string | null; resolves_by: number | null; created_at: number }>();
+  `).bind(limit, offset).all<{ id: string; connection_count: number; content: string; source: string | null; derived_from: string | null; resolves_by: number | null; created_at: number }>();
 
   const entities: InsightEntity[] = (result.results || []).map(row => ({
     id: row.id,
@@ -124,7 +130,16 @@ async function getHubs(
     createdAt: new Date(row.created_at).toISOString(),
   }));
 
-  return { entities, total: entities.length };
+  // Get total count of memories with edges
+  const countResult = await db.prepare(`
+    SELECT COUNT(DISTINCT id) as count FROM (
+      SELECT source_id as id FROM edges
+      UNION ALL
+      SELECT target_id as id FROM edges
+    )
+  `).first<{ count: number }>();
+
+  return { entities, total: countResult?.count || entities.length };
 }
 
 /**
@@ -133,7 +148,8 @@ async function getHubs(
  */
 async function getOrphans(
   db: D1Database,
-  limit: number
+  limit: number,
+  offset: number
 ): Promise<{ entities: InsightEntity[]; total: number }> {
   const result = await db.prepare(`
     SELECT m.id, m.content, m.created_at, m.source, m.derived_from, m.resolves_by
@@ -143,8 +159,8 @@ async function getOrphans(
       AND m.retracted = 0
       AND e.source_id IS NULL
     ORDER BY m.created_at DESC
-    LIMIT ?
-  `).bind(limit).all<{ id: string; content: string; created_at: number; source: string | null; derived_from: string | null; resolves_by: number | null }>();
+    LIMIT ? OFFSET ?
+  `).bind(limit, offset).all<{ id: string; content: string; created_at: number; source: string | null; derived_from: string | null; resolves_by: number | null }>();
 
   const entities: InsightEntity[] = (result.results || []).map(row => ({
     id: row.id,
@@ -172,15 +188,16 @@ async function getOrphans(
  */
 async function getRecent(
   db: D1Database,
-  limit: number
+  limit: number,
+  offset: number
 ): Promise<{ entities: InsightEntity[]; total: number }> {
   const result = await db.prepare(`
     SELECT id, content, created_at, source, derived_from, resolves_by
     FROM memories
     WHERE retracted = 0
     ORDER BY created_at DESC
-    LIMIT ?
-  `).bind(limit).all<{ id: string; content: string; created_at: number; source: string | null; derived_from: string | null; resolves_by: number | null }>();
+    LIMIT ? OFFSET ?
+  `).bind(limit, offset).all<{ id: string; content: string; created_at: number; source: string | null; derived_from: string | null; resolves_by: number | null }>();
 
   const entities: InsightEntity[] = (result.results || []).map(row => ({
     id: row.id,
@@ -189,7 +206,12 @@ async function getRecent(
     createdAt: new Date(row.created_at).toISOString(),
   }));
 
-  return { entities, total: entities.length };
+  // Get total count
+  const countResult = await db.prepare(`
+    SELECT COUNT(*) as count FROM memories WHERE retracted = 0
+  `).first<{ count: number }>();
+
+  return { entities, total: countResult?.count || entities.length };
 }
 
 /**
@@ -198,7 +220,8 @@ async function getRecent(
  */
 async function getPendingExposure(
   db: D1Database,
-  limit: number
+  limit: number,
+  offset: number
 ): Promise<{ entities: InsightEntity[]; total: number }> {
   const result = await db.prepare(`
     SELECT id, content, created_at, source, derived_from, resolves_by, exposure_check_status
@@ -206,8 +229,8 @@ async function getPendingExposure(
     WHERE retracted = 0
       AND exposure_check_status IN ('pending', 'processing')
     ORDER BY created_at ASC
-    LIMIT ?
-  `).bind(limit).all<{ id: string; content: string; created_at: number; source: string | null; derived_from: string | null; resolves_by: number | null; exposure_check_status: string }>();
+    LIMIT ? OFFSET ?
+  `).bind(limit, offset).all<{ id: string; content: string; created_at: number; source: string | null; derived_from: string | null; resolves_by: number | null; exposure_check_status: string }>();
 
   const entities: InsightEntity[] = (result.results || []).map(row => ({
     id: row.id,
@@ -235,7 +258,8 @@ async function getPendingExposure(
  */
 async function getUntested(
   db: D1Database,
-  limit: number
+  limit: number,
+  offset: number
 ): Promise<{ entities: InsightEntity[]; total: number }> {
   const result = await db.prepare(`
     SELECT id, content, created_at, source, derived_from, resolves_by, times_tested
@@ -245,8 +269,8 @@ async function getUntested(
       AND exposure_check_status = 'completed'
       AND times_tested < 3
     ORDER BY created_at DESC
-    LIMIT ?
-  `).bind(limit).all<{ id: string; content: string; created_at: number; source: string | null; derived_from: string | null; resolves_by: number | null; times_tested: number }>();
+    LIMIT ? OFFSET ?
+  `).bind(limit, offset).all<{ id: string; content: string; created_at: number; source: string | null; derived_from: string | null; resolves_by: number | null; times_tested: number }>();
 
   const entities: InsightEntity[] = (result.results || []).map(row => ({
     id: row.id,

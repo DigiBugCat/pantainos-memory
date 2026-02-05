@@ -152,7 +152,7 @@ function formatRecall(memory: MemoryRow, connections: Array<{ target_id: string;
 }
 
 /** Format insights results */
-function formatInsights(view: string, memories: MemoryRow[]): string {
+function formatInsights(view: string, memories: MemoryRow[], total: number, limit: number, offset: number): string {
   if (memories.length === 0) return `No memories in "${view}" view`;
 
   const lines = memories.map(row => {
@@ -160,11 +160,13 @@ function formatInsights(view: string, memories: MemoryRow[]): string {
     return formatMemory(m);
   });
 
-  return `=== ${view.toUpperCase()} ===\n\n${lines.join('\n')}`;
+  const from = offset + 1;
+  const to = offset + memories.length;
+  return `=== ${view.toUpperCase()} === (showing ${from}-${to} of ${total})\n\n${lines.join('\n')}`;
 }
 
 /** Format pending predictions */
-function formatPending(memories: Array<{ id: string; content: string; resolves_by?: number }>): string {
+function formatPending(memories: Array<{ id: string; content: string; resolves_by?: number }>, total: number, limit: number, offset: number): string {
   if (memories.length === 0) return 'No pending time-bound predictions';
 
   const lines = memories.map(m => {
@@ -172,7 +174,9 @@ function formatPending(memories: Array<{ id: string; content: string; resolves_b
     return `[${m.id}] ${m.content}\n   Resolves by: ${deadline}`;
   });
 
-  return `=== PENDING RESOLUTION ===\n\n${lines.join('\n\n')}`;
+  const from = offset + 1;
+  const to = offset + memories.length;
+  return `=== PENDING RESOLUTION === (showing ${from}-${to} of ${total})\n\n${lines.join('\n\n')}`;
 }
 
 /** Text result wrapper */
@@ -890,34 +894,40 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       properties: {
         overdue: { type: 'boolean', description: 'Only show overdue predictions (default: false shows all pending)' },
         limit: { type: 'integer', description: 'Max results (default: 20)' },
+        offset: { type: 'integer', description: 'Skip first N results for pagination (default: 0)' },
       },
     },
     handler: async (args, ctx) => {
-      const { overdue, limit } = args as { overdue?: boolean; limit?: number };
+      const { overdue, limit, offset } = args as { overdue?: boolean; limit?: number; offset?: number };
       const now = Date.now();
       const resultLimit = limit || 20;
+      const resultOffset = offset || 0;
 
       // Predictions are memories with resolves_by set (uses field presence)
-      let query = `
-        SELECT * FROM memories
+      let whereClause = `
         WHERE state = 'active'
         AND retracted = 0
         AND resolves_by IS NOT NULL
       `;
 
       if (overdue) {
-        query += ` AND resolves_by < ${now}`;
+        whereClause += ` AND resolves_by < ${now}`;
       }
 
-      query += ` ORDER BY created_at DESC LIMIT ${resultLimit}`;
+      const countResult = await ctx.env.DB.prepare(
+        `SELECT COUNT(*) as count FROM memories ${whereClause}`
+      ).first<{ count: number }>();
+      const total = countResult?.count || 0;
 
-      const results = await ctx.env.DB.prepare(query).all<MemoryRow>();
+      const results = await ctx.env.DB.prepare(
+        `SELECT * FROM memories ${whereClause} ORDER BY created_at DESC LIMIT ${resultLimit} OFFSET ${resultOffset}`
+      ).all<MemoryRow>();
 
       return textResult(formatPending((results.results || []).map(row => ({
         id: row.id,
         content: row.content,
         resolves_by: row.resolves_by ?? undefined,
-      }))));
+      })), total, resultLimit, resultOffset));
     },
   }),
 
@@ -933,13 +943,16 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
           description: 'Type of insight view (default: recent)'
         },
         limit: { type: 'integer', description: 'Max results (default: 20)' },
+        offset: { type: 'integer', description: 'Skip first N results for pagination (default: 0)' },
       },
     },
     handler: async (args, ctx) => {
-      const { view, limit } = args as { view?: string; limit?: number };
+      const { view, limit, offset } = args as { view?: string; limit?: number; offset?: number };
       const resultLimit = limit || 20;
+      const resultOffset = offset || 0;
 
       let query = '';
+      let countQuery = '';
       switch (view) {
         case 'hubs':
           query = `
@@ -949,8 +962,9 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
             WHERE m.retracted = 0
             GROUP BY m.id
             ORDER BY connection_count DESC
-            LIMIT ${resultLimit}
+            LIMIT ${resultLimit} OFFSET ${resultOffset}
           `;
+          countQuery = `SELECT COUNT(*) as count FROM memories WHERE retracted = 0`;
           break;
         case 'orphans':
           query = `
@@ -959,7 +973,13 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
             LEFT JOIN edges e ON m.id = e.source_id OR m.id = e.target_id
             WHERE m.retracted = 0 AND e.source_id IS NULL
             ORDER BY m.created_at DESC
-            LIMIT ${resultLimit}
+            LIMIT ${resultLimit} OFFSET ${resultOffset}
+          `;
+          countQuery = `
+            SELECT COUNT(*) as count
+            FROM memories m
+            LEFT JOIN edges e ON m.id = e.source_id OR m.id = e.target_id
+            WHERE m.retracted = 0 AND e.source_id IS NULL
           `;
           break;
         case 'untested':
@@ -967,16 +987,18 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
             SELECT * FROM memories
             WHERE retracted = 0 AND times_tested < 3
             ORDER BY created_at DESC
-            LIMIT ${resultLimit}
+            LIMIT ${resultLimit} OFFSET ${resultOffset}
           `;
+          countQuery = `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND times_tested < 3`;
           break;
         case 'failing':
           query = `
             SELECT * FROM memories
             WHERE retracted = 0 AND json_array_length(violations) > 0
             ORDER BY created_at DESC
-            LIMIT ${resultLimit}
+            LIMIT ${resultLimit} OFFSET ${resultOffset}
           `;
+          countQuery = `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND json_array_length(violations) > 0`;
           break;
         case 'recent':
         default:
@@ -984,13 +1006,18 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
             SELECT * FROM memories
             WHERE retracted = 0
             ORDER BY created_at DESC
-            LIMIT ${resultLimit}
+            LIMIT ${resultLimit} OFFSET ${resultOffset}
           `;
+          countQuery = `SELECT COUNT(*) as count FROM memories WHERE retracted = 0`;
       }
 
-      const results = await ctx.env.DB.prepare(query).all<MemoryRow>();
+      const [results, countResult] = await Promise.all([
+        ctx.env.DB.prepare(query).all<MemoryRow>(),
+        ctx.env.DB.prepare(countQuery).first<{ count: number }>(),
+      ]);
+      const total = countResult?.count || 0;
 
-      return textResult(formatInsights(view || 'recent', results.results || []));
+      return textResult(formatInsights(view || 'recent', results.results || [], total, resultLimit, resultOffset));
     },
   }),
 
