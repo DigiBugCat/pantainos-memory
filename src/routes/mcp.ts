@@ -51,6 +51,49 @@ type Variables = {
 /** Valid observation sources */
 const VALID_SOURCES = ['market', 'news', 'earnings', 'email', 'human', 'tool'] as const;
 
+/**
+ * Parse a resolves_by value into Unix seconds.
+ * Accepts:
+ *   - Date string: "2026-03-15", "2026-03-15T00:00:00Z", "March 15, 2026"
+ *   - Unix seconds: 1770000000 (< 1e12)
+ *   - Unix milliseconds: 1770000000000 (>= 1e12, auto-converted)
+ * Returns Unix seconds, or null if unparseable.
+ */
+function parseResolvesBy(value: unknown): number | null {
+  if (value === undefined || value === null) return null;
+
+  if (typeof value === 'number') {
+    // Already a number — normalize to seconds
+    return value >= 1e12 ? Math.floor(value / 1000) : value;
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+
+    // Try as a pure number string
+    const asNum = Number(trimmed);
+    if (!isNaN(asNum) && trimmed.length > 0) {
+      return asNum >= 1e12 ? Math.floor(asNum / 1000) : asNum;
+    }
+
+    // Try as a date string
+    const parsed = new Date(trimmed);
+    if (!isNaN(parsed.getTime())) {
+      return Math.floor(parsed.getTime() / 1000);
+    }
+
+    return null;
+  }
+
+  return null;
+}
+
+/** Convert stored resolves_by (Unix seconds) to display date string */
+function formatResolvesBy(seconds: number): string {
+  const ms = seconds < 1e12 ? seconds * 1000 : seconds;
+  return new Date(ms).toISOString().split('T')[0];
+}
+
 // ============================================
 // Text Formatting Helpers (human-readable output)
 // ============================================
@@ -125,7 +168,7 @@ function formatPending(memories: Array<{ id: string; content: string; resolves_b
   if (memories.length === 0) return 'No pending time-bound predictions';
 
   const lines = memories.map(m => {
-    const deadline = m.resolves_by ? new Date(m.resolves_by).toISOString().split('T')[0] : 'no deadline';
+    const deadline = m.resolves_by ? formatResolvesBy(m.resolves_by) : 'no deadline';
     return `[${m.id}] ${m.content}\n   Resolves by: ${deadline}`;
   });
 
@@ -156,7 +199,7 @@ THOUGHT (derived belief): Set "derived_from" with source memory IDs
 Exactly one of "source" OR "derived_from" required (mutually exclusive).
 
 Both modes support invalidates_if/confirms_if conditions.
-For predictions: add resolves_by (timestamp) + outcome_condition.`,
+For predictions: add resolves_by (date string or timestamp) + outcome_condition.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -166,7 +209,7 @@ For predictions: add resolves_by (timestamp) + outcome_condition.`,
         invalidates_if: { type: 'array', items: { type: 'string' }, description: 'Conditions that would prove this wrong' },
         confirms_if: { type: 'array', items: { type: 'string' }, description: 'Conditions that would strengthen this' },
         assumes: { type: 'array', items: { type: 'string' }, description: 'Underlying assumptions (thoughts only)' },
-        resolves_by: { type: 'integer', description: 'Unix timestamp deadline' },
+        resolves_by: { type: 'string', description: 'Deadline as date string (e.g. "2026-03-15") or Unix timestamp' },
         outcome_condition: { type: 'string', description: 'Success/failure criteria (required if resolves_by set)' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for categorization' },
       },
@@ -180,7 +223,7 @@ For predictions: add resolves_by (timestamp) + outcome_condition.`,
         invalidates_if,
         confirms_if,
         assumes,
-        resolves_by,
+        resolves_by: rawResolvesBy,
         outcome_condition,
         tags,
       } = args as {
@@ -190,10 +233,16 @@ For predictions: add resolves_by (timestamp) + outcome_condition.`,
         invalidates_if?: string[];
         confirms_if?: string[];
         assumes?: string[];
-        resolves_by?: number;
+        resolves_by?: number | string;
         outcome_condition?: string;
         tags?: string[];
       };
+
+      // Parse resolves_by: accepts date strings ("2026-03-15") or Unix timestamps
+      const resolves_by = parseResolvesBy(rawResolvesBy);
+      if (rawResolvesBy !== undefined && resolves_by === null) {
+        return errorResult(`Could not parse resolves_by: "${rawResolvesBy}". Use a date string (e.g. "2026-03-15") or Unix timestamp.`);
+      }
 
       // Validate origin: exactly one of source XOR derived_from required
       const hasSource = source !== undefined && source !== null;
@@ -232,7 +281,7 @@ For predictions: add resolves_by (timestamp) + outcome_condition.`,
       }
 
       // Time-bound validation
-      const timeBound = resolves_by !== undefined;
+      const timeBound = resolves_by !== null && resolves_by !== undefined;
       if (timeBound && !outcome_condition) {
         return errorResult('outcome_condition is required when resolves_by is set');
       }
@@ -378,7 +427,7 @@ For predictions: add resolves_by (timestamp) + outcome_condition.`,
           invalidates_if,
           confirms_if,
           assumes,
-          resolves_by,
+          resolves_by: resolves_by ?? undefined,
           requestId,
           embedding,
         });
@@ -435,7 +484,7 @@ For predictions: add resolves_by (timestamp) + outcome_condition.`,
         invalidates_if: { type: 'array', items: { type: 'string' }, description: 'Conditions to ADD (not replace)' },
         confirms_if: { type: 'array', items: { type: 'string' }, description: 'Conditions to ADD (not replace)' },
         assumes: { type: 'array', items: { type: 'string' }, description: 'Assumptions to ADD (thoughts only)' },
-        resolves_by: { type: 'integer', description: 'Unix timestamp deadline (cannot change if already set)' },
+        resolves_by: { type: 'string', description: 'Deadline as date string (e.g. "2026-03-15") or Unix timestamp (cannot change if already set)' },
         outcome_condition: { type: 'string', description: 'Success/failure criteria (cannot change if already set)' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Tags to ADD (not replace)' },
       },
@@ -447,7 +496,7 @@ For predictions: add resolves_by (timestamp) + outcome_condition.`,
         invalidates_if,
         confirms_if,
         assumes,
-        resolves_by,
+        resolves_by: rawResolvesBy2,
         outcome_condition,
         tags,
       } = args as {
@@ -455,10 +504,16 @@ For predictions: add resolves_by (timestamp) + outcome_condition.`,
         invalidates_if?: string[];
         confirms_if?: string[];
         assumes?: string[];
-        resolves_by?: number;
+        resolves_by?: number | string;
         outcome_condition?: string;
         tags?: string[];
       };
+
+      // Parse resolves_by if provided
+      const resolves_by = rawResolvesBy2 !== undefined ? parseResolvesBy(rawResolvesBy2) : undefined;
+      if (rawResolvesBy2 !== undefined && resolves_by === null) {
+        return errorResult(`Could not parse resolves_by: "${rawResolvesBy2}". Use a date string (e.g. "2026-03-15") or Unix timestamp.`);
+      }
 
       // Fetch the memory
       const row = await ctx.env.DB.prepare(
