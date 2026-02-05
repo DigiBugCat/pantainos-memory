@@ -492,7 +492,8 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
     },
     handler: async (args, ctx) => {
       const {
-        memory_id,
+        memory_id: rawMemoryId,
+        id: rawId,
         invalidates_if,
         confirms_if,
         assumes,
@@ -500,7 +501,8 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         outcome_condition,
         tags,
       } = args as {
-        memory_id: string;
+        memory_id?: string;
+        id?: string;
         invalidates_if?: string[];
         confirms_if?: string[];
         assumes?: string[];
@@ -508,6 +510,11 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         outcome_condition?: string;
         tags?: string[];
       };
+
+      const memory_id = rawMemoryId || rawId;
+      if (!memory_id) {
+        return errorResult('memory_id is required');
+      }
 
       // Parse resolves_by if provided
       const resolves_by = rawResolvesBy2 !== undefined ? parseResolvesBy(rawResolvesBy2) : undefined;
@@ -815,20 +822,25 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       required: ['memory_id'],
     },
     handler: async (args, ctx) => {
-      const { memory_id } = args as { memory_id: string };
+      const { memory_id, id } = args as { memory_id?: string; id?: string };
+      const resolvedId = memory_id || id;
+
+      if (!resolvedId) {
+        return errorResult('memory_id is required');
+      }
 
       const row = await ctx.env.DB.prepare(
         `SELECT * FROM memories WHERE id = ?`
-      ).bind(memory_id).first<MemoryRow>();
+      ).bind(resolvedId).first<MemoryRow>();
 
       if (!row) {
-        return errorResult(`Memory not found: ${memory_id}`);
+        return errorResult(`Memory not found: ${resolvedId}`);
       }
 
       // Get connected memories
       const edges = await ctx.env.DB.prepare(
         `SELECT target_id, strength FROM edges WHERE source_id = ?`
-      ).bind(memory_id).all<{ target_id: string; strength: number }>();
+      ).bind(resolvedId).all<{ target_id: string; strength: number }>();
 
       return textResult(formatRecall(row, edges.results || []));
     },
@@ -999,11 +1011,16 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       required: ['memory_id'],
     },
     handler: async (args, ctx) => {
-      const { memory_id, direction = 'both', depth: maxDepth = 2 } = args as {
-        memory_id: string;
+      const { memory_id: rawMemId, id: rawId2, direction = 'both', depth: maxDepth = 2 } = args as {
+        memory_id?: string;
+        id?: string;
         direction?: 'up' | 'down' | 'both';
         depth?: number;
       };
+      const memory_id = rawMemId || rawId2;
+      if (!memory_id) {
+        return errorResult('memory_id is required');
+      }
 
       interface GraphNode {
         id: string;
@@ -1147,7 +1164,11 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       required: ['memory_id'],
     },
     handler: async (args, ctx) => {
-      const { memory_id } = args as { memory_id: string };
+      const { memory_id: rawMemId3, id: rawId3 } = args as { memory_id?: string; id?: string };
+      const memory_id = rawMemId3 || rawId3;
+      if (!memory_id) {
+        return errorResult('memory_id is required');
+      }
 
       // Get the memory
       const row = await ctx.env.DB.prepare(
