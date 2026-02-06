@@ -522,7 +522,9 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         time_bound: timeBound,
       };
 
-      await ctx.env.DETECTION_QUEUE.send(exposureJob);
+      if (ctx.env.DETECTION_QUEUE) {
+        await ctx.env.DETECTION_QUEUE.send(exposureJob);
+      }
 
       // Format response based on mode
       if (hasSource) {
@@ -819,7 +821,9 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
           confirms_if: newConfirmsIf.length > 0 ? newConfirmsIf : undefined,
           time_bound: timeBound,
         };
-        await ctx.env.DETECTION_QUEUE.send(exposureJob);
+        if (ctx.env.DETECTION_QUEUE) {
+          await ctx.env.DETECTION_QUEUE.send(exposureJob);
+        }
       }
 
       // Record version for audit trail
@@ -1030,7 +1034,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
     },
     handler: async (args, ctx) => {
       const { overdue, limit, offset } = args as { overdue?: boolean; limit?: number; offset?: number };
-      const now = Date.now();
+      const now = Math.floor(Date.now() / 1000);
       const resultLimit = limit || 20;
       const resultOffset = offset || 0;
 

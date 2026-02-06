@@ -320,6 +320,16 @@ export async function checkExposures(
     autoConfirmed: [],
   };
 
+  // Skip exposure checking for resolution observations to prevent feedback loops.
+  // When the resolver agent resolves a memory, it may create observations whose
+  // content matches invalidation conditions of other memories, causing circular violations.
+  if (await isResolutionObservation(env.DB, observationId)) {
+    getLog().info('skipping_resolution_observation', {
+      observation_id: observationId,
+    });
+    return result;
+  }
+
   // Track which memories we've already processed to avoid duplicates
   const processedMemories = new Set<string>();
 
@@ -359,6 +369,15 @@ export async function checkExposures(
       getLog().debug('skipping_non_active_memory', {
         memory_id: candidate.memory_id,
         state: memory.state,
+        condition: candidate.condition_text,
+      });
+      continue;
+    }
+
+    // Skip memories that have a pending resolution event (being processed by resolver)
+    if (await hasPendingResolutionEvent(env.DB, candidate.memory_id)) {
+      getLog().debug('skipping_pending_resolution', {
+        memory_id: candidate.memory_id,
         condition: candidate.condition_text,
       });
       continue;
@@ -453,6 +472,14 @@ export async function checkExposures(
       getLog().debug('skipping_non_active_prediction', {
         memory_id: candidate.memory_id,
         state: memory.state,
+      });
+      continue;
+    }
+
+    // Skip predictions that have a pending resolution event
+    if (await hasPendingResolutionEvent(env.DB, candidate.memory_id)) {
+      getLog().debug('skipping_pending_resolution_prediction', {
+        memory_id: candidate.memory_id,
       });
       continue;
     }
@@ -571,6 +598,12 @@ export async function checkExposuresForNewThought(
       const obs = await getMemoryById(env.DB, obsCandidate.id);
       if (!obs) continue;
 
+      // Skip resolution observations to prevent feedback loops
+      if (hasResolutionTag(obs.tags)) {
+        processedObs.add(obsCandidate.id);
+        continue;
+      }
+
       const match = await checkConditionMatch(
         env,
         config,
@@ -636,6 +669,12 @@ export async function checkExposuresForNewThought(
         const obs = await getMemoryById(env.DB, obsCandidate.id);
         if (!obs) continue;
 
+        // Skip resolution observations to prevent feedback loops
+        if (hasResolutionTag(obs.tags)) {
+          processedObs.add(obsCandidate.id);
+          continue;
+        }
+
         const match = await checkConditionMatch(
           env,
           config,
@@ -695,6 +734,64 @@ async function getMemoryById(
   return row;
 }
 
+// ============================================
+// Resolution Feedback Loop Prevention
+// ============================================
+
+/** Tags that indicate an observation is part of a resolution process */
+const RESOLUTION_TAGS = ['resolution', 'resolver', 'auto-resolution'];
+
+/**
+ * Check if a memory's tags JSON contains any resolution-related tags.
+ * Used to filter out resolution observations from exposure checking.
+ */
+function hasResolutionTag(tagsJson: string | null): boolean {
+  if (!tagsJson) return false;
+  try {
+    const tags: string[] = JSON.parse(tagsJson);
+    return tags.some(tag => RESOLUTION_TAGS.includes(tag.toLowerCase()));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Check if an observation is tagged as a resolution observation.
+ * Resolution observations are created by the resolver agent and should
+ * not trigger new violations (prevents feedback loops).
+ */
+async function isResolutionObservation(
+  db: D1Database,
+  observationId: string
+): Promise<boolean> {
+  const row = await db
+    .prepare('SELECT tags FROM memories WHERE id = ?')
+    .bind(observationId)
+    .first<{ tags: string | null }>();
+
+  return row ? hasResolutionTag(row.tags) : false;
+}
+
+/**
+ * Check if a memory has a pending resolution event in the event queue.
+ * Memories awaiting resolution should not be re-violated or re-confirmed.
+ * Checks both undispatched AND dispatched events (resolver may be actively working).
+ */
+async function hasPendingResolutionEvent(
+  db: D1Database,
+  memoryId: string
+): Promise<boolean> {
+  const row = await db
+    .prepare(`
+      SELECT COUNT(*) as count FROM memory_events
+      WHERE memory_id = ?
+        AND event_type = 'thought:pending_resolution'
+    `)
+    .bind(memoryId)
+    .first<{ count: number }>();
+
+  return (row?.count ?? 0) > 0;
+}
 
 /**
  * Use LLM to check if an observation matches a condition.

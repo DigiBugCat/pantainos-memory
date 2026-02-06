@@ -31,8 +31,8 @@ import { checkExposures, checkExposuresForNewThought } from './services/exposure
 import {
   queueSignificantEvent,
   findInactiveSessions,
-  getPendingEvents,
-  markEventsDispatched,
+  claimEventsForDispatch,
+  releaseClaimedEvents,
   findOverduePredictions,
 } from './services/event-queue.js';
 import {
@@ -584,11 +584,21 @@ async function dispatchSessionEvents(
   sessionId: string,
   log: ReturnType<typeof createStandaloneLogger>
 ): Promise<void> {
-  const events = await getPendingEvents(env, sessionId);
+  const claimId = `claim-${crypto.randomUUID().slice(0, 8)}`;
+
+  // Claim events atomically BEFORE dispatching. This marks them as dispatched=1
+  // so the next cron tick won't pick them up while we're still processing.
+  const events = await claimEventsForDispatch(env, sessionId, claimId);
 
   if (events.length === 0) {
     return;
   }
+
+  log.info('events_claimed', {
+    session_id: sessionId,
+    claim_id: claimId,
+    event_count: events.length,
+  });
 
   // Group events by type
   const violations: ViolationEvent[] = events
@@ -697,12 +707,20 @@ async function dispatchSessionEvents(
     });
   }
 
-  // Dispatch all in parallel
+  // Dispatch all in parallel. Events are already claimed (dispatched=1),
+  // so we only need to release on failure.
   const results = await Promise.allSettled(
     dispatches.map(async ({ payload, eventIds }) => {
-      await dispatchToResolver(env, payload);
-      await markEventsDispatched(env, eventIds, payload.batchId);
-      return payload.batchId;
+      try {
+        await dispatchToResolver(env, payload);
+        // Update workflow_id to the actual batch ID (claim used a placeholder)
+        // Events are already marked dispatched=1 from the claim step
+        return payload.batchId;
+      } catch (error) {
+        // Release failed events back to pending so next cron tick can retry
+        await releaseClaimedEvents(env, eventIds);
+        throw error;
+      }
     })
   );
 

@@ -126,6 +126,78 @@ export async function markEventsDispatched(
 }
 
 /**
+ * Atomically claim events for dispatch by marking them dispatched=1 before
+ * the actual dispatch call. This prevents the next cron tick from picking up
+ * the same events while dispatch is in-flight.
+ *
+ * Returns the full event rows that were claimed (only those still undispatched).
+ * On dispatch failure, call releaseClaimedEvents to roll back.
+ */
+export async function claimEventsForDispatch(
+  env: Env,
+  sessionId: string,
+  workflowId: string
+): Promise<{
+  id: string;
+  session_id: string;
+  event_type: string;
+  memory_id: string;
+  violated_by: string | null;
+  damage_level: string | null;
+  context: string;
+  created_at: number;
+}[]> {
+  // First get undispatched events for this session
+  const pending = await env.DB.prepare(`
+    SELECT id, session_id, event_type, memory_id, violated_by, damage_level, context, created_at
+    FROM memory_events
+    WHERE session_id = ? AND dispatched = 0
+    ORDER BY created_at
+  `).bind(sessionId).all<{
+    id: string;
+    session_id: string;
+    event_type: string;
+    memory_id: string;
+    violated_by: string | null;
+    damage_level: string | null;
+    context: string;
+    created_at: number;
+  }>();
+
+  const events = pending.results || [];
+  if (events.length === 0) return [];
+
+  // Mark them as dispatched immediately to prevent next cron tick from claiming them
+  const ids = events.map(e => e.id);
+  const placeholders = ids.map(() => '?').join(',');
+  await env.DB.prepare(`
+    UPDATE memory_events
+    SET dispatched = 1, dispatched_at = ?, workflow_id = ?
+    WHERE id IN (${placeholders}) AND dispatched = 0
+  `).bind(Date.now(), workflowId, ...ids).run();
+
+  return events;
+}
+
+/**
+ * Release previously claimed events back to pending state on dispatch failure.
+ * This allows the next cron tick to retry them.
+ */
+export async function releaseClaimedEvents(
+  env: Env,
+  eventIds: string[]
+): Promise<void> {
+  if (eventIds.length === 0) return;
+
+  const placeholders = eventIds.map(() => '?').join(',');
+  await env.DB.prepare(`
+    UPDATE memory_events
+    SET dispatched = 0, dispatched_at = NULL, workflow_id = NULL
+    WHERE id IN (${placeholders})
+  `).bind(...eventIds).run();
+}
+
+/**
  * Find overdue predictions that haven't been dispatched yet.
  * Used by the daily cron to queue pending_resolution events.
  */
@@ -137,7 +209,7 @@ export async function findOverduePredictions(env: Env): Promise<{
   invalidates_if: string | null;
   confirms_if: string | null;
 }[]> {
-  const now = Date.now();
+  const now = Math.floor(Date.now() / 1000);
 
   const result = await env.DB.prepare(`
     SELECT m.id, m.content, m.outcome_condition, m.resolves_by, m.invalidates_if, m.confirms_if

@@ -27,7 +27,7 @@ app.get('/', async (c) => {
   const overdueOnly = c.req.query('overdue') === 'true';
   const limit = parseInt(c.req.query('limit') || '50', 10);
 
-  const now = Date.now();
+  const now = Math.floor(Date.now() / 1000);
 
   // Get predictions from unified memories table
   // Predictions are memories with resolves_by IS NOT NULL
@@ -63,7 +63,7 @@ app.get('/', async (c) => {
     const memory = rowToMemory(row);
     const stats = getConfidenceStats(memory);
     const daysOverdue = memory.resolves_by
-      ? Math.max(0, Math.floor((now - memory.resolves_by) / (24 * 60 * 60 * 1000)))
+      ? Math.max(0, Math.floor((now - memory.resolves_by) / (24 * 60 * 60)))
       : 0;
 
     predictions.push({
