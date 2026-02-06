@@ -37,6 +37,8 @@ import { rowToMemory } from '../lib/transforms.js';
 import { createScoredMemory } from '../lib/scoring.js';
 import { incrementCentrality } from '../services/exposure-checker.js';
 import { checkMemoryCompleteness } from '../services/classification-challenge.js';
+import { deleteConditionVectors } from '../services/embedding-tables.js';
+import { propagateResolution } from '../services/cascade.js';
 
 type Env = BaseEnv & LoggingEnv;
 
@@ -1565,6 +1567,92 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       } else {
         text += `\nNo source track records computed (need 5+ tested memories per source)`;
       }
+
+      return textResult(text);
+    },
+  }),
+
+  defineTool({
+    name: 'resolve',
+    description: 'Resolve a thought or prediction as correct, incorrect, or voided. Sets state to "resolved" with the given outcome, cleans up condition vectors, triggers cascade propagation to related memories, and records an audit trail. Only works on thoughts/predictions (not observations). Use when a prediction deadline has passed, or when you have enough evidence to judge a thought.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        memory_id: { type: 'string', description: 'ID of the memory to resolve' },
+        outcome: {
+          type: 'string',
+          enum: ['correct', 'incorrect', 'voided'],
+          description: 'Resolution outcome: correct (confirmed true), incorrect (proven wrong), voided (no longer relevant/testable)',
+        },
+        reason: { type: 'string', description: 'Explanation for why this outcome was chosen (audit trail)' },
+      },
+      required: ['memory_id', 'outcome', 'reason'],
+    },
+    handler: async (args, ctx) => {
+      const { memory_id, outcome, reason } = args as {
+        memory_id: string;
+        outcome: 'correct' | 'incorrect' | 'voided';
+        reason: string;
+      };
+
+      if (!memory_id) return errorResult('memory_id is required');
+      if (!outcome) return errorResult('outcome is required');
+      if (!reason) return errorResult('reason is required');
+
+      // Fetch memory
+      const row = await ctx.env.DB.prepare(
+        'SELECT id, content, state, outcome, source, retracted FROM memories WHERE id = ?'
+      ).bind(memory_id).first<{ id: string; content: string; state: string; outcome: string | null; source: string | null; retracted: number }>();
+
+      if (!row) return errorResult(`Memory not found: ${memory_id}`);
+      if (row.retracted) return errorResult(`Memory is retracted: ${memory_id}`);
+      if (row.source !== null) return errorResult('Cannot resolve an observation. Observations are facts — use retract instead.');
+      if (row.state === 'resolved') return errorResult(`Memory is already resolved (outcome: ${row.outcome}). Use admin tools to override.`);
+
+      const oldState = row.state;
+      const now = Date.now();
+
+      // Update state
+      await ctx.env.DB.prepare(
+        `UPDATE memories SET state = 'resolved', outcome = ?, resolved_at = ?, updated_at = ? WHERE id = ?`
+      ).bind(outcome, now, now, memory_id).run();
+
+      // Clean up condition vectors so resolved memory doesn't match future exposure checks
+      await deleteConditionVectors(ctx.env, memory_id).catch(() => {});
+
+      // Record version for audit trail
+      await recordVersion(ctx.env.DB, {
+        entityId: memory_id,
+        entityType: 'thought',
+        changeType: 'resolved',
+        contentSnapshot: {
+          old_state: oldState,
+          new_state: 'resolved',
+          outcome,
+          reason,
+        },
+        changeReason: reason,
+        sessionId: ctx.sessionId,
+        requestId,
+      });
+
+      // Trigger cascade propagation
+      let cascadeText = '';
+      try {
+        const cascadeOutcome = outcome === 'correct' ? 'correct' : outcome === 'incorrect' ? 'incorrect' : 'void';
+        const cascadeResult = await propagateResolution(ctx.env, memory_id, cascadeOutcome, ctx.sessionId);
+        if (cascadeResult.effects.length > 0) {
+          cascadeText = `\nCascade: ${cascadeResult.effects.length} related memories flagged for review`;
+        }
+      } catch (err) {
+        cascadeText = `\nCascade failed: ${err instanceof Error ? err.message : String(err)}`;
+      }
+
+      let text = `Resolved [${memory_id}] as ${outcome}\n`;
+      text += `  ${row.content.slice(0, 120)}${row.content.length > 120 ? '...' : ''}\n`;
+      text += `  Previous state: ${oldState}\n`;
+      text += `  Reason: ${reason}`;
+      text += cascadeText;
 
       return textResult(text);
     },
