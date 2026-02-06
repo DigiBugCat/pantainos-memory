@@ -36,7 +36,7 @@ import { recordAccessBatch } from '../services/access-service.js';
 import { rowToMemory } from '../lib/transforms.js';
 import { createScoredMemory } from '../lib/scoring.js';
 import { incrementCentrality } from '../services/exposure-checker.js';
-import { checkMemoryCompleteness, formatCompletenessOutput } from '../services/classification-challenge.js';
+import { checkMemoryCompleteness } from '../services/classification-challenge.js';
 
 type Env = BaseEnv & LoggingEnv;
 
@@ -152,7 +152,7 @@ function formatRecall(memory: MemoryRow, connections: Array<{ target_id: string;
 }
 
 /** Format insights results */
-function formatInsights(view: string, memories: MemoryRow[], total: number, limit: number, offset: number): string {
+function formatInsights(view: string, memories: MemoryRow[], total: number, _limit: number, offset: number): string {
   if (memories.length === 0) return `No memories in "${view}" view`;
 
   const lines = memories.map(row => {
@@ -166,7 +166,7 @@ function formatInsights(view: string, memories: MemoryRow[], total: number, limi
 }
 
 /** Format pending predictions */
-function formatPending(memories: Array<{ id: string; content: string; resolves_by?: number }>, total: number, limit: number, offset: number): string {
+function formatPending(memories: Array<{ id: string; content: string; resolves_by?: number }>, total: number, _limit: number, offset: number): string {
   if (memories.length === 0) return 'No pending time-bound predictions';
 
   const lines = memories.map(m => {
@@ -300,7 +300,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
           `SELECT content FROM memories WHERE id = ?`
         ).bind(dupCheck.id).first<{ content: string }>();
 
-        return textResult(`⚠️ DUPLICATE DETECTED (${Math.round(dupCheck.similarity * 100)}% match)\n\nExisting: [${dupCheck.id}] ${existing?.content || '(not found)'}\n\nNew (skipped): ${content}`);
+        return errorResult(`Duplicate detected (${Math.round(dupCheck.similarity * 100)}% match). Existing: [${dupCheck.id}] ${existing?.content || '(not found)'}`);
       } else if (dupCheck.id && dupCheck.similarity >= config.dedupLowerThreshold) {
         const existing = await ctx.env.DB.prepare(
           `SELECT content FROM memories WHERE id = ?`
@@ -309,9 +309,26 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         if (existing) {
           const llmResult = await checkDuplicateWithLLM(ctx.env.AI, content, existing.content, config, requestId, ctx.env);
           if (llmResult.isDuplicate && llmResult.confidence >= config.dedupConfidenceThreshold) {
-            return textResult(`⚠️ DUPLICATE DETECTED (LLM: ${Math.round(llmResult.confidence * 100)}% confidence)\n\nExisting: [${dupCheck.id}] ${existing.content}\n\nNew (skipped): ${content}\n\nReason: ${llmResult.reasoning}`);
+            return errorResult(`Duplicate detected (LLM: ${Math.round(llmResult.confidence * 100)}% confidence). Existing: [${dupCheck.id}] ${existing.content}. Reason: ${llmResult.reasoning}`);
           }
         }
+      }
+
+      // Check for memory completeness before creating (feature toggle)
+      const completeness = await checkMemoryCompleteness(ctx.env, ctx.env.AI, config, {
+        content,
+        has_source: hasSource,
+        has_derived_from: hasDerivedFrom,
+        has_invalidates_if: Boolean(invalidates_if?.length),
+        has_confirms_if: Boolean(confirms_if?.length),
+        has_resolves_by: timeBound,
+        requestId,
+      });
+      if (completeness && !completeness.is_complete && completeness.missing_fields.length > 0) {
+        const suggestions = completeness.missing_fields
+          .map(f => `- ${f.field}: ${f.reason}`)
+          .join('\n');
+        return errorResult(`Memory could be strengthened. Add the suggested fields and retry:\n${suggestions}`);
       }
 
       const now = Date.now();
@@ -453,43 +470,31 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
 
       await ctx.env.DETECTION_QUEUE.send(exposureJob);
 
-      // Check for memory completeness (feature toggle)
-      let completenessText = '';
-      const completeness = await checkMemoryCompleteness(ctx.env, ctx.env.AI, config, {
-        content,
-        has_source: hasSource,
-        has_derived_from: hasDerivedFrom,
-        has_invalidates_if: Boolean(invalidates_if?.length),
-        has_confirms_if: Boolean(confirms_if?.length),
-        has_resolves_by: timeBound,
-        requestId,
-      });
-      if (completeness) {
-        completenessText = formatCompletenessOutput(completeness);
-      }
-
       // Format response based on mode
       if (hasSource) {
-        return textResult(`✓ Observed [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}${completenessText}`);
+        return textResult(`✓ Observed [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}`);
       } else {
         const typeLabel = timeBound ? 'Predicted' : 'Thought';
-        return textResult(`✓ ${typeLabel} [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}\n\nDerived from: ${derived_from!.map(d => `[${d}]`).join(', ')}${completenessText}`);
+        return textResult(`✓ ${typeLabel} [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}\n\nDerived from: ${derived_from!.map(d => `[${d}]`).join(', ')}`);
       }
     },
   }),
 
   defineTool({
     name: 'update',
-    description: 'Add missing fields to a recently-created memory (within 1 hour or same session). Use after completeness suggestions to strengthen a memory without recreating it. Cannot change core identity (content, source, derived_from).',
+    description: 'Update a memory (within 1 hour or same session). Can modify content, source, derived_from, and all metadata fields. Arrays (invalidates_if, confirms_if, assumes, tags) are merged with existing values.',
     inputSchema: {
       type: 'object',
       properties: {
         memory_id: { type: 'string', description: 'ID of the memory to update' },
+        content: { type: 'string', description: 'New content text (replaces existing)' },
+        source: { type: 'string', enum: ['market', 'news', 'earnings', 'email', 'human', 'tool'], description: 'Change observation source (only for observations)' },
+        derived_from: { type: 'array', items: { type: 'string' }, description: 'Replace derived_from IDs (only for thoughts)' },
         invalidates_if: { type: 'array', items: { type: 'string' }, description: 'Conditions to ADD (not replace)' },
         confirms_if: { type: 'array', items: { type: 'string' }, description: 'Conditions to ADD (not replace)' },
         assumes: { type: 'array', items: { type: 'string' }, description: 'Assumptions to ADD (thoughts only)' },
-        resolves_by: { type: 'string', description: 'Deadline as date string (e.g. "2026-03-15") or Unix timestamp (cannot change if already set)' },
-        outcome_condition: { type: 'string', description: 'Success/failure criteria (cannot change if already set)' },
+        resolves_by: { type: 'string', description: 'Deadline as date string (e.g. "2026-03-15") or Unix timestamp' },
+        outcome_condition: { type: 'string', description: 'Success/failure criteria (required if resolves_by set)' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Tags to ADD (not replace)' },
       },
       required: ['memory_id'],
@@ -498,6 +503,9 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       const {
         memory_id: rawMemoryId,
         id: rawId,
+        content: newContent,
+        source: newSource,
+        derived_from: newDerivedFrom,
         invalidates_if,
         confirms_if,
         assumes,
@@ -507,6 +515,9 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       } = args as {
         memory_id?: string;
         id?: string;
+        content?: string;
+        source?: string;
+        derived_from?: string[];
         invalidates_if?: string[];
         confirms_if?: string[];
         assumes?: string[];
@@ -545,13 +556,45 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         return errorResult(`Memory [${memory_id}] is too old to update (created ${Math.round((now - row.created_at) / 1000 / 60)} minutes ago). Only memories created within 1 hour or in the same session can be updated.`);
       }
 
-      // Determine memory type
-      const hasSource = row.source !== null;
+      // Determine current memory type
+      const wasObservation = row.source !== null;
       const hasDerivedFrom = row.derived_from !== null;
 
+      // Validate source/derived_from changes don't cross types
+      if (newSource !== undefined && hasDerivedFrom) {
+        return errorResult('Cannot set source on a thought (has derived_from). These are mutually exclusive.');
+      }
+      if (newDerivedFrom !== undefined && wasObservation && newSource === undefined) {
+        return errorResult('Cannot set derived_from on an observation (has source). These are mutually exclusive.');
+      }
+
+      // After update, determine the effective type
+      const effectiveSource = newSource !== undefined ? newSource : row.source;
+      const effectiveDerivedFrom = newDerivedFrom !== undefined ? newDerivedFrom : (hasDerivedFrom ? JSON.parse(row.derived_from!) : null);
+      const hasEffectiveSource = effectiveSource !== null;
+
       // Validate assumes is only for thoughts
-      if (assumes && assumes.length > 0 && hasSource) {
+      if (assumes && assumes.length > 0 && hasEffectiveSource) {
         return errorResult('"assumes" can only be added to thoughts (derived_from mode), not observations');
+      }
+
+      // Validate new derived_from IDs exist
+      if (newDerivedFrom && newDerivedFrom.length > 0) {
+        const placeholders = newDerivedFrom.map(() => '?').join(',');
+        const sources = await ctx.env.DB.prepare(
+          `SELECT id FROM memories WHERE id IN (${placeholders}) AND retracted = 0`
+        ).bind(...newDerivedFrom).all<{ id: string }>();
+
+        if (!sources.results || sources.results.length !== newDerivedFrom.length) {
+          const foundIds = new Set(sources.results?.map((r) => r.id) || []);
+          const missing = newDerivedFrom.filter((id) => !foundIds.has(id));
+          return errorResult(`Source memories not found: ${missing.join(', ')}`);
+        }
+      }
+
+      // Validate new source value
+      if (newSource !== undefined && !VALID_SOURCES.includes(newSource as typeof VALID_SOURCES[number])) {
+        return errorResult(`source must be one of: ${VALID_SOURCES.join(', ')}`);
       }
 
       // Parse existing arrays
@@ -566,32 +609,41 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       const newAssumes = assumes ? [...existingAssumes, ...assumes] : existingAssumes;
       const newTags = tags ? [...new Set([...existingTags, ...tags])] : existingTags;
 
-      // Handle resolves_by and outcome_condition - can only set if not already set
-      let newResolvesBy = row.resolves_by;
-      let newOutcomeCondition = row.outcome_condition;
-
-      if (resolves_by !== undefined) {
-        if (row.resolves_by !== null) {
-          return errorResult('resolves_by is already set and cannot be changed');
-        }
-        newResolvesBy = resolves_by;
-      }
-
-      if (outcome_condition !== undefined) {
-        if (row.outcome_condition !== null) {
-          return errorResult('outcome_condition is already set and cannot be changed');
-        }
-        newOutcomeCondition = outcome_condition;
-      }
+      // Handle resolves_by and outcome_condition - allow overwriting
+      const newResolvesBy = resolves_by !== undefined ? resolves_by : row.resolves_by;
+      const newOutcomeCondition = outcome_condition !== undefined ? outcome_condition : row.outcome_condition;
+      const timeBound = newResolvesBy !== null && newResolvesBy !== undefined;
 
       // Validate time-bound consistency
-      if (newResolvesBy !== null && newOutcomeCondition === null) {
+      if (timeBound && !newOutcomeCondition) {
         return errorResult('outcome_condition is required when resolves_by is set');
+      }
+
+      const finalContent = newContent || row.content;
+
+      // Completeness check on the updated state
+      const updateCompleteness = await checkMemoryCompleteness(ctx.env, ctx.env.AI, config, {
+        content: finalContent,
+        has_source: hasEffectiveSource,
+        has_derived_from: effectiveDerivedFrom !== null && effectiveDerivedFrom.length > 0,
+        has_invalidates_if: newInvalidatesIf.length > 0,
+        has_confirms_if: newConfirmsIf.length > 0,
+        has_resolves_by: timeBound,
+        requestId,
+      });
+      if (updateCompleteness && !updateCompleteness.is_complete && updateCompleteness.missing_fields.length > 0) {
+        const suggestions = updateCompleteness.missing_fields
+          .map(f => `- ${f.field}: ${f.reason}`)
+          .join('\n');
+        return errorResult(`Memory still incomplete after update. Add the suggested fields and retry:\n${suggestions}`);
       }
 
       // Update the memory
       await ctx.env.DB.prepare(
         `UPDATE memories SET
+          content = ?,
+          source = ?,
+          derived_from = ?,
           invalidates_if = ?,
           confirms_if = ?,
           assumes = ?,
@@ -601,6 +653,9 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
           updated_at = ?
         WHERE id = ?`
       ).bind(
+        finalContent,
+        hasEffectiveSource ? effectiveSource : null,
+        effectiveDerivedFrom ? JSON.stringify(effectiveDerivedFrom) : null,
         newInvalidatesIf.length > 0 ? JSON.stringify(newInvalidatesIf) : null,
         newConfirmsIf.length > 0 ? JSON.stringify(newConfirmsIf) : null,
         newAssumes.length > 0 ? JSON.stringify(newAssumes) : null,
@@ -611,14 +666,34 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         memory_id
       ).run();
 
-      // Re-embed conditions if new ones were added
+      // Handle derived_from edge changes
+      if (newDerivedFrom !== undefined) {
+        // Delete old edges and create new ones
+        await ctx.env.DB.prepare(
+          `DELETE FROM edges WHERE target_id = ? AND edge_type = 'derived_from'`
+        ).bind(memory_id).run();
+
+        for (const sourceId of newDerivedFrom) {
+          const edgeId = generateId();
+          await ctx.env.DB.prepare(
+            `INSERT INTO edges (id, source_id, target_id, edge_type, strength, created_at)
+             VALUES (?, ?, ?, 'derived_from', 1.0, ?)`
+          ).bind(edgeId, sourceId, memory_id, now).run();
+
+          await incrementCentrality(ctx.env.DB, sourceId);
+        }
+      }
+
+      // Re-embed if content or conditions changed
+      const contentChanged = newContent !== undefined;
       const addedInvalidatesIf = invalidates_if || [];
       const addedConfirmsIf = confirms_if || [];
-      const timeBound = newResolvesBy !== null;
+      const needsReEmbed = contentChanged || addedInvalidatesIf.length > 0 || addedConfirmsIf.length > 0;
 
-      if (addedInvalidatesIf.length > 0 || addedConfirmsIf.length > 0) {
+      if (needsReEmbed) {
+        const embedding = await generateEmbedding(ctx.env.AI, finalContent, config, requestId);
+
         // Store new condition embeddings
-        // Start index from existing array length to avoid ID collisions
         if (addedInvalidatesIf.length > 0) {
           const conditionVectors = await Promise.all(
             addedInvalidatesIf.map(async (condition, idx) => {
@@ -659,15 +734,14 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
           await ctx.env.CONFIRMS_VECTORS.upsert(conditionVectors as any);
         }
 
-        // Update MEMORY_VECTORS metadata to reflect conditions now exist
-        const existingEmbedding = await generateEmbedding(ctx.env.AI, row.content, config, requestId);
+        // Update MEMORY_VECTORS with new embedding and metadata
         await ctx.env.MEMORY_VECTORS.upsert([
           {
             id: memory_id,
-            values: existingEmbedding,
+            values: embedding,
             metadata: {
-              type: hasSource ? 'obs' : 'thought',
-              source: row.source || undefined,
+              type: hasEffectiveSource ? 'obs' : 'thought',
+              source: effectiveSource || undefined,
               has_invalidates_if: newInvalidatesIf.length > 0,
               has_confirms_if: newConfirmsIf.length > 0,
               has_assumes: newAssumes.length > 0,
@@ -678,12 +752,12 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
           },
         ]);
 
-        // Re-queue exposure check with new conditions
+        // Re-queue exposure check
         const exposureJob: ExposureCheckJob = {
           memory_id,
-          is_observation: hasSource,
-          content: row.content,
-          embedding: existingEmbedding,
+          is_observation: hasEffectiveSource,
+          content: finalContent,
+          embedding,
           session_id: ctx.sessionId,
           request_id: requestId,
           timestamp: now,
@@ -697,13 +771,13 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       // Record version for audit trail
       await recordVersion(ctx.env.DB, {
         entityId: memory_id,
-        entityType: hasSource ? 'observation' : (timeBound ? 'prediction' : 'thought'),
+        entityType: hasEffectiveSource ? 'observation' : (timeBound ? 'prediction' : 'thought'),
         changeType: 'updated',
         contentSnapshot: {
           id: memory_id,
-          content: row.content,
-          source: row.source || undefined,
-          derived_from: hasDerivedFrom ? JSON.parse(row.derived_from!) : undefined,
+          content: finalContent,
+          source: effectiveSource || undefined,
+          derived_from: effectiveDerivedFrom || undefined,
           assumes: newAssumes.length > 0 ? newAssumes : undefined,
           invalidates_if: newInvalidatesIf.length > 0 ? newInvalidatesIf : undefined,
           confirms_if: newConfirmsIf.length > 0 ? newConfirmsIf : undefined,
@@ -715,14 +789,17 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         requestId,
       });
 
-      // Build response showing what was added
+      // Build response showing what changed
       const changes: string[] = [];
+      if (contentChanged) changes.push('content updated');
+      if (newSource !== undefined) changes.push(`source → ${newSource}`);
+      if (newDerivedFrom !== undefined) changes.push(`derived_from → [${newDerivedFrom.join(', ')}]`);
       if (addedInvalidatesIf.length > 0) changes.push(`+${addedInvalidatesIf.length} invalidates_if`);
       if (addedConfirmsIf.length > 0) changes.push(`+${addedConfirmsIf.length} confirms_if`);
       if (assumes && assumes.length > 0) changes.push(`+${assumes.length} assumes`);
       if (tags && tags.length > 0) changes.push(`+${tags.length} tags`);
-      if (resolves_by !== undefined) changes.push(`resolves_by set`);
-      if (outcome_condition !== undefined) changes.push(`outcome_condition set`);
+      if (resolves_by !== undefined) changes.push('resolves_by updated');
+      if (outcome_condition !== undefined) changes.push('outcome_condition updated');
 
       return textResult(`✓ Updated [${memory_id}]\n${changes.join(', ')}`);
     },
