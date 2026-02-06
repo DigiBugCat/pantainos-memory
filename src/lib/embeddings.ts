@@ -170,7 +170,14 @@ export async function checkDuplicateWithLLM(
   requestId?: string,
   env?: Env
 ): Promise<LLMDuplicateResult> {
-  const prompt = `Two memories are duplicates ONLY if they record the SAME insight about the SAME specific person/topic. Related themes don't count.
+  const prompt = `Two memories are duplicates ONLY if they record the SAME insight about the SAME specific person/topic at the SAME level of abstraction. Related themes don't count.
+
+CRITICAL distinctions — these are NEVER duplicates:
+- A SYNTHESIS/THOUGHT that references multiple topics vs. a single-topic OBSERVATION it was derived from
+- Two memories from the same source that cover DIFFERENT subtopics (e.g., one about power constraints, another about chip fabs)
+- A broad summary vs. a narrow detail, even if the detail appears within the summary
+
+Only call "duplicate" when both memories would be fully redundant if you kept just one.
 
 Memory A: ${contentA}
 

@@ -455,11 +455,14 @@ function buildCompletenessPrompt(
     has_resolves_by?: boolean;
   }
 ): string {
+  const isObservation = currentFields.has_source === true;
+
   return `Analyze whether this memory is complete and well-formed.
 
 Content: "${content}"
 
 Current fields present: ${JSON.stringify(currentFields)}
+Memory type: ${isObservation ? 'OBSERVATION (recording what was seen/heard/read)' : 'THOUGHT (inference derived from other memories)'}
 
 Field definitions:
 - source: Where the information came from (for observations: market, news, tool, human, etc.)
@@ -467,15 +470,23 @@ Field definitions:
 - invalidates_if: Conditions that would prove this memory wrong (makes claims falsifiable)
 - confirms_if: Conditions that would strengthen confidence in this memory
 - resolves_by: Deadline for time-bound predictions (Unix timestamp)
-
+${isObservation ? `
+IMPORTANT — Observation leniency rules:
+Observations record WHAT WAS SAID or WHAT HAPPENED. They are not the author's own claims.
+- If someone said "X will happen in 3 years," that is a QUOTE, not a prediction by the memory author. Do NOT require resolves_by.
+- Falsifiable claims WITHIN quotes belong to the speaker, not the memory. Do NOT require invalidates_if for quoted/attributed claims.
+- invalidates_if and confirms_if are NICE TO HAVE on observations, never required. Only flag them if truly obvious and simple (1 condition max).
+- confirms_if is NEVER required for observations.
+- An observation with source + content is COMPLETE. Err heavily toward marking observations as complete.
+` : ''}
 Check for these completeness issues:
-1. Falsifiable claims without invalidates_if conditions - any claim that could be proven wrong should ideally have kill conditions
+1. ${isObservation ? 'SKIP for observations unless the memory itself (not quoted speakers) makes a novel prediction' : 'Falsifiable claims without invalidates_if conditions - any claim that could be proven wrong should ideally have kill conditions'}
 2. Apparent inferences without derived_from - if this seems like a conclusion based on other information, it should trace its reasoning
-3. Time-bound predictions without resolves_by/outcome_condition - predictions with implicit deadlines should make them explicit
+3. ${isObservation ? 'SKIP for observations — quoted time-bound claims belong to the speaker' : 'Time-bound predictions without resolves_by/outcome_condition - predictions with implicit deadlines should make them explicit'}
 4. Claims that reference external information without source attribution
 
 Note: Not every memory needs every field. Simple facts or observations may be complete as-is.
-Focus on genuinely missing fields that would strengthen the memory, not theoretical completeness.
+${isObservation ? 'Observations are almost always complete if they have a source. Be very reluctant to flag missing fields.' : 'Focus on genuinely missing fields that would strengthen the memory, not theoretical completeness.'}
 
 Respond with JSON only:
 {
