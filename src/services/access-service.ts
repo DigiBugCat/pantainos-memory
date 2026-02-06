@@ -235,6 +235,115 @@ export async function queryAccessEvents(
 }
 
 /**
+ * Aggregated memory access for session recap.
+ */
+export interface SessionMemoryAccess {
+  memoryId: string;
+  content: string;
+  displayType: 'observation' | 'thought' | 'prediction';
+  accessTypes: string[];
+  queryTexts: string[];
+  lastAccessed: number;
+  accessCount: number;
+  state: string;
+}
+
+/**
+ * Query memories accessed in a session, grouped and deduplicated.
+ * Uses sessionId when available, falls back to time-based window.
+ */
+export async function querySessionMemories(
+  db: D1Database,
+  filters: { sessionId?: string; sinceMinutes?: number; limit?: number }
+): Promise<SessionMemoryAccess[]> {
+  const { sessionId, sinceMinutes = 30, limit = 30 } = filters;
+
+  const cutoff = Date.now() - sinceMinutes * 60 * 1000;
+
+  let query: string;
+  const bindings: (string | number)[] = [];
+
+  if (sessionId) {
+    query = `
+      SELECT
+        a.entity_id AS memory_id,
+        m.content,
+        m.source,
+        m.derived_from,
+        m.resolves_by,
+        m.state,
+        GROUP_CONCAT(DISTINCT a.access_type) AS access_types,
+        GROUP_CONCAT(DISTINCT a.query_text) AS query_texts,
+        MAX(a.accessed_at) AS last_accessed,
+        COUNT(*) AS access_count
+      FROM access_events a
+      JOIN memories m ON m.id = a.entity_id AND m.retracted = 0
+      WHERE a.session_id = ?
+      GROUP BY a.entity_id
+      ORDER BY last_accessed DESC
+      LIMIT ?
+    `;
+    bindings.push(sessionId, limit);
+  } else {
+    query = `
+      SELECT
+        a.entity_id AS memory_id,
+        m.content,
+        m.source,
+        m.derived_from,
+        m.resolves_by,
+        m.state,
+        GROUP_CONCAT(DISTINCT a.access_type) AS access_types,
+        GROUP_CONCAT(DISTINCT a.query_text) AS query_texts,
+        MAX(a.accessed_at) AS last_accessed,
+        COUNT(*) AS access_count
+      FROM access_events a
+      JOIN memories m ON m.id = a.entity_id AND m.retracted = 0
+      WHERE a.accessed_at > ?
+      GROUP BY a.entity_id
+      ORDER BY last_accessed DESC
+      LIMIT ?
+    `;
+    bindings.push(cutoff, limit);
+  }
+
+  const rows = await db.prepare(query).bind(...bindings).all<{
+    memory_id: string;
+    content: string;
+    source: string | null;
+    derived_from: string | null;
+    resolves_by: number | null;
+    state: string;
+    access_types: string;
+    query_texts: string | null;
+    last_accessed: number;
+    access_count: number;
+  }>();
+
+  return (rows.results ?? []).map(row => {
+    let displayType: 'observation' | 'thought' | 'prediction';
+    if (row.source !== null) {
+      displayType = 'observation';
+    } else if (row.resolves_by !== null) {
+      displayType = 'prediction';
+    } else {
+      displayType = 'thought';
+    }
+
+    return {
+      memoryId: row.memory_id,
+      content: row.content,
+      displayType,
+      accessTypes: row.access_types ? row.access_types.split(',') : [],
+      queryTexts: row.query_texts ? row.query_texts.split(',') : [],
+      lastAccessed: row.last_accessed,
+      accessCount: row.access_count,
+      state: row.state,
+    };
+  });
+}
+
+/**
  * Infer entity type from ID prefix.
  * Note: With unified model, IDs no longer have prefixes.
  * This function is kept for legacy compatibility only.

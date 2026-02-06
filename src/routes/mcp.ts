@@ -29,10 +29,10 @@ import type { LoggingEnv } from '../lib/shared/hono/index.js';
 import { generateId } from '../lib/id.js';
 import { TYPE_STARTING_CONFIDENCE } from '../services/confidence.js';
 import { getStartingConfidenceForSource, computeSystemStats, getSystemStatsSummary } from '../jobs/compute-stats.js';
-import { generateEmbedding, searchSimilar, checkDuplicate, checkDuplicateWithLLM } from '../lib/embeddings.js';
+import { generateEmbedding, searchSimilar, checkDuplicate, checkDuplicateWithLLM, callExternalLLM } from '../lib/embeddings.js';
 import { storeObservationEmbeddings, storeObservationWithConditions, storeThoughtEmbeddings } from '../services/embedding-tables.js';
 import { recordVersion } from '../services/history-service.js';
-import { recordAccessBatch } from '../services/access-service.js';
+import { recordAccessBatch, querySessionMemories, type SessionMemoryAccess } from '../services/access-service.js';
 import { rowToMemory } from '../lib/transforms.js';
 import { createScoredMemory } from '../lib/scoring.js';
 import { incrementCentrality } from '../services/exposure-checker.js';
@@ -182,6 +182,58 @@ function formatPending(memories: Array<{ id: string; content: string; resolves_b
 /** Text result wrapper */
 function textResult(text: string) {
   return { content: [{ type: 'text' as const, text }] };
+}
+
+/** Build LLM prompt for session recap summarization */
+function buildRecapPrompt(accesses: SessionMemoryAccess[]): string {
+  const memoryList = accesses.map(a => {
+    const queries = a.queryTexts.length > 0 ? ` (surfaced by: ${a.queryTexts.join('; ')})` : '';
+    return `- [${a.memoryId}] (${a.displayType}, ${a.state}) ${a.content.substring(0, 200)}${a.content.length > 200 ? '...' : ''}${queries}`;
+  }).join('\n');
+
+  return `You are summarizing a research session for an AI agent. Below are the memories accessed during this session.
+
+Memories accessed (${accesses.length} total):
+${memoryList}
+
+Write a concise session recap (3-5 paragraphs):
+1. Identify 2-4 themes or topics explored
+2. Note connections between memories where apparent
+3. Highlight key findings or patterns
+4. Use [ID] notation when referencing specific memories
+
+Be concise and insightful. Focus on what the session revealed, not just what was looked up.`;
+}
+
+/** Format raw recap (structured fallback when LLM unavailable) */
+function formatRawRecap(accesses: SessionMemoryAccess[], sessionId: string | undefined, minutes: number): string {
+  const scope = sessionId ? `session ${sessionId}` : `last ${minutes} minutes`;
+  let text = `=== SESSION RECAP (raw) === ${scope}\n${accesses.length} memories accessed\n\n`;
+
+  const byType: Record<string, SessionMemoryAccess[]> = {};
+  for (const a of accesses) {
+    (byType[a.displayType] ??= []).push(a);
+  }
+
+  for (const [type, items] of Object.entries(byType)) {
+    text += `--- ${type.toUpperCase()}S (${items.length}) ---\n`;
+    for (const item of items) {
+      const queries = item.queryTexts.length > 0 ? `\n   queries: ${item.queryTexts.join(', ')}` : '';
+      text += `[${item.memoryId}] ${item.content.substring(0, 150)}${item.content.length > 150 ? '...' : ''}${queries}\n`;
+    }
+    text += '\n';
+  }
+
+  return text.trim();
+}
+
+/** Wrap LLM summary with header and referenced IDs */
+function formatRecapResult(summary: string, memoryIds: string[], total: number): string {
+  let text = `=== SESSION RECAP === (${total} memories)\n\n${summary}`;
+  if (memoryIds.length > 0) {
+    text += `\n\nReferenced: ${memoryIds.map(id => `[${id}]`).join(', ')}`;
+  }
+  return text;
 }
 
 // ============================================
@@ -1515,6 +1567,74 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       }
 
       return textResult(text);
+    },
+  }),
+
+  defineTool({
+    name: 'session_recap',
+    description: 'Summarize memories accessed in the current session. Pulls recently accessed memories, sends them to an LLM for thematic summarization, and returns a narrative recap with memory IDs. Use raw mode to skip LLM summarization.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        minutes: { type: 'integer', description: 'Time window in minutes (default: 30, used when no session ID available)', minimum: 1, maximum: 1440 },
+        limit: { type: 'integer', description: 'Max memories to include (default: 30)', minimum: 1, maximum: 100 },
+        raw: { type: 'boolean', description: 'Skip LLM summarization, return structured list (default: false)' },
+      },
+    },
+    handler: async (args, ctx) => {
+      const { minutes = 30, limit = 30, raw = false } = args as {
+        minutes?: number;
+        limit?: number;
+        raw?: boolean;
+      };
+
+      const accesses = await querySessionMemories(ctx.env.DB, {
+        sessionId: ctx.sessionId,
+        sinceMinutes: minutes,
+        limit,
+      });
+
+      if (accesses.length === 0) {
+        return textResult('No memories accessed in this session. Use find/recall/reference to explore the knowledge graph first.');
+      }
+
+      // Raw mode: skip LLM
+      if (raw) {
+        return textResult(formatRawRecap(accesses, ctx.sessionId, minutes));
+      }
+
+      // Try LLM summarization
+      const prompt = buildRecapPrompt(accesses);
+      const memoryIds = accesses.map(a => a.memoryId);
+
+      try {
+        let summary: string;
+
+        if (ctx.env.CLAUDE_PROXY || ctx.env.LLM_JUDGE_URL) {
+          summary = await callExternalLLM(
+            ctx.env.CLAUDE_PROXY ?? ctx.env.LLM_JUDGE_URL!,
+            prompt,
+            { apiKey: ctx.env.LLM_JUDGE_API_KEY, requestId }
+          );
+        } else {
+          // Workers AI fallback
+          const aiResponse = await ctx.env.AI.run(
+            '@cf/meta/llama-3.1-8b-instruct' as Parameters<typeof ctx.env.AI.run>[0],
+            { messages: [{ role: 'user', content: prompt }] } as { messages: Array<{ role: string; content: string }> }
+          ) as { response?: string };
+
+          summary = aiResponse.response || '';
+        }
+
+        if (!summary) {
+          return textResult(formatRawRecap(accesses, ctx.sessionId, minutes));
+        }
+
+        return textResult(formatRecapResult(summary, memoryIds, accesses.length));
+      } catch (_err) {
+        // Graceful degradation to raw format
+        return textResult(formatRawRecap(accesses, ctx.sessionId, minutes));
+      }
     },
   }),
 ]);
