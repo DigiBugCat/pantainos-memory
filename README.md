@@ -1,6 +1,24 @@
 # Pantainos Memory
 
-Zettelkasten-style knowledge graph for AI agents. Cloudflare Workers with D1, Vectorize, and Workers AI.
+An epistemological memory system for AI agents — a knowledge graph where every belief has a derivation chain back to reality and every claim can be tested, violated, or confirmed over time.
+
+## Why This Exists
+
+LLMs are stateless. Between conversations, everything is lost. Most memory solutions solve this with simple key-value stores or vector databases — dump text in, retrieve text out. That works for recall, but it doesn't capture *how you know what you know* or *how much you should trust it*.
+
+Pantainos Memory treats knowledge like a scientific process:
+
+- **Everything traces back to reality.** Observations come from sources (market data, news, tools, humans). Thoughts are derived from other memories, forming a derivation DAG. You can always trace a belief back to the ground-truth observations it's built on — and if those observations get retracted, the system knows which downstream beliefs are affected.
+
+- **Beliefs are weighted bets, not facts.** Every memory has a confidence score that starts based on its origin (a market data point starts higher than a human rumor) and evolves as the system tests it. Confidence isn't static — it's a survival rate under exposure.
+
+- **The system actively tests itself.** When a new memory arrives, it's checked against existing beliefs. If a new observation contradicts a thought's `invalidates_if` conditions, the system flags a violation. If it matches `confirms_if` conditions, confidence goes up. This happens automatically via a queue-based exposure checker — you don't have to manually cross-reference.
+
+- **Predictions have deadlines.** Any thought can be given a `resolves_by` date and `outcome_condition`, turning it into a prediction. When the deadline passes, the system queues it for resolution. Over time, this builds a track record — which sources are reliable, which reasoning patterns hold up, which don't.
+
+- **Knowledge degrades gracefully.** Violated memories aren't deleted — they're marked, and the violation cascades through the derivation graph so downstream beliefs know their foundation is shaky. Retracted observations propagate damage to everything built on them. The graph self-heals.
+
+The result is a memory system where an agent can ask not just "what do I know about X?" but "how confident should I be?" and "what is this belief based on?" — and get real answers backed by the graph structure, not just vector similarity.
 
 ## Architecture
 
@@ -46,14 +64,17 @@ Three workers share the same D1 database and Vectorize indexes:
 
 ## Concepts
 
-**Two memory primitives (determined by field presence, no type column):**
-- **Observations**: Facts from reality. Has `source` field (market, news, earnings, email, human, tool).
-- **Thoughts**: Derived beliefs. Has `derived_from` field (array of source memory IDs).
-  - A thought with `resolves_by` set becomes a **Prediction** (time-bound, enters pending queue at deadline).
+There is one unified `memories` table. Type is determined by field presence, not a type column:
 
-**Exposure checking:** When new memories arrive, the system queues an exposure check. Observations are tested against existing thought conditions; thoughts are tested against existing observations. Semantic similarity + LLM judge determine violations and confirmations.
+- **Observations**: Ground truth from reality. Identified by having a `source` field (market, news, earnings, email, human, tool). These are the leaves of the derivation DAG — everything ultimately traces back to observations.
+- **Thoughts**: Derived beliefs. Identified by having a `derived_from` field (array of source memory IDs). Each thought creates edges in the derivation graph back to what it's based on.
+  - A thought with `resolves_by` set becomes a **Prediction** — a time-bound claim that enters a pending resolution queue when its deadline passes.
 
-**Confidence model:** Memories are weighted bets, not facts. `starting_confidence` is set by source type or memory kind. `times_tested` and `confirmations` track survival rate. Daily cron recomputes system-wide stats and per-source track records.
+**Exposure checking:** Every new memory is queued for bi-directional exposure checking. New observations are tested against existing thought conditions (`invalidates_if`, `confirms_if`). New thoughts are tested against existing observations. Semantic similarity finds candidates; an LLM judge evaluates whether the match constitutes a real violation or confirmation. Significant findings generate events that get dispatched for resolution.
+
+**Confidence model:** Starting confidence is set by origin — observations inherit from their source's track record (market data starts at ~0.75, human input at ~0.50), thoughts start at 0.40, predictions at 0.35. As the system tests memories through exposure checks, `times_tested` and `confirmations` accumulate. The effective confidence becomes a survival rate. A daily cron job recomputes system-wide stats and per-source track records, so learned confidence feeds back into future starting scores.
+
+**Cascade propagation:** When a memory is resolved, violated, or retracted, the effects propagate through the derivation graph. If an observation is retracted, every thought built on it gets flagged. If a prediction is resolved as incorrect, downstream beliefs that assumed it are weakened. The graph structure makes these cascades precise — only actually-dependent memories are affected.
 
 ## Authentication
 
