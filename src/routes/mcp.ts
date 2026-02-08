@@ -39,6 +39,13 @@ import { incrementCentrality } from '../services/exposure-checker.js';
 import { checkMemoryCompleteness } from '../services/classification-challenge.js';
 import { deleteConditionVectors } from '../services/embedding-tables.js';
 import { propagateResolution } from '../services/cascade.js';
+import {
+  formatZone,
+  parseViolationCount,
+  isOverwhelminglyViolated,
+  addBoundaryReason,
+  type SafetyRow,
+} from '../lib/zones.js';
 
 type Env = BaseEnv & LoggingEnv;
 
@@ -180,6 +187,11 @@ function formatPending(memories: Array<{ id: string; content: string; resolves_b
   const to = offset + memories.length;
   return `=== PENDING RESOLUTION === (showing ${from}-${to} of ${total})\n\n${lines.join('\n\n')}`;
 }
+
+type Memory = ReturnType<typeof rowToMemory>;
+
+// truncate/formatConfidence/scoreZone/formatZone/parseViolationCount/isOverwhelminglyViolated
+// imported from ../lib/zones.js
 
 /** Text result wrapper */
 function textResult(text: string) {
@@ -1485,6 +1497,454 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       text += rootLines.join('\n');
 
       return textResult(text);
+    },
+  }),
+
+  defineTool({
+    name: 'zones',
+    description: 'Return a locally consistent reasoning zone: a mutually non-contradictory cluster of memories around a seed, plus boundary contradictions and external support dependency. Use this when you need a coherent set of facts/thoughts to reason over without internal violated_by conflicts.',
+    annotations: {
+      title: 'Reasoning Zones',
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Semantic seed query (optional)' },
+        memory_id: { type: 'string', description: 'Direct seed memory ID (optional)' },
+        max_depth: { type: 'integer', description: 'Graph traversal depth (default: 3)', minimum: 1, maximum: 5 },
+        max_size: { type: 'integer', description: 'Max zone members (default: 30)', minimum: 5, maximum: 100 },
+        include_semantic: { type: 'boolean', description: 'Supplement with semantic search if zone is small (default: true)' },
+        min_edge_strength: { type: 'number', description: 'Minimum edge strength to traverse (default: 0.3, range 0-1). Edges weakened by violations below this threshold are skipped.', minimum: 0, maximum: 1 },
+      },
+    },
+    handler: async (args, ctx) => {
+      const {
+        query,
+        memory_id: rawMemoryId,
+        max_depth,
+        max_size,
+        include_semantic,
+        min_edge_strength,
+      } = args as {
+        query?: string;
+        memory_id?: string;
+        max_depth?: number;
+        max_size?: number;
+        include_semantic?: boolean;
+        min_edge_strength?: number;
+      };
+
+      const maxDepth = max_depth ?? 3;
+      const maxSize = max_size ?? 30;
+      const includeSemantic = include_semantic ?? true;
+      const minEdgeStrength = min_edge_strength ?? 0.3;
+
+      if (!query && !rawMemoryId) {
+        return errorResult('At least one of "query" or "memory_id" is required');
+      }
+      if (maxDepth < 1 || maxDepth > 5) {
+        return errorResult('max_depth must be between 1 and 5');
+      }
+      if (maxSize < 5 || maxSize > 100) {
+        return errorResult('max_size must be between 5 and 100');
+      }
+
+      const makePlaceholders = (n: number) => new Array(n).fill('?').join(',');
+
+      // SafetyRow, parseViolationCount, isOverwhelminglyViolated, addBoundaryReason
+      // imported from ../lib/zones.js
+
+      // --------------------------
+      // Phase 1: Seed selection
+      // --------------------------
+      let seedId: string | null = null;
+      let seedRow: MemoryRow | null = null;
+
+      if (rawMemoryId) {
+        seedId = rawMemoryId;
+        seedRow = await ctx.env.DB.prepare(
+          `SELECT * FROM memories WHERE id = ? AND retracted = 0`
+        ).bind(seedId).first<MemoryRow>();
+        if (!seedRow) return errorResult(`Memory not found: ${seedId}`);
+      } else if (query) {
+        const queryEmbedding = await generateEmbedding(ctx.env.AI, query, config, requestId);
+        const matches = await searchSimilar(ctx.env, queryEmbedding, 10, config.search.minSimilarity, requestId);
+
+        for (const match of matches) {
+          const row = await ctx.env.DB.prepare(
+            `SELECT * FROM memories WHERE id = ? AND retracted = 0`
+          ).bind(match.id).first<MemoryRow>();
+          if (row) {
+            seedId = match.id;
+            seedRow = row;
+            break;
+          }
+        }
+
+        if (!seedId || !seedRow) {
+          return errorResult('No seed found for query (no non-retracted matches)');
+        }
+      }
+
+      if (!seedId || !seedRow) {
+        return errorResult('Failed to resolve seed');
+      }
+
+      // --------------------------
+      // Phase 1.5: Seed safety eval (using already-fetched seedRow)
+      // --------------------------
+      const unsafeReasons: string[] = [];
+      if (seedRow.state === 'violated') unsafeReasons.push('seed state=violated');
+      // outcome column exists in DB but not in MemoryRow type — SELECT * returns it
+      const seedOutcome = (seedRow as unknown as Record<string, unknown>).outcome as string | null;
+      if (seedRow.state === 'resolved' && seedOutcome === 'incorrect') unsafeReasons.push('seed resolved incorrect');
+      if (parseViolationCount(seedRow.violations) > 0) unsafeReasons.push('seed has recorded violations');
+
+      // --------------------------
+      // Phase 2: BFS growth (graph)
+      // --------------------------
+      const zoneIds: string[] = [seedId];
+      const zoneSet = new Set<string>(zoneIds);
+      const seen = new Set<string>(zoneIds);
+      const semanticMemberIds = new Set<string>();
+      const boundaryReasons = new Map<string, Set<string>>();
+
+      type TraversalEdgeRow = { source_id: string; target_id: string; edge_type: string; strength: number };
+      type ViolatedByEdgeRow = { source_id: string; target_id: string };
+
+      let frontier: string[] = [seedId];
+      for (let depth = 0; depth < maxDepth; depth++) {
+        if (zoneIds.length >= maxSize) break;
+        if (frontier.length === 0) break;
+
+        const frontierSet = new Set(frontier);
+        const ph = makePlaceholders(frontier.length);
+        const edges = await ctx.env.DB.prepare(
+          `SELECT source_id, target_id, edge_type, strength
+           FROM edges
+           WHERE edge_type IN ('derived_from', 'confirmed_by')
+             AND strength >= ?
+             AND (source_id IN (${ph}) OR target_id IN (${ph}))`
+        ).bind(minEdgeStrength, ...frontier, ...frontier).all<TraversalEdgeRow>();
+
+        const candidates: string[] = [];
+        const candidateSet = new Set<string>();
+        for (const e of edges.results ?? []) {
+          if (frontierSet.has(e.source_id) && !seen.has(e.target_id) && !candidateSet.has(e.target_id)) {
+            candidates.push(e.target_id);
+            candidateSet.add(e.target_id);
+          }
+          if (frontierSet.has(e.target_id) && !seen.has(e.source_id) && !candidateSet.has(e.source_id)) {
+            candidates.push(e.source_id);
+            candidateSet.add(e.source_id);
+          }
+        }
+
+        if (candidates.length === 0) {
+          frontier = [];
+          continue;
+        }
+
+        // Mark all as seen to avoid re-processing across depths.
+        for (const id of candidates) seen.add(id);
+
+        const candPh = makePlaceholders(candidates.length);
+        const safetyRows = await ctx.env.DB.prepare(
+          `SELECT id, state, outcome, retracted, violations, times_tested, confirmations FROM memories WHERE id IN (${candPh})`
+        ).bind(...candidates).all<SafetyRow>();
+
+        const safetyById = new Map<string, SafetyRow>();
+        for (const r of safetyRows.results ?? []) safetyById.set(r.id, r);
+
+        const eligible: string[] = [];
+        for (const id of candidates) {
+          const r = safetyById.get(id);
+          if (!r) continue;
+          if (r.retracted) continue;
+
+          if (r.state === 'violated') {
+            addBoundaryReason(boundaryReasons, id, 'excluded: state=violated');
+            continue;
+          }
+          if (r.state === 'resolved' && r.outcome === 'incorrect') {
+            addBoundaryReason(boundaryReasons, id, 'excluded: resolved incorrect');
+            continue;
+          }
+          if (isOverwhelminglyViolated(r)) {
+            const surv = r.times_tested > 0 ? Math.round(r.confirmations / r.times_tested * 100) : 0;
+            addBoundaryReason(boundaryReasons, id, `excluded: survival rate ${surv}% (${r.confirmations}/${r.times_tested})`);
+            continue;
+          }
+          eligible.push(id);
+        }
+
+        // Contradiction gate against current zone
+        const newlyAdded: string[] = [];
+        if (eligible.length > 0 && zoneIds.length < maxSize) {
+          const z = zoneIds;
+          const eligiblePh = makePlaceholders(eligible.length);
+          const zonePh = makePlaceholders(z.length);
+          const candSet2 = new Set<string>(eligible);
+
+          const contradictions = await ctx.env.DB.prepare(
+            `SELECT source_id, target_id
+             FROM edges
+             WHERE edge_type = 'violated_by' AND (
+               (source_id IN (${eligiblePh}) AND target_id IN (${zonePh}))
+               OR (target_id IN (${eligiblePh}) AND source_id IN (${zonePh}))
+             )`
+          ).bind(...eligible, ...z, ...eligible, ...z).all<ViolatedByEdgeRow>();
+
+          const conflicts = new Map<string, Set<string>>();
+          for (const e of contradictions.results ?? []) {
+            if (candSet2.has(e.source_id) && zoneSet.has(e.target_id)) {
+              (conflicts.get(e.source_id) ?? conflicts.set(e.source_id, new Set()).get(e.source_id)!).add(e.target_id);
+            } else if (candSet2.has(e.target_id) && zoneSet.has(e.source_id)) {
+              (conflicts.get(e.target_id) ?? conflicts.set(e.target_id, new Set()).get(e.target_id)!).add(e.source_id);
+            }
+          }
+
+          for (const id of eligible) {
+            if (zoneIds.length >= maxSize) break;
+            const conflictWith = conflicts.get(id);
+            if (conflictWith && conflictWith.size > 0) {
+              for (const zid of conflictWith) {
+                addBoundaryReason(boundaryReasons, id, `contradicts [${zid}] (violated_by)`);
+              }
+              continue;
+            }
+
+            zoneIds.push(id);
+            zoneSet.add(id);
+            newlyAdded.push(id);
+          }
+        }
+
+        frontier = newlyAdded;
+      }
+
+      // --------------------------
+      // Phase 3: Semantic expansion (optional)
+      // --------------------------
+      if (includeSemantic && query && zoneIds.length < 5 && zoneIds.length < maxSize) {
+        const queryEmbedding = await generateEmbedding(ctx.env.AI, query, config, requestId);
+        const matches = await searchSimilar(ctx.env, queryEmbedding, 25, config.search.minSimilarity, requestId);
+
+        const candidates: string[] = [];
+        for (const m of matches) {
+          if (zoneSet.has(m.id) || seen.has(m.id)) continue;
+          candidates.push(m.id);
+        }
+
+        if (candidates.length > 0) {
+          for (const id of candidates) seen.add(id);
+
+          const candPh = makePlaceholders(candidates.length);
+          const safetyRows = await ctx.env.DB.prepare(
+            `SELECT id, state, outcome, retracted, violations, times_tested, confirmations FROM memories WHERE id IN (${candPh})`
+          ).bind(...candidates).all<SafetyRow>();
+
+          const safetyById = new Map<string, SafetyRow>();
+          for (const r of safetyRows.results ?? []) safetyById.set(r.id, r);
+
+          const eligible: string[] = [];
+          for (const id of candidates) {
+            const r = safetyById.get(id);
+            if (!r) continue;
+            if (r.retracted) continue;
+
+            if (r.state === 'violated') {
+              addBoundaryReason(boundaryReasons, id, 'excluded: state=violated');
+              continue;
+            }
+            if (r.state === 'resolved' && r.outcome === 'incorrect') {
+              addBoundaryReason(boundaryReasons, id, 'excluded: resolved incorrect');
+              continue;
+            }
+            if (isOverwhelminglyViolated(r)) {
+              const surv = r.times_tested > 0 ? Math.round(r.confirmations / r.times_tested * 100) : 0;
+              addBoundaryReason(boundaryReasons, id, `excluded: survival rate ${surv}% (${r.confirmations}/${r.times_tested})`);
+              continue;
+            }
+            eligible.push(id);
+          }
+
+          if (eligible.length > 0 && zoneIds.length < maxSize) {
+            const z = zoneIds;
+            const eligiblePh = makePlaceholders(eligible.length);
+            const zonePh = makePlaceholders(z.length);
+            const candSet2 = new Set<string>(eligible);
+
+            const contradictions = await ctx.env.DB.prepare(
+              `SELECT source_id, target_id
+               FROM edges
+               WHERE edge_type = 'violated_by' AND (
+                 (source_id IN (${eligiblePh}) AND target_id IN (${zonePh}))
+                 OR (target_id IN (${eligiblePh}) AND source_id IN (${zonePh}))
+               )`
+            ).bind(...eligible, ...z, ...eligible, ...z).all<ViolatedByEdgeRow>();
+
+            const conflicts = new Map<string, Set<string>>();
+            for (const e of contradictions.results ?? []) {
+              if (candSet2.has(e.source_id) && zoneSet.has(e.target_id)) {
+                (conflicts.get(e.source_id) ?? conflicts.set(e.source_id, new Set()).get(e.source_id)!).add(e.target_id);
+              } else if (candSet2.has(e.target_id) && zoneSet.has(e.source_id)) {
+                (conflicts.get(e.target_id) ?? conflicts.set(e.target_id, new Set()).get(e.target_id)!).add(e.source_id);
+              }
+            }
+
+            for (const id of eligible) {
+              if (zoneIds.length >= maxSize) break;
+              const conflictWith = conflicts.get(id);
+              if (conflictWith && conflictWith.size > 0) {
+                for (const zid of conflictWith) {
+                  addBoundaryReason(boundaryReasons, id, `contradicts [${zid}] (violated_by)`);
+                }
+                continue;
+              }
+
+              zoneIds.push(id);
+              zoneSet.add(id);
+              semanticMemberIds.add(id);
+            }
+          }
+        }
+      }
+
+      // --------------------------
+      // Boundary completion (cut-)
+      // --------------------------
+      const zonePh = makePlaceholders(zoneIds.length);
+      const violatedEdges = await ctx.env.DB.prepare(
+        `SELECT source_id, target_id
+         FROM edges
+         WHERE edge_type = 'violated_by'
+           AND (source_id IN (${zonePh}) OR target_id IN (${zonePh}))`
+      ).bind(...zoneIds, ...zoneIds).all<ViolatedByEdgeRow>();
+
+      const cutMinusEdges: Array<{ source_id: string; target_id: string; edge_type: 'violated_by' }> = [];
+      for (const e of violatedEdges.results ?? []) {
+        const sourceIn = zoneSet.has(e.source_id);
+        const targetIn = zoneSet.has(e.target_id);
+        if (sourceIn && targetIn) continue;
+        if (sourceIn !== targetIn) {
+          cutMinusEdges.push({ source_id: e.source_id, target_id: e.target_id, edge_type: 'violated_by' });
+        }
+
+        const other = sourceIn ? e.target_id : e.source_id;
+        const inZone = sourceIn ? e.source_id : e.target_id;
+        if (!zoneSet.has(other)) {
+          addBoundaryReason(boundaryReasons, other, `contradicts [${inZone}] (violated_by)`);
+        }
+      }
+
+      // --------------------------
+      // External support dependency (loss+)
+      // --------------------------
+      const traversalEdges = await ctx.env.DB.prepare(
+        `SELECT source_id, target_id, edge_type, strength
+         FROM edges
+         WHERE edge_type IN ('derived_from', 'confirmed_by')
+           AND (source_id IN (${zonePh}) OR target_id IN (${zonePh}))`
+      ).bind(...zoneIds, ...zoneIds).all<TraversalEdgeRow>();
+
+      const internalEdges: Array<{ source_id: string; target_id: string; edge_type: string; strength: number }> = [];
+      const lossPlusEdges: Array<{ source_id: string; target_id: string; edge_type: 'derived_from' | 'confirmed_by' }> = [];
+      const internalKey = new Set<string>();
+      for (const e of traversalEdges.results ?? []) {
+        const sourceIn = zoneSet.has(e.source_id);
+        const targetIn = zoneSet.has(e.target_id);
+        if (sourceIn && targetIn) {
+          const key = `${e.source_id}|${e.target_id}|${e.edge_type}`;
+          if (!internalKey.has(key)) {
+            internalKey.add(key);
+            internalEdges.push({ source_id: e.source_id, target_id: e.target_id, edge_type: e.edge_type, strength: e.strength });
+          }
+        } else if (sourceIn !== targetIn) {
+          lossPlusEdges.push({
+            source_id: e.source_id,
+            target_id: e.target_id,
+            edge_type: e.edge_type as 'derived_from' | 'confirmed_by',
+          });
+        }
+      }
+
+      // --------------------------
+      // Fetch full rows for output
+      // --------------------------
+      const boundaryIds = Array.from(boundaryReasons.keys()).filter(id => !zoneSet.has(id));
+      const idsToFetch = Array.from(new Set([...zoneIds, ...boundaryIds]));
+
+      const memById = new Map<string, MemoryRow>();
+      if (idsToFetch.length > 0) {
+        const allPh = makePlaceholders(idsToFetch.length);
+        const rows = await ctx.env.DB.prepare(
+          `SELECT * FROM memories WHERE id IN (${allPh}) AND retracted = 0`
+        ).bind(...idsToFetch).all<MemoryRow>();
+        for (const r of rows.results ?? []) memById.set(r.id, r);
+      }
+
+      const zoneMembers: Memory[] = [];
+      for (const id of zoneIds) {
+        const row = memById.get(id);
+        if (!row) continue;
+        zoneMembers.push(rowToMemory(row));
+      }
+
+      const boundary: Array<{ memory: Memory; reasons: string[] }> = [];
+      for (const [id, reasons] of boundaryReasons.entries()) {
+        if (zoneSet.has(id)) continue;
+        const row = memById.get(id);
+        if (!row) continue; // retracted or missing
+        boundary.push({ memory: rowToMemory(row), reasons: Array.from(reasons) });
+      }
+
+      // --------------------------
+      // Record access events
+      // --------------------------
+      const accessEvents: RecordAccessParams[] = [];
+      let rank = 1;
+      for (const m of zoneMembers) {
+        accessEvents.push({
+          entityId: m.id,
+          entityType: getDisplayType(m),
+          accessType: 'reference' as const,
+          sessionId: ctx.sessionId,
+          requestId,
+          queryText: query,
+          queryParams: { tool: 'zones', seedId, maxDepth, maxSize, includeSemantic: includeSemantic },
+          resultRank: rank++,
+        });
+      }
+      for (const b of boundary) {
+        accessEvents.push({
+          entityId: b.memory.id,
+          entityType: getDisplayType(b.memory),
+          accessType: 'reference' as const,
+          sessionId: ctx.sessionId,
+          requestId,
+          queryText: query,
+          queryParams: { tool: 'zones', seedId, maxDepth, maxSize, includeSemantic: includeSemantic },
+          resultRank: rank++,
+        });
+      }
+      if (accessEvents.length > 0) {
+        await recordAccessBatch(ctx.env.DB, accessEvents);
+      }
+
+      return textResult(formatZone({
+        seedId,
+        query,
+        zoneMembers,
+        semanticMemberIds,
+        internalEdges,
+        boundary,
+        cutMinusEdges,
+        lossPlusEdges,
+        unsafeReasons,
+      }));
     },
   }),
 

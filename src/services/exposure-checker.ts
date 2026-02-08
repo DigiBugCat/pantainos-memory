@@ -970,6 +970,17 @@ async function recordViolation(
       error: err instanceof Error ? err.message : String(err),
     });
   });
+
+  // Decay outgoing support edges (shock update from Nikooroo & Engel)
+  // Core violations decay edges to 50%, peripheral to 75%
+  const damageFactor = violation.damage_level === 'core' ? 0.5 : 0.25;
+  await env.DB
+    .prepare(
+      `UPDATE edges SET strength = strength * (1.0 - ?)
+       WHERE source_id = ? AND edge_type IN ('derived_from', 'confirmed_by')`
+    )
+    .bind(damageFactor, memoryId)
+    .run();
 }
 
 /**
@@ -989,6 +1000,15 @@ async function recordConfirmation(
     `
     )
     .bind(Date.now(), memoryId)
+    .run();
+
+  // Recover outgoing support edges toward 1.0 (10% per confirmation, capped)
+  await db
+    .prepare(
+      `UPDATE edges SET strength = MIN(1.0, strength * 1.1)
+       WHERE source_id = ? AND edge_type IN ('derived_from', 'confirmed_by')`
+    )
+    .bind(memoryId)
     .run();
 }
 
@@ -1075,6 +1095,15 @@ export async function manualConfirm(
     .bind(Date.now(), memoryId)
     .run();
 
+  // Recover outgoing support edges toward 1.0
+  await db
+    .prepare(
+      `UPDATE edges SET strength = MIN(1.0, strength * 1.1)
+       WHERE source_id = ? AND edge_type IN ('derived_from', 'confirmed_by')`
+    )
+    .bind(memoryId)
+    .run();
+
   // Create edge if observation provided
   if (observationId) {
     await createEdge(db, observationId, memoryId, 'confirmed_by');
@@ -1159,6 +1188,16 @@ export async function manualViolate(
       error: err instanceof Error ? err.message : String(err),
     });
   });
+
+  // Decay outgoing support edges (shock update)
+  const damageFactor = damageLevel === 'core' ? 0.5 : 0.25;
+  await env.DB
+    .prepare(
+      `UPDATE edges SET strength = strength * (1.0 - ?)
+       WHERE source_id = ? AND edge_type IN ('derived_from', 'confirmed_by')`
+    )
+    .bind(damageFactor, memoryId)
+    .run();
 
   // Create edge if observation provided
   if (observationId) {
