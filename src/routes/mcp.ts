@@ -258,6 +258,13 @@ Exactly one of "source" OR "derived_from" required (mutually exclusive).
 
 Both modes support invalidates_if/confirms_if conditions.
 For predictions: add resolves_by (date string or timestamp) + outcome_condition.`,
+    annotations: {
+      title: 'Record Memory',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -270,6 +277,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         resolves_by: { type: 'string', description: 'Deadline as date string (e.g. "2026-03-15") or Unix timestamp' },
         outcome_condition: { type: 'string', description: 'Success/failure criteria (required if resolves_by set)' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for categorization' },
+        obsidian_sources: { type: 'array', items: { type: 'string' }, description: 'Obsidian vault file paths that reference this memory' },
       },
       required: ['content'],
     },
@@ -284,6 +292,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         resolves_by: rawResolvesBy,
         outcome_condition,
         tags,
+        obsidian_sources,
       } = args as {
         content: string;
         source?: string;
@@ -294,6 +303,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         resolves_by?: number | string;
         outcome_condition?: string;
         tags?: string[];
+        obsidian_sources?: string[];
       };
 
       // Parse resolves_by: accepts date strings ("2026-03-15") or Unix timestamps
@@ -407,8 +417,8 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
           outcome_condition, resolves_by,
           starting_confidence, confirmations, times_tested, contradictions,
           centrality, state, violations,
-          retracted, tags, session_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'active', '[]', 0, ?, ?, ?)`
+          retracted, tags, obsidian_sources, session_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'active', '[]', 0, ?, ?, ?, ?)`
       ).bind(
         id,
         content,
@@ -421,6 +431,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         resolves_by || null,
         startingConfidence,
         tags ? JSON.stringify(tags) : null,
+        obsidian_sources ? JSON.stringify(obsidian_sources) : null,
         sessionId || null,
         now
       ).run();
@@ -455,6 +466,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
           outcome_condition,
           resolves_by,
           tags,
+          obsidian_sources,
           starting_confidence: startingConfidence,
           confirmations: 0,
           times_tested: 0,
@@ -539,6 +551,13 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
   defineTool({
     name: 'update',
     description: 'Update a memory (within 1 hour or same session). Can modify content, source, derived_from, and all metadata fields. Arrays (invalidates_if, confirms_if, assumes, tags) are merged with existing values.',
+    annotations: {
+      title: 'Update Memory',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -552,6 +571,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         resolves_by: { type: 'string', description: 'Deadline as date string (e.g. "2026-03-15") or Unix timestamp' },
         outcome_condition: { type: 'string', description: 'Success/failure criteria (required if resolves_by set)' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Tags to ADD (not replace)' },
+        obsidian_sources: { type: 'array', items: { type: 'string' }, description: 'Obsidian vault file paths to ADD (not replace)' },
       },
       required: ['memory_id'],
     },
@@ -568,6 +588,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         resolves_by: rawResolvesBy2,
         outcome_condition,
         tags,
+        obsidian_sources,
       } = args as {
         memory_id?: string;
         id?: string;
@@ -580,6 +601,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         resolves_by?: number | string;
         outcome_condition?: string;
         tags?: string[];
+        obsidian_sources?: string[];
       };
 
       const memory_id = rawMemoryId || rawId;
@@ -603,13 +625,19 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       }
 
       // Check time window: same session OR created within 1 hour
+      // Exception: metadata-only updates (tags, obsidian_sources) bypass the time window
+      const isMetadataOnly = !newContent && newSource === undefined && newDerivedFrom === undefined
+        && !invalidates_if && !confirms_if && !assumes
+        && rawResolvesBy2 === undefined && outcome_condition === undefined
+        && (!!tags || !!obsidian_sources);
+
       const ONE_HOUR_MS = 60 * 60 * 1000;
       const now = Date.now();
       const isSameSession = ctx.sessionId && row.session_id === ctx.sessionId;
       const isWithinTimeWindow = (now - row.created_at) < ONE_HOUR_MS;
 
-      if (!isSameSession && !isWithinTimeWindow) {
-        return errorResult(`Memory [${memory_id}] is too old to update (created ${Math.round((now - row.created_at) / 1000 / 60)} minutes ago). Only memories created within 1 hour or in the same session can be updated.`);
+      if (!isMetadataOnly && !isSameSession && !isWithinTimeWindow) {
+        return errorResult(`Memory [${memory_id}] is too old to update (created ${Math.round((now - row.created_at) / 1000 / 60)} minutes ago). Only memories created within 1 hour or in the same session can be updated. Metadata-only updates (tags, obsidian_sources) are exempt.`);
       }
 
       // Determine current memory type
@@ -665,6 +693,10 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       const newAssumes = assumes ? [...existingAssumes, ...assumes] : existingAssumes;
       const newTags = tags ? [...new Set([...existingTags, ...tags])] : existingTags;
 
+      // Merge obsidian_sources (ADD, deduplicated)
+      const existingObsidianSources: string[] = row.obsidian_sources ? JSON.parse(row.obsidian_sources) : [];
+      const newObsidianSources = obsidian_sources ? [...new Set([...existingObsidianSources, ...obsidian_sources])] : existingObsidianSources;
+
       // Handle resolves_by and outcome_condition - allow overwriting
       const newResolvesBy = resolves_by !== undefined ? resolves_by : row.resolves_by;
       const newOutcomeCondition = outcome_condition !== undefined ? outcome_condition : row.outcome_condition;
@@ -706,6 +738,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
           resolves_by = ?,
           outcome_condition = ?,
           tags = ?,
+          obsidian_sources = ?,
           updated_at = ?
         WHERE id = ?`
       ).bind(
@@ -718,6 +751,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         newResolvesBy || null,
         newOutcomeCondition || null,
         newTags.length > 0 ? JSON.stringify(newTags) : null,
+        newObsidianSources.length > 0 ? JSON.stringify(newObsidianSources) : null,
         now,
         memory_id
       ).run();
@@ -842,6 +876,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
           outcome_condition: newOutcomeCondition || undefined,
           resolves_by: newResolvesBy || undefined,
           tags: newTags.length > 0 ? newTags : undefined,
+          obsidian_sources: newObsidianSources.length > 0 ? newObsidianSources : undefined,
         },
         sessionId: ctx.sessionId,
         requestId,
@@ -856,6 +891,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       if (addedConfirmsIf.length > 0) changes.push(`+${addedConfirmsIf.length} confirms_if`);
       if (assumes && assumes.length > 0) changes.push(`+${assumes.length} assumes`);
       if (tags && tags.length > 0) changes.push(`+${tags.length} tags`);
+      if (obsidian_sources && obsidian_sources.length > 0) changes.push(`+${obsidian_sources.length} obsidian_sources`);
       if (resolves_by !== undefined) changes.push('resolves_by updated');
       if (outcome_condition !== undefined) changes.push('outcome_condition updated');
 
@@ -866,6 +902,11 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
   defineTool({
     name: 'find',
     description: 'Search memories by meaning. Results ranked by: similarity (semantic match), confidence (survival rate under testing), and centrality (how many thoughts derive from this). Use to find related observations before forming thoughts, or to check if a thought already exists.',
+    annotations: {
+      title: 'Search Memories',
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -953,6 +994,11 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
   defineTool({
     name: 'recall',
     description: 'Get a memory by ID. Returns the content, confidence stats (times_tested, confirmations), state (active/violated/confirmed), and derivation edges. Use to inspect a specific memory before building on it.',
+    annotations: {
+      title: 'Get Memory',
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -988,6 +1034,11 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
   defineTool({
     name: 'stats',
     description: 'Get memory statistics (counts by type, robustness distribution, etc.).',
+    annotations: {
+      title: 'Memory Statistics',
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {},
@@ -1024,6 +1075,11 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
   defineTool({
     name: 'pending',
     description: 'List time-bound predictions past their resolves_by deadline awaiting resolution. These need human review to mark as confirmed or violated.',
+    annotations: {
+      title: 'Pending Predictions',
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -1069,6 +1125,11 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
   defineTool({
     name: 'insights',
     description: 'Analyze knowledge graph health. Views: hubs (most-connected memories), orphans (unconnected - no derivation links), untested (low times_tested - dangerous if confident), failing (have violations from contradicting observations), recent (latest memories).',
+    annotations: {
+      title: 'Graph Insights',
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -1163,6 +1224,11 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
   defineTool({
     name: 'reference',
     description: 'Follow the derivation graph from a memory. Returns memories connected by derivation edges - what this memory derives from (ancestors via direction=up) or what derives from it (descendants via direction=down). Use to trace reasoning chains and understand thought dependencies.',
+    annotations: {
+      title: 'Follow Derivation Graph',
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -1318,6 +1384,11 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
   defineTool({
     name: 'roots',
     description: 'Trace a thought back to its root observations. Walks the derivation chain to find the original facts this belief is based on. Use to audit reasoning - every thought should trace back to reality.',
+    annotations: {
+      title: 'Trace Root Observations',
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -1420,6 +1491,11 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
   defineTool({
     name: 'between',
     description: 'Find memories that bridge two given memories. Discovers conceptual connections you might not have noticed. Use when you have two related thoughts and want to understand what links them.',
+    annotations: {
+      title: 'Find Bridges',
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -1522,6 +1598,13 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
   defineTool({
     name: 'refresh_stats',
     description: 'Manually trigger system statistics recomputation. Updates max_times_tested, median_times_tested, and per-source learned_confidence values. Normally runs daily via cron, use this to force an immediate refresh.',
+    annotations: {
+      title: 'Refresh Statistics',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -1579,6 +1662,13 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
   defineTool({
     name: 'resolve',
     description: 'Resolve a thought or prediction as correct, incorrect, or voided. Sets state to "resolved" with the given outcome, cleans up condition vectors, triggers cascade propagation to related memories, and records an audit trail. Only works on thoughts/predictions (not observations). Use when a prediction deadline has passed, or when you have enough evidence to judge a thought.',
+    annotations: {
+      title: 'Resolve Thought/Prediction',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -1665,6 +1755,11 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
   defineTool({
     name: 'session_recap',
     description: 'Summarize memories accessed in the current session. Pulls recently accessed memories, sends them to an LLM for thematic summarization, and returns a narrative recap with memory IDs. Use raw mode to skip LLM summarization.',
+    annotations: {
+      title: 'Session Recap',
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object',
       properties: {

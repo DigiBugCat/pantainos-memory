@@ -129,6 +129,7 @@ export interface Memory {
 
   // Metadata
   tags?: string[];
+  obsidian_sources?: string[];
   session_id?: string;
   created_at: number;
   updated_at?: number;
@@ -165,6 +166,7 @@ export interface MemoryRow {
   last_cascade_at: number | null;
   // Metadata
   tags: string | null;
+  obsidian_sources: string | null;
   session_id: string | null;
   created_at: number;
   updated_at: number | null;

@@ -1,22 +1,36 @@
 # Pantainos Memory
 
-Zettelkasten-style knowledge graph for AI agents. Cloudflare Worker with D1, Vectorize, and Workers AI.
+Zettelkasten-style knowledge graph for AI agents. Cloudflare Workers with D1, Vectorize, and Workers AI.
 
 ## Architecture
 
+Three workers share the same D1 database and Vectorize indexes:
+
 ```
-┌─────────────────────────────────────────────────────────┐
-│                   Cloudflare Worker                      │
-│                                                          │
-│  POST /         - MCP Streamable HTTP (OAuth protected) │
-│  /mcp           - MCP JSON-RPC endpoint                 │
-│  /api/*         - REST API                              │
-│  /internal/*    - Service binding API                   │
-│  /authorize     - OAuth authorization                   │
-│  /token         - OAuth token exchange                  │
-│                                                          │
-│  Queue Consumer → Exposure Check Workflow               │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  pantainos-memory (API Worker)                                    │
+│                                                                    │
+│  GET  /              - Discovery / info                           │
+│  POST /              - MCP Streamable HTTP (OAuth protected)      │
+│  POST /mcp           - MCP JSON-RPC endpoint                     │
+│  /api/*              - REST API (flow, query, tags, graph, etc.) │
+│  /internal/*         - Service binding API (no auth)             │
+│  /authorize, /token  - OAuth 2.0 endpoints                       │
+│                                                                    │
+│  Cron: * * * * *     - Dispatch events for inactive sessions     │
+│  Cron: 0 3 * * *     - Compute stats, find overdue predictions   │
+│  Queue Consumer      - Exposure check processing                  │
+├──────────────────────────────────────────────────────────────────┤
+│  pantainos-memory-mcp (MCP Worker)                                │
+│                                                                    │
+│  Same MCP tools, standalone worker for direct MCP client access  │
+│  OAuth + CF Access service token auth                             │
+├──────────────────────────────────────────────────────────────────┤
+│  pantainos-memory-admin (Admin Worker)                            │
+│                                                                    │
+│  Admin-only MCP tools for maintenance and diagnostics            │
+│  OAuth only (no service token fallback)                           │
+└──────────────────────────────────────────────────────────────────┘
          │              │                │                │
          ▼              ▼                ▼                ▼
     ┌────────┐    ┌──────────┐    ┌───────────┐    ┌───────────┐
@@ -32,15 +46,18 @@ Zettelkasten-style knowledge graph for AI agents. Cloudflare Worker with D1, Vec
 
 ## Concepts
 
-**Two memory primitives:**
-- **Observations** (`obs`): Facts from reality (market data, news, user input)
-- **Assumptions**: Derived beliefs that can be tested against future observations
+**Two memory primitives (determined by field presence, no type column):**
+- **Observations**: Facts from reality. Has `source` field (market, news, earnings, email, human, tool).
+- **Thoughts**: Derived beliefs. Has `derived_from` field (array of source memory IDs).
+  - A thought with `resolves_by` set becomes a **Prediction** (time-bound, enters pending queue at deadline).
 
-**Exposure checking:** When new observations arrive, the system checks if they violate or confirm existing assumptions using semantic similarity + LLM judge.
+**Exposure checking:** When new memories arrive, the system queues an exposure check. Observations are tested against existing thought conditions; thoughts are tested against existing observations. Semantic similarity + LLM judge determine violations and confirmations.
+
+**Confidence model:** Memories are weighted bets, not facts. `starting_confidence` is set by source type or memory kind. `times_tested` and `confirmations` track survival rate. Daily cron recomputes system-wide stats and per-source track records.
 
 ## Authentication
 
-MCP OAuth 2.0 backed by Cloudflare Access. Configure these environment variables:
+MCP OAuth 2.0 backed by Cloudflare Access (via `@pantainos/mcp-core`).
 
 | Variable | Description |
 |----------|-------------|
@@ -48,132 +65,169 @@ MCP OAuth 2.0 backed by Cloudflare Access. Configure these environment variables
 | `CF_ACCESS_AUD` | Application Audience (AUD) tag from Access |
 | `ISSUER_URL` | (Optional) Override OAuth issuer URL |
 
-OAuth endpoints:
-- `/.well-known/oauth-authorization-server` - Authorization server metadata
-- `/.well-known/oauth-protected-resource` - Protected resource metadata
-- `/register` - Dynamic client registration
+OAuth endpoints (on all three workers):
+- `/.well-known/oauth-authorization-server` - Authorization server metadata (RFC 8414)
+- `/.well-known/oauth-protected-resource` - Protected resource metadata (RFC 9728)
+- `/register` - Dynamic client registration (RFC 7591)
 - `/authorize` - Authorization endpoint
 - `/token` - Token endpoint
 
 ## Development
 
 ```bash
-# Install dependencies
-pnpm install
-
-# Create dev environment (D1, Vectorize, Queue, KV)
-pnpm dev:up
-
-# Run locally (connects to remote dev resources)
-pnpm dev
-
-# Tear down dev environment
-pnpm dev:down
+pnpm install      # Install dependencies
+pnpm dev          # Run locally (connects to remote dev resources)
+pnpm build        # Build all three worker bundles to dist/
+pnpm test         # Run tests
+pnpm typecheck    # TypeScript type checking
 ```
 
 ## Deployment
 
-```bash
-# Deploy to dev
-pnpm deploy:dev
+Production is managed via OpenTofu (Terraform). See `infra/` and `CLAUDE.md` for details.
 
-# Deploy to production
-pnpm deploy
+```bash
+pnpm build                                    # Build dist/index.js, dist/mcp-index.js, dist/admin-index.js
+cd infra && tofu apply -var="environment=prod" # Deploy all workers
 ```
 
-## API Endpoints
+For dev deploys via wrangler:
 
-### MCP (Model Context Protocol)
+```bash
+pnpm deploy:dev   # Deploy API worker to dev
+```
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/` | MCP Streamable HTTP transport (OAuth protected) |
-| POST | `/mcp` | MCP JSON-RPC endpoint |
+## MCP Tools
 
-**MCP Tools exposed:**
+### Memory Tools (API + MCP workers)
 
 | Tool | Description |
 |------|-------------|
-| `observe` | Record a fact from reality (immutable observation) |
-| `assume` | Form a derived belief from observations/assumptions |
-| `find` | Semantic search across memories |
-| `recall` | Get a memory by ID with confidence stats |
-| `reference` | Follow derivation graph (ancestors/descendants) |
-| `roots` | Trace assumption back to root observations |
-| `between` | Find memories bridging two given memories |
-| `pending` | List time-bound assumptions past deadline |
-| `insights` | Analyze knowledge graph health |
-| `stats` | Get memory counts |
+| `observe` | Record a memory. Set `source` for observations, `derived_from` for thoughts. Unified creation endpoint. |
+| `update` | Update a memory (within 1 hour or same session). Arrays are merged, not replaced. |
+| `find` | Semantic search across memories. Ranked by similarity, confidence, and centrality. |
+| `recall` | Get a memory by ID with confidence stats, state, and derivation edges. |
+| `reference` | Follow the derivation graph (ancestors via up, descendants via down). |
+| `roots` | Trace a thought back to its root observations. |
+| `between` | Find memories that bridge two given memories (conceptual connections). |
+| `pending` | List time-bound predictions awaiting resolution. Supports `overdue` filter. |
+| `insights` | Analyze graph health. Views: `hubs`, `orphans`, `untested`, `failing`, `recent`. |
+| `stats` | Memory statistics (counts by type, edge count). |
+| `refresh_stats` | Manually trigger system stats recomputation (normally runs daily via cron). |
+| `resolve` | Resolve a thought/prediction as correct, incorrect, or voided. Triggers cascade propagation. |
+| `session_recap` | Summarize memories accessed in the current session via LLM. |
 
-**Not exposed via MCP** (by design - resolution happens elsewhere):
-- `violate`/`confirm`/`retract` - Manual state changes
+### Admin Tools (Admin worker only)
 
-### Internal API (for service bindings)
+| Tool | Description |
+|------|-------------|
+| `queue_status` | View event queue state: pending counts, stuck sessions, type distribution. |
+| `queue_purge` | Delete stale or dispatched events. Dry-run by default. |
+| `memory_state` | Override a memory's state (active, confirmed, violated, resolved). |
+| `condition_vectors_cleanup` | Delete stale condition vectors from Vectorize for non-active memories. |
+| `system_diagnostics` | Full system health: state distribution, exposure status, graph metrics, queue health. |
+| `force_dispatch` | View pending events for a specific session. |
+| `graph_health` | Find graph anomalies: orphan edges, broken derivations, duplicate edges. |
+| `bulk_retract` | Retract a memory and optionally cascade to all derived descendants. |
+
+### REST API Write Path (`/api/...`)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/internal/observe` | Record an observation |
-| POST | `/internal/assume` | Create a testable assumption |
-| POST | `/internal/find` | Semantic search across memories |
+| POST | `/api/observe` | Create a memory (observation or thought) |
+| POST | `/api/confirm/:id` | Manually confirm a memory |
+| POST | `/api/violate/:id` | Manually violate a memory |
+| POST | `/api/retract/:id` | Retract a memory |
+| POST | `/api/cascade/events` | View cascade events |
+| POST | `/api/cascade/apply` | Apply cascade effects |
+
+### REST API Read Path (`/api/...`)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/find` | Semantic search |
+| GET | `/api/recall/:id` | Get memory by ID |
+| GET | `/api/reference/:id` | Graph traversal |
+| GET | `/api/between` | Find bridging memories |
+| GET | `/api/pending` | Overdue predictions |
+| GET | `/api/insights/:view` | Analytical views |
+| GET | `/api/knowledge` | Topic depth assessment |
+| GET | `/api/brittle` | Low-exposure thoughts |
+| GET | `/api/graveyard` | Retracted/violated memories |
+| GET | `/api/collisions` | Duplicate detection |
+| GET | `/api/roots/:id` | Root observations |
+| GET | `/api/stats` | Memory statistics |
+| GET | `/api/history/:id` | Version history |
+| GET | `/api/access-log/:id` | Access audit trail |
+| GET | `/api/tags` | Tag management |
+| GET | `/api/graph` | Graph operations |
+| GET | `/api/config` | Current configuration |
+| GET | `/api/events/pending` | Pending event queue status |
+
+### REST API System
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/` | Discovery/info endpoint |
+| GET | `/health` | Health check with D1 + Vectorize status |
+
+### Internal API (service bindings, no auth)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/internal/observe` | Create a memory (observation or thought) |
+| POST | `/internal/find` | Semantic search |
 | POST | `/internal/recall` | Get memory by ID |
 | GET | `/internal/stats` | Memory statistics |
-
-### REST API
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/health` | Health check with dependency status |
-| GET | `/api/stats` | Memory statistics |
-| GET | `/api/config` | Current configuration |
 
 ## Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `REASONING_MODEL` | LLM for judge decisions | `@cf/openai/gpt-oss-120b` |
+| `DEDUP_MODEL` | LLM for duplicate detection | `@cf/openai/gpt-oss-20b` |
+| `DEDUP_THRESHOLD` | Vector similarity threshold for auto-dedup | `0.85` |
+| `DEDUP_LOWER_THRESHOLD` | Threshold to trigger LLM dedup check | `0.55` |
+| `DEDUP_CONFIDENCE_THRESHOLD` | LLM confidence to reject as duplicate | `0.8` |
 | `MIN_SIMILARITY` | Vector search threshold | `0.35` |
 | `VIOLATION_CONFIDENCE_THRESHOLD` | LLM confidence for violations | `0.6` |
 | `CONFIRM_CONFIDENCE_THRESHOLD` | LLM confidence for confirmations | `0.7` |
+| `CLASSIFICATION_CHALLENGE_ENABLED` | Enable memory completeness checks | `true` |
 | `CF_ACCESS_TEAM` | Cloudflare Access team name | - |
 | `CF_ACCESS_AUD` | Access application AUD tag | - |
 
-### External LLM Endpoint (Optional)
+### External LLM Endpoint
 
-By default, LLM judge calls (deduplication, exposure checking) use Cloudflare Workers AI. You can route these to any OpenAI-compatible endpoint instead:
+LLM judge calls use a `CLAUDE_PROXY` service binding by default (worker-to-worker). Alternatively, configure an external endpoint:
 
 | Variable | Description |
 |----------|-------------|
 | `LLM_JUDGE_URL` | OpenAI-compatible chat completions endpoint |
 | `LLM_JUDGE_API_KEY` | Bearer token for authentication (optional) |
 
-**Example configurations:**
+### Event Dispatch
 
-```bash
-# OpenRouter
-LLM_JUDGE_URL=https://openrouter.ai/api/v1/chat/completions
-LLM_JUDGE_API_KEY=sk-or-...
+| Variable | Description |
+|----------|-------------|
+| `RESOLVER_TYPE` | `'none'` (default), `'github'`, or `'webhook'` |
+| `RESOLVER_GITHUB_REPO` | GitHub repo for issue-based dispatch (e.g., `org/repo`) |
+| `RESOLVER_GITHUB_TOKEN` | GitHub token with issue creation permissions |
+| `RESOLVER_WEBHOOK_URL` | Where to POST event batches (if webhook type) |
+| `RESOLVER_WEBHOOK_TOKEN` | Bearer token for webhook auth (optional) |
 
-# n8n workflow (custom routing/logging)
-LLM_JUDGE_URL=https://your-n8n.example.com/webhook/llm-judge
+## Event Dispatch & Resolution
 
-# Local Ollama
-LLM_JUDGE_URL=http://localhost:11434/v1/chat/completions
+Events (violations, confirmations, cascades, overdue predictions) accumulate in the `memory_events` table, grouped by session.
 
-# Azure OpenAI
-LLM_JUDGE_URL=https://your-resource.openai.azure.com/openai/deployments/gpt-4/chat/completions?api-version=2024-02-01
-LLM_JUDGE_API_KEY=your-azure-key
-```
+**Built-in cron triggers handle dispatch automatically:**
 
-The endpoint receives standard OpenAI chat format:
-```json
-{
-  "model": "default",
-  "messages": [{ "role": "user", "content": "..." }],
-  "temperature": 0.1
-}
-```
+- **Every minute** (`* * * * *`): Finds sessions inactive for 30s, claims their pending events, and dispatches them.
+- **Daily at 3 AM UTC** (`0 3 * * *`): Recomputes system stats, finds overdue predictions, and queues `thought:pending_resolution` events.
 
-Response must include `choices[0].message.content` or one of: `content`, `response`, `result`.
+**Dispatch strategy (GitHub Issues resolver):**
+- Violations, confirmations, and cascades are batched together into a single GitHub issue per session.
+- Each overdue prediction gets its own GitHub issue for parallel resolution.
+- A `memory-resolver` label is applied; GitHub Actions (`memory-resolver.yml`) picks up labeled issues and runs Claude Code to resolve them.
 
 ## Resources
 
@@ -184,30 +238,5 @@ Each environment creates:
   - `pantainos-memory-{env}-vectors` - Memory embeddings
   - `pantainos-memory-{env}-invalidates` - Invalidation conditions
   - `pantainos-memory-{env}-confirms` - Confirmation conditions
-- **Queue**: `pantainos-memory-{env}-detection`
-
-## Event Dispatch
-
-Events (violations, confirmations, cascades) accumulate in the `memory_events` table.
-To dispatch them to your resolver, you need an external scheduler to periodically:
-
-1. Query `/api/events/pending` to check for accumulated events
-2. Call the dispatch endpoint or trigger processing
-
-### Recommended: n8n Workflow
-
-Create an n8n workflow with:
-- **Schedule Trigger**: Every 1-5 minutes
-- **HTTP Request**: GET `https://memory-dev.pantainos.workers.dev/api/events/pending`
-- **IF Node**: Check if `pending > 0`
-- **HTTP Request**: POST to your resolver webhook with the batch
-
-Alternatively use: Temporal, cron jobs, AWS EventBridge, or any scheduler.
-
-### Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `RESOLVER_TYPE` | `'none'` (default) or `'webhook'` |
-| `RESOLVER_WEBHOOK_URL` | Where to POST event batches |
-| `RESOLVER_WEBHOOK_TOKEN` | Bearer token for auth (optional) |
+- **Queue**: `pantainos-memory-{env}-detection` (exposure check jobs)
+- **Analytics Engine**: `memory_{worker}_{env}` (per-worker analytics)

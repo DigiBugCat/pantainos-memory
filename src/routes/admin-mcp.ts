@@ -68,6 +68,11 @@ const createAdminTools = () => createToolRegistry<Env>([
   defineTool({
     name: 'queue_status',
     description: 'View event queue state: pending counts by session, event type distribution, stuck sessions, dispatched history.',
+    annotations: {
+      title: 'Queue Status',
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -192,6 +197,12 @@ const createAdminTools = () => createToolRegistry<Env>([
   defineTool({
     name: 'queue_purge',
     description: 'Delete stale or dispatched events from the queue. Modes: dispatched_only (safe cleanup), session (clear specific session), all_pending (nuclear). Dry-run by default.',
+    annotations: {
+      title: 'Purge Queue Events',
+      readOnlyHint: false,
+      destructiveHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -272,6 +283,12 @@ const createAdminTools = () => createToolRegistry<Env>([
   defineTool({
     name: 'memory_state',
     description: 'Manually set a memory\'s state (active, confirmed, violated, resolved). Useful for fixing stuck memories or overriding incorrect auto-resolution. Triggers cascade propagation when appropriate.',
+    annotations: {
+      title: 'Override Memory State',
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -360,6 +377,12 @@ const createAdminTools = () => createToolRegistry<Env>([
   defineTool({
     name: 'condition_vectors_cleanup',
     description: 'Delete condition vectors (invalidates_if, confirms_if) from Vectorize for memories that are no longer active (violated, resolved, retracted). Prevents stale conditions from triggering future exposure checks.',
+    annotations: {
+      title: 'Cleanup Condition Vectors',
+      readOnlyHint: false,
+      destructiveHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -444,6 +467,11 @@ const createAdminTools = () => createToolRegistry<Env>([
   defineTool({
     name: 'system_diagnostics',
     description: 'System health overview: memory state distribution, exposure check status, event queue health, system stats, edge counts, and graph metrics.',
+    annotations: {
+      title: 'System Diagnostics',
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -603,6 +631,11 @@ const createAdminTools = () => createToolRegistry<Env>([
   defineTool({
     name: 'force_dispatch',
     description: 'View pending events for a session. Shows what would be dispatched if the inactivity timer triggers.',
+    annotations: {
+      title: 'View Session Events',
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -660,6 +693,11 @@ const createAdminTools = () => createToolRegistry<Env>([
   defineTool({
     name: 'graph_health',
     description: 'Find graph anomalies: orphan edges (pointing to deleted memories), duplicate edges, memories with broken derived_from references.',
+    annotations: {
+      title: 'Graph Health Check',
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -754,6 +792,12 @@ const createAdminTools = () => createToolRegistry<Env>([
   defineTool({
     name: 'bulk_retract',
     description: 'Retract a memory and optionally cascade retraction to all derived descendants. Removes condition vectors and marks as retracted.',
+    annotations: {
+      title: 'Bulk Retract',
+      readOnlyHint: false,
+      destructiveHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: 'object' as const,
       properties: {

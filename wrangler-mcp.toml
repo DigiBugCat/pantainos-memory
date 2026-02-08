@@ -51,6 +51,11 @@ id = "44a53cd6bcbd4aadae45c51d1769b204"
 binding = "ANALYTICS"
 dataset = "memory_mcp_prod"
 
+# Detection Queue (producer only - queue consumed by API worker)
+[[queues.producers]]
+queue = "pantainos-memory-detection"
+binding = "DETECTION_QUEUE"
+
 # Service Binding to claude-proxy (worker-to-worker, bypasses CF Access)
 [[services]]
 binding = "CLAUDE_PROXY"
@@ -76,6 +81,10 @@ name = "pantainos-memory-mcp-dev"
 
 [env.dev.ai]
 binding = "AI"
+
+[[env.dev.queues.producers]]
+queue = "pantainos-memory-dev-detection"
+binding = "DETECTION_QUEUE"
 
 [[env.dev.services]]
 binding = "CLAUDE_PROXY"

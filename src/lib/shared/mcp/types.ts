@@ -92,6 +92,23 @@ export interface ToolPropertySchema {
 }
 
 /**
+ * Tool annotations providing hints about tool behavior.
+ * Per MCP spec: these are hints, not guarantees.
+ */
+export interface ToolAnnotations {
+  /** Human-readable title for the tool */
+  title?: string;
+  /** If true, the tool does not modify its environment (default: false) */
+  readOnlyHint?: boolean;
+  /** If true, the tool may perform destructive updates (default: true, only meaningful when readOnlyHint is false) */
+  destructiveHint?: boolean;
+  /** If true, repeated calls with same args have no additional effect (default: false, only meaningful when readOnlyHint is false) */
+  idempotentHint?: boolean;
+  /** If true, tool interacts with external entities (default: true) */
+  openWorldHint?: boolean;
+}
+
+/**
  * Tool definition exposed to MCP clients.
  * Does not include the handler function.
  */
@@ -99,6 +116,7 @@ export interface McpToolDefinition {
   name: string;
   description: string;
   inputSchema: ToolInputSchema;
+  annotations?: ToolAnnotations;
 }
 
 /**
@@ -163,6 +181,7 @@ export interface Tool<TArgs = Record<string, unknown>, TEnv = unknown> {
   name: string;
   description: string;
   inputSchema: ToolInputSchema;
+  annotations?: ToolAnnotations;
   handler: ToolHandler<TArgs, TEnv>;
 }
 

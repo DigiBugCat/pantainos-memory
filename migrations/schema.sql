@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS memories (
 
   -- Metadata
   tags TEXT,
+  obsidian_sources TEXT,
   session_id TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER

@@ -16,6 +16,7 @@ export type {
   McpCapabilities,
   McpInitializeResult,
   // Tools
+  ToolAnnotations,
   ToolInputSchema,
   ToolPropertySchema,
   McpToolDefinition,

@@ -13,6 +13,7 @@ import type {
   ToolContext,
   ToolHandler,
   ToolInputSchema,
+  ToolAnnotations,
   TextContent,
 } from './types.js';
 
@@ -53,6 +54,7 @@ export class ToolRegistry<TEnv = unknown> {
       name: tool.name,
       description: tool.description,
       inputSchema: tool.inputSchema,
+      ...(tool.annotations ? { annotations: tool.annotations } : {}),
     }));
   }
 
@@ -165,6 +167,7 @@ export function defineTool<TArgs extends Record<string, unknown>, TEnv = unknown
     name: string;
     description: string;
     inputSchema: ToolInputSchema;
+    annotations?: ToolAnnotations;
     handler: ToolHandler<TArgs, TEnv>;
   }
 ): Tool<TArgs, TEnv> {
