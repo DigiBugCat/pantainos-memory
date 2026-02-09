@@ -16,13 +16,12 @@ export type SignificantEventType =
   | 'violation'
   | 'thought_confirmed'
   | 'thought_resolved'
+  // Overdue prediction resolution (the only event type the resolver still processes)
+  | 'thought:pending_resolution'
+  // Legacy event types (kept for DB backward compat — no longer queued)
   | 'thought:cascade_review'
-  // Upward propagation events (informational, not action-oriented)
   | 'thought:evidence_validated'
   | 'thought:evidence_invalidated'
-  // Overdue prediction resolution
-  | 'thought:pending_resolution'
-  // Legacy event types (for migration compatibility)
   | 'prediction_confirmed'
   | 'prediction_resolved'
   | 'assumption_confirmed'

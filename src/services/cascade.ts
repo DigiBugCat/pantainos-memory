@@ -3,16 +3,20 @@
  *
  * When a prediction/inference resolves, this service:
  * 1. Traverses the graph to find related memories
- * 2. Flags them for review (doesn't auto-modify)
- * 3. Queues events for agentic dispatch
+ * 2. Determines cascade effects
+ * 3. Applies automatic confidence propagation (Phase B):
+ *    - incorrect → applyShock() on connected memories
+ *    - correct → edge recovery on connected support edges
+ *    - void → no propagation
  *
- * Philosophy: Mark for review, don't auto-cascade.
- * Let the agent/human make the final judgment on related memories.
+ * Philosophy (post Phase B): Propagate automatically, don't queue for review.
+ * Shock propagation + daily batch convergence handle downstream effects.
+ * Only overdue predictions still go through the resolver (task scheduler).
  */
 
 import type { Env } from '../types/index.js';
 import { createStandaloneLogger } from '../lib/shared/logging/index.js';
-import { queueSignificantEvent, type SignificantEventType } from './event-queue.js';
+import { applyShock } from './shock-propagation.js';
 
 // Lazy logger - avoids crypto in global scope
 let _log: ReturnType<typeof createStandaloneLogger> | null = null;
@@ -234,62 +238,64 @@ export function determineCascadeEffects(
 }
 
 // ============================================
-// Event Queueing
+// Automatic Propagation (Phase B — replaces event queueing)
 // ============================================
 
 /**
- * Queue cascade events for agentic dispatch.
- * These events are batched and sent to the resolver agent.
+ * Apply automatic confidence propagation based on resolution outcome.
  *
- * Maps effects to event types:
- * - Upstream: evidence_validated / evidence_invalidated (informational)
- * - Everything else: cascade_review
+ * - incorrect: Run shock propagation from the resolved memory (core-level shock)
+ * - correct: Recover outgoing support edges (10% boost, capped at 1.0)
+ * - void: No propagation — outcome is ambiguous
+ *
+ * This replaces the old queueCascadeEvents() which queued cascade_review,
+ * evidence_validated, and evidence_invalidated events for the resolver agent.
+ * Those events are no longer needed — propagation handles them automatically.
  */
-async function queueCascadeEvents(
+async function applyAutomaticPropagation(
   env: Env,
-  sessionId: string | undefined,
-  effects: CascadeEffect[]
+  memoryId: string,
+  outcome: 'correct' | 'incorrect' | 'void',
 ): Promise<number> {
-  let queued = 0;
+  if (outcome === 'void') return 0;
 
-  for (const effect of effects) {
-    // Map reason to event_type
-    let eventType: SignificantEventType;
-
-    // Check if this is an upward propagation event (informational)
-    if (effect.reason === 'derived_evidence_validated') {
-      eventType = 'thought:evidence_validated';
-    } else if (effect.reason === 'derived_evidence_invalidated') {
-      eventType = 'thought:evidence_invalidated';
-    } else {
-      // All cascade effects are review-only
-      eventType = 'thought:cascade_review';
-    }
-
+  if (outcome === 'incorrect') {
+    // Shock propagation: treat resolution as incorrect = core-level violation
     try {
-      await queueSignificantEvent(env, {
-        session_id: sessionId,
-        event_type: eventType,
-        memory_id: effect.target_id,
-        context: {
-          reason: effect.reason,
-          source_id: effect.source_id,
-          source_outcome: effect.source_outcome,
-          edge_type: effect.edge_type,
-          suggested_action: effect.suggested_action,
-        },
+      const shock = await applyShock(env, memoryId, 'core');
+      getLog().info('cascade_shock_applied', {
+        memory_id: memoryId,
+        affected: shock.affected_count,
+        max_drop: Math.round(shock.max_confidence_drop * 100),
       });
-      queued++;
+      return shock.affected_count;
     } catch (error) {
-      getLog().warn('event_queue_failed', {
-        event_type: eventType,
-        target_id: effect.target_id,
+      getLog().warn('cascade_shock_failed', {
+        memory_id: memoryId,
         error: error instanceof Error ? error.message : String(error),
       });
+      return 0;
     }
   }
 
-  return queued;
+  // correct: recover outgoing support edges
+  try {
+    await env.DB
+      .prepare(
+        `UPDATE edges SET strength = MIN(1.0, strength * 1.1)
+         WHERE source_id = ? AND edge_type IN ('derived_from', 'confirmed_by')`
+      )
+      .bind(memoryId)
+      .run();
+    getLog().info('cascade_edge_recovery', { memory_id: memoryId });
+    return 1; // at least one effect applied
+  } catch (error) {
+    getLog().warn('cascade_recovery_failed', {
+      memory_id: memoryId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return 0;
+  }
 }
 
 // ============================================
@@ -302,39 +308,39 @@ async function queueCascadeEvents(
  * Call this when a prediction/inference is resolved (correct/incorrect/void).
  * It will:
  * 1. Find all connected memories
- * 2. Determine cascade effects
- * 3. Queue events for agentic dispatch
+ * 2. Determine cascade effects (for reporting)
+ * 3. Apply automatic confidence propagation (shock or edge recovery)
  *
  * @param env - Worker environment
  * @param memoryId - The resolved memory ID
  * @param outcome - How the memory was resolved
- * @param sessionId - Optional session ID for event batching
+ * @param sessionId - Optional session ID (kept for API compat, unused)
  */
 export async function propagateResolution(
   env: Env,
   memoryId: string,
   outcome: 'correct' | 'incorrect' | 'void',
-  sessionId?: string
+  _sessionId?: string
 ): Promise<CascadeResult> {
   getLog().info('propagating', { memory_id: memoryId, outcome });
 
-  // Find connected memories
+  // Find connected memories (still useful for effect reporting)
   const connections = await findConnectedMemories(env.DB, memoryId);
   getLog().debug('connections_found', { memory_id: memoryId, count: connections.length });
 
-  // Determine effects
+  // Determine effects (for reporting — not for event queueing)
   const effects = determineCascadeEffects(memoryId, outcome, connections);
   getLog().debug('effects_determined', { memory_id: memoryId, count: effects.length });
 
-  // Queue events
-  const eventsQueued = await queueCascadeEvents(env, sessionId, effects);
-  getLog().debug('events_queued', { memory_id: memoryId, count: eventsQueued });
+  // Apply automatic propagation instead of queueing events
+  const affected = await applyAutomaticPropagation(env, memoryId, outcome);
+  getLog().info('propagation_applied', { memory_id: memoryId, outcome, affected });
 
   return {
     source_id: memoryId,
     outcome,
     effects,
-    events_queued: eventsQueued,
+    events_queued: affected,
   };
 }
 
