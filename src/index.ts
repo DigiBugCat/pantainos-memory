@@ -43,6 +43,7 @@ import {
   type OverduePredictionEvent,
 } from './services/resolver.js';
 import { computeSystemStats } from './jobs/compute-stats.js';
+import { runFullGraphPropagation } from './services/propagation.js';
 
 // Extend Env with LoggingEnv for proper typing
 type Env = BaseEnv & LoggingEnv;
@@ -825,6 +826,21 @@ export default {
         });
       } catch (error) {
         log.error('daily_stats_computation_failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+
+      // Full-graph confidence propagation (Phase B-beta)
+      try {
+        const propagation = await runFullGraphPropagation(env, `cron-${event.scheduledTime}`);
+        log.info('daily_propagation_complete', {
+          components: propagation.components_processed,
+          updated: propagation.total_updated,
+          max_delta: Math.round(propagation.max_delta * 1000) / 1000,
+          duration_ms: propagation.duration_ms,
+        });
+      } catch (error) {
+        log.error('daily_propagation_failed', {
           error: error instanceof Error ? error.message : String(error),
         });
       }
