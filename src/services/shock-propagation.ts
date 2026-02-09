@@ -24,6 +24,7 @@ const MAX_HOPS = 2;
 const MAX_ITERATIONS = 3;
 const MIN_STRENGTH = 0.1;
 const ALPHA = 0.6;
+const CONTRADICTION_ETA = 0.8;
 const EPS = 1e-6;
 
 type SupportEdgeType = 'derived_from' | 'confirmed_by';
@@ -32,6 +33,12 @@ type EdgeRow = {
   source_id: string;
   target_id: string;
   edge_type: SupportEdgeType;
+  strength: number;
+};
+
+type ContradictionEdgeRow = {
+  source_id: string;
+  target_id: string;
   strength: number;
 };
 
@@ -90,6 +97,20 @@ async function fetchMemoriesLite(env: Env, ids: string[]): Promise<MemoryLiteRow
   return res.results ?? [];
 }
 
+async function fetchIncomingContradictions(env: Env, targetIds: string[]): Promise<ContradictionEdgeRow[]> {
+  if (targetIds.length === 0) return [];
+  const placeholders = targetIds.map(() => '?').join(',');
+  const sql = `
+    SELECT source_id, target_id, strength
+    FROM edges
+    WHERE target_id IN (${placeholders})
+      AND edge_type = 'violated_by'
+      AND strength >= ?
+  `;
+  const res = await env.DB.prepare(sql).bind(...targetIds, MIN_STRENGTH).all<ContradictionEdgeRow>();
+  return res.results ?? [];
+}
+
 export async function applyShock(env: Env, memoryId: string, damageLevel: DamageLevel): Promise<ShockResult> {
   // 1) Discover local subgraph (<= 2 hops) using support edges only.
   const nodeIds = new Set<string>([memoryId]);
@@ -130,6 +151,75 @@ export async function applyShock(env: Env, memoryId: string, damageLevel: Damage
   const byId = new Map<string, MemoryLiteRow>();
   for (const r of rows) byId.set(r.id, r);
 
+  // 3b) Load incoming contradiction edges (violated_by) targeting nodes in the local neighborhood.
+  // We intentionally do not traverse through contradiction sources to keep the shock localized.
+  const contradictions = await fetchIncomingContradictions(env, allNodeIds);
+  const contradictionIncoming = new Map<string, Array<{ source_id: string; strength: number }>>();
+  const contradictionSources = new Set<string>();
+  for (const e of contradictions) {
+    if (!contradictionIncoming.has(e.target_id)) contradictionIncoming.set(e.target_id, []);
+    contradictionIncoming.get(e.target_id)!.push({ source_id: e.source_id, strength: e.strength });
+    contradictionSources.add(e.source_id);
+  }
+
+  // Fetch source rows for contradiction edges if they weren't part of the discovered support neighborhood.
+  const missingSourceIds = Array.from(contradictionSources).filter(id => !byId.has(id));
+  if (missingSourceIds.length > 0) {
+    const extraRows = await fetchMemoriesLite(env, missingSourceIds);
+    for (const r of extraRows) byId.set(r.id, r);
+  }
+
+  // 3c) Inject contradiction edges from seed to support neighbors (Paper Eq. 13).
+  // ρ controls how much contradiction is distributed to neighbors on shock.
+  const RHO = 0.3;
+  const seedSupportOut: Array<{ target_id: string; strength: number }> = [];
+  for (const e of edges) {
+    if (e.source_id === memoryId) {
+      seedSupportOut.push({ target_id: e.target_id, strength: e.strength });
+    }
+  }
+
+  const totalSuppStrength = seedSupportOut.reduce((sum, e) => sum + e.strength, 0);
+  if (totalSuppStrength > 0) {
+    const shockStrength = damageLevel === 'core' ? 1.0 : 0.4;
+    const now3c = Date.now();
+
+    for (const e of seedSupportOut) {
+      const proportionalShare = e.strength / totalSuppStrength;
+      const injectedStrength = RHO * shockStrength * proportionalShare;
+
+      if (injectedStrength < MIN_STRENGTH) continue;
+
+      await env.DB.prepare(`
+        INSERT INTO edges (source_id, target_id, edge_type, strength, created_at, updated_at)
+        VALUES (?, ?, 'violated_by', ?, ?, ?)
+        ON CONFLICT (source_id, target_id, edge_type)
+        DO UPDATE SET strength = MIN(strength + ?, 1.0), updated_at = ?
+      `).bind(
+        memoryId, e.target_id,
+        injectedStrength, now3c, now3c,
+        injectedStrength, now3c
+      ).run();
+    }
+
+    // Reload contradiction edges since we just created/updated some.
+    const refreshed = await fetchIncomingContradictions(env, allNodeIds);
+    contradictionIncoming.clear();
+    contradictionSources.clear();
+    for (const ce of refreshed) {
+      if (!contradictionIncoming.has(ce.target_id)) contradictionIncoming.set(ce.target_id, []);
+      contradictionIncoming.get(ce.target_id)!.push({ source_id: ce.source_id, strength: ce.strength });
+      contradictionSources.add(ce.source_id);
+    }
+
+    // Fetch any new contradiction source rows.
+    const newMissing = Array.from(contradictionSources).filter(id => !byId.has(id));
+    if (newMissing.length > 0) {
+      const extraRows = await fetchMemoriesLite(env, newMissing);
+      for (const r of extraRows) byId.set(r.id, r);
+    }
+  }
+
   // 4) Build incoming support adjacency (target -> [{source, strength}, ...]).
   const incoming = new Map<string, Array<{ source_id: string; strength: number }>>();
   for (const e of edges) {
@@ -147,6 +237,14 @@ export async function applyShock(env: Env, memoryId: string, damageLevel: Damage
     local.set(id, lc);
     x.set(id, r.propagated_confidence ?? lc);
   }
+
+  const getNodeValue = (id: string): number => {
+    const v = x.get(id);
+    if (v != null) return v;
+    const r = byId.get(id);
+    if (!r) return 0;
+    return computeLocalConfidence(r);
+  };
 
   // 6) Iterate damped updates on local subgraph.
   const updateable = (id: string): boolean => {
@@ -169,14 +267,28 @@ export async function applyShock(env: Env, memoryId: string, damageLevel: Damage
       let supportSum = 0;
       let strengthSum = 0;
       for (const s of inc) {
-        const srcVal = x.get(s.source_id);
-        if (srcVal == null) continue;
+        const srcVal = getNodeValue(s.source_id);
         supportSum += s.strength * srcVal;
         strengthSum += s.strength;
       }
 
       const support = strengthSum > 0 ? (supportSum / strengthSum) : 0;
-      const updated = clamp01((1 - ALPHA) * r.starting_confidence + ALPHA * support);
+
+      const cInc = contradictionIncoming.get(id) ?? [];
+      let contrSum = 0;
+      let contrStrengthSum = 0;
+      for (const s of cInc) {
+        const srcVal = getNodeValue(s.source_id);
+        contrSum += s.strength * srcVal;
+        contrStrengthSum += s.strength;
+      }
+      const contradiction = contrStrengthSum > 0 ? (contrSum / contrStrengthSum) : 0;
+
+      // Paper Eq. 5: subtractive contradiction — influence can go negative,
+      // outer clamp01 on the full expression keeps final value in [0,1].
+      const influence = support - CONTRADICTION_ETA * contradiction;
+      const prior = local.get(id) ?? computeLocalConfidence(r);
+      const updated = clamp01((1 - ALPHA) * prior + ALPHA * influence);
       xNew.set(id, updated);
     }
 
@@ -230,4 +342,3 @@ export async function applyShock(env: Env, memoryId: string, damageLevel: Damage
     is_core: damageLevel === 'core',
   };
 }
-

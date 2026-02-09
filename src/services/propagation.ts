@@ -6,11 +6,15 @@
  * drift, and cross-component effects that local shock propagation misses.
  *
  * Formula per iteration:
- *   x_{t+1} = σ((1-α)·b + α·weighted_support)
+ *   x_{t+1} = σ((1-α)·b + α·influence)
  *
- * Where b = starting_confidence, α = 0.6, σ = clamp(0, 1),
- * and weighted_support is the strength-weighted mean of incoming
- * support edge sources' current confidence.
+ * Where b = local confidence (prior blended with earned survival rate),
+ * α = 0.6, σ = clamp(0, 1).
+ *
+ * influence is derived from incoming support and contradiction (Paper Eq. 5):
+ * - support = strength-weighted mean of incoming support sources' x
+ * - contradiction = strength-weighted mean of incoming contradiction sources' x
+ * - influence = support - η * contradiction  (subtractive, can go negative)
  *
  * Runs after computeSystemStats() in the daily 3 AM UTC cron.
  */
@@ -24,6 +28,7 @@ import { DEFAULT_MAX_TIMES_TESTED, getEvidenceWeight } from './confidence.js';
 // ============================================
 
 const ALPHA = 0.6;          // mixing parameter: how much graph structure matters vs prior
+const CONTRADICTION_ETA = 0.8; // contradiction damping in influence term
 const CONVERGENCE_EPS = 1e-4; // stop when max change < this
 const MAX_ITERATIONS = 100;  // safety cap
 const MIN_STRENGTH = 0.1;    // skip effectively-dead edges
@@ -139,6 +144,7 @@ function propagateComponent(
   nodeIds: string[],
   memoryById: Map<string, MemoryLiteRow>,
   supportEdges: EdgeRow[],
+  contradictionIncoming: Map<string, Array<{ source_id: string; strength: number }>>,
 ): Map<string, number> {
   // Build incoming support adjacency: target → [{source, strength}]
   const incoming = new Map<string, Array<{ source_id: string; strength: number }>>();
@@ -154,6 +160,15 @@ function propagateComponent(
     if (!r) continue;
     x.set(id, r.propagated_confidence ?? computeLocalConfidence(r));
   }
+
+  // Read-only fallback for sources outside this component (common for contradiction edges).
+  const getNodeValue = (id: string): number => {
+    const v = x.get(id);
+    if (v != null) return v;
+    const r = memoryById.get(id);
+    if (!r) return 0;
+    return computeLocalConfidence(r);
+  };
 
   // Which nodes can be updated (not observations)
   const updateableIds = nodeIds.filter(id => {
@@ -173,14 +188,28 @@ function propagateComponent(
       let supportSum = 0;
       let strengthSum = 0;
       for (const s of inc) {
-        const srcVal = x.get(s.source_id);
-        if (srcVal == null) continue;
+        const srcVal = getNodeValue(s.source_id);
         supportSum += s.strength * srcVal;
         strengthSum += s.strength;
       }
 
       const support = strengthSum > 0 ? (supportSum / strengthSum) : 0;
-      const updated = clamp01((1 - ALPHA) * r.starting_confidence + ALPHA * support);
+
+      const cInc = contradictionIncoming.get(id) ?? [];
+      let contrSum = 0;
+      let contrStrengthSum = 0;
+      for (const s of cInc) {
+        const srcVal = getNodeValue(s.source_id);
+        contrSum += s.strength * srcVal;
+        contrStrengthSum += s.strength;
+      }
+      const contradiction = contrStrengthSum > 0 ? (contrSum / contrStrengthSum) : 0;
+
+      // Paper Eq. 5: subtractive contradiction — influence can go negative,
+      // outer clamp01 on the full expression keeps final value in [0,1].
+      const influence = support - CONTRADICTION_ETA * contradiction;
+      const prior = computeLocalConfidence(r);
+      const updated = clamp01((1 - ALPHA) * prior + ALPHA * influence);
 
       const prev = x.get(id) ?? 0;
       const change = Math.abs(updated - prev);
@@ -237,6 +266,15 @@ export async function runFullGraphPropagation(
   `).bind(MIN_STRENGTH).all<EdgeRow>();
   const allEdges = edgesResult.results ?? [];
 
+  // 1b. Fetch contradiction edges (negative evidence)
+  const contradictionResult = await env.DB.prepare(`
+    SELECT source_id, target_id, edge_type, strength
+    FROM edges
+    WHERE edge_type IN ('violated_by')
+      AND strength >= ?
+  `).bind(MIN_STRENGTH).all<EdgeRow>();
+  const allContradictions = contradictionResult.results ?? [];
+
   // 2. Fetch all active memory confidence data
   const memoriesResult = await env.DB.prepare(`
     SELECT id, source, starting_confidence, confirmations, times_tested, propagated_confidence
@@ -289,6 +327,16 @@ export async function runFullGraphPropagation(
     edgesByNode.get(e.target_id)!.push(e);
   }
 
+  // Build incoming contradiction adjacency once (target → [{source,strength}]).
+  // We do not use contradictions for component discovery to avoid "giant components"
+  // caused by a single observation contradicting many beliefs.
+  const contradictionIncoming = new Map<string, Array<{ source_id: string; strength: number }>>();
+  for (const e of allContradictions) {
+    if (!memoryById.has(e.target_id)) continue;
+    if (!contradictionIncoming.has(e.target_id)) contradictionIncoming.set(e.target_id, []);
+    contradictionIncoming.get(e.target_id)!.push({ source_id: e.source_id, strength: e.strength });
+  }
+
   for (const [_root, nodeIds] of components) {
     // Skip trivial components (single node)
     if (nodeIds.length <= 1) continue;
@@ -308,7 +356,7 @@ export async function runFullGraphPropagation(
       }
     }
 
-    const changes = propagateComponent(nodeIds, memoryById, componentEdges);
+    const changes = propagateComponent(nodeIds, memoryById, componentEdges, contradictionIncoming);
 
     // Write back changes
     for (const [id, newVal] of changes) {
