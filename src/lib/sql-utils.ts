@@ -1,0 +1,92 @@
+/**
+ * SQL Utilities for D1
+ *
+ * Helpers for working within D1's 999 bind-parameter limit.
+ */
+
+const MAX_PARAMS = 900; // D1 limit is 999, leave headroom for scalar params
+
+/**
+ * Execute a query with IN-clause chunking to stay under D1's 999-variable limit.
+ *
+ * Splits `ids` into chunks, runs the query for each chunk, and merges results.
+ *
+ * @param db - D1 database instance
+ * @param buildQuery - receives a placeholder string (e.g. "?,?,?") and returns the full SQL
+ * @param ids - array of IDs to spread into the IN clause(s)
+ * @param scalarsBefore - scalar bind params placed before the IN spread(s)
+ * @param scalarsAfter - scalar bind params placed after the IN spread(s)
+ * @param spreadCount - how many times `ids` is spread in the bind call
+ *                      (e.g. 2 for `source_id IN (?) OR target_id IN (?)`)
+ */
+export async function queryInChunks<T>(
+  db: D1Database,
+  buildQuery: (placeholders: string) => string,
+  ids: string[],
+  scalarsBefore: unknown[],
+  scalarsAfter: unknown[],
+  spreadCount: number,
+): Promise<T[]> {
+  if (ids.length === 0) return [];
+
+  const scalarCount = scalarsBefore.length + scalarsAfter.length;
+  const chunkSize = Math.max(1, Math.floor((MAX_PARAMS - scalarCount) / spreadCount));
+
+  const results: T[] = [];
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    const chunk = ids.slice(i, i + chunkSize);
+    const placeholders = chunk.map(() => '?').join(',');
+    const sql = buildQuery(placeholders);
+
+    // Build bind params: scalarsBefore + (chunk repeated spreadCount times) + scalarsAfter
+    const bindParams: unknown[] = [...scalarsBefore];
+    for (let s = 0; s < spreadCount; s++) {
+      bindParams.push(...chunk);
+    }
+    bindParams.push(...scalarsAfter);
+
+    const res = await db.prepare(sql).bind(...bindParams).all<T>();
+    if (res.results) results.push(...res.results);
+  }
+
+  return results;
+}
+
+/**
+ * Execute a contradiction gate query that spreads TWO different arrays.
+ *
+ * Pattern: `(source_id IN (eligible) AND target_id IN (zone))
+ *        OR (target_id IN (eligible) AND source_id IN (zone))`
+ *
+ * Chunks `eligible` while keeping `zoneIds` constant per chunk.
+ */
+export async function queryContradictionGate<T>(
+  db: D1Database,
+  eligible: string[],
+  zoneIds: string[],
+): Promise<T[]> {
+  if (eligible.length === 0 || zoneIds.length === 0) return [];
+
+  // Each chunk uses: eligible_chunk * 2 + zoneIds * 2 params
+  const fixedParams = zoneIds.length * 2;
+  const chunkSize = Math.max(1, Math.floor((MAX_PARAMS - fixedParams) / 2));
+
+  const results: T[] = [];
+  for (let i = 0; i < eligible.length; i += chunkSize) {
+    const chunk = eligible.slice(i, i + chunkSize);
+    const eligiblePh = chunk.map(() => '?').join(',');
+    const zonePh = zoneIds.map(() => '?').join(',');
+
+    const sql = `SELECT source_id, target_id
+       FROM edges
+       WHERE edge_type = 'violated_by' AND (
+         (source_id IN (${eligiblePh}) AND target_id IN (${zonePh}))
+         OR (target_id IN (${eligiblePh}) AND source_id IN (${zonePh}))
+       )`;
+
+    const res = await db.prepare(sql).bind(...chunk, ...zoneIds, ...chunk, ...zoneIds).all<T>();
+    if (res.results) results.push(...res.results);
+  }
+
+  return results;
+}

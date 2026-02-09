@@ -47,6 +47,7 @@ import {
   checkSignedBalance,
   type SafetyRow,
 } from '../lib/zones.js';
+import { queryInChunks, queryContradictionGate } from '../lib/sql-utils.js';
 
 type Env = BaseEnv & LoggingEnv;
 
@@ -1670,14 +1671,19 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         if (frontier.length === 0) break;
 
         const frontierSet = new Set(frontier);
-        const ph = makePlaceholders(frontier.length);
-        const edges = await ctx.env.DB.prepare(
-          `SELECT source_id, target_id, edge_type, strength
+        const edgeResults = await queryInChunks<TraversalEdgeRow>(
+          ctx.env.DB,
+          (ph) => `SELECT source_id, target_id, edge_type, strength
            FROM edges
            WHERE edge_type IN ('derived_from', 'confirmed_by')
              AND strength >= ?
-             AND (source_id IN (${ph}) OR target_id IN (${ph}))`
-        ).bind(minEdgeStrength, ...frontier, ...frontier).all<TraversalEdgeRow>();
+             AND (source_id IN (${ph}) OR target_id IN (${ph}))`,
+          frontier,
+          [minEdgeStrength],
+          [],
+          2,
+        );
+        const edges = { results: edgeResults };
 
         const candidates: string[] = [];
         const candidateSet = new Set<string>();
@@ -1733,22 +1739,16 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         // Contradiction gate against current zone
         const newlyAdded: string[] = [];
         if (eligible.length > 0 && zoneIds.length < maxSize) {
-          const z = zoneIds;
-          const eligiblePh = makePlaceholders(eligible.length);
-          const zonePh = makePlaceholders(z.length);
           const candSet2 = new Set<string>(eligible);
 
-          const contradictions = await ctx.env.DB.prepare(
-            `SELECT source_id, target_id
-             FROM edges
-             WHERE edge_type = 'violated_by' AND (
-               (source_id IN (${eligiblePh}) AND target_id IN (${zonePh}))
-               OR (target_id IN (${eligiblePh}) AND source_id IN (${zonePh}))
-             )`
-          ).bind(...eligible, ...z, ...eligible, ...z).all<ViolatedByEdgeRow>();
+          const contradictionResults = await queryContradictionGate<ViolatedByEdgeRow>(
+            ctx.env.DB,
+            eligible,
+            zoneIds,
+          );
 
           const conflicts = new Map<string, Set<string>>();
-          for (const e of contradictions.results ?? []) {
+          for (const e of contradictionResults) {
             if (candSet2.has(e.source_id) && zoneSet.has(e.target_id)) {
               (conflicts.get(e.source_id) ?? conflicts.set(e.source_id, new Set()).get(e.source_id)!).add(e.target_id);
             } else if (candSet2.has(e.target_id) && zoneSet.has(e.source_id)) {
@@ -1822,22 +1822,16 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
           }
 
           if (eligible.length > 0 && zoneIds.length < maxSize) {
-            const z = zoneIds;
-            const eligiblePh = makePlaceholders(eligible.length);
-            const zonePh = makePlaceholders(z.length);
             const candSet2 = new Set<string>(eligible);
 
-            const contradictions = await ctx.env.DB.prepare(
-              `SELECT source_id, target_id
-               FROM edges
-               WHERE edge_type = 'violated_by' AND (
-                 (source_id IN (${eligiblePh}) AND target_id IN (${zonePh}))
-                 OR (target_id IN (${eligiblePh}) AND source_id IN (${zonePh}))
-               )`
-            ).bind(...eligible, ...z, ...eligible, ...z).all<ViolatedByEdgeRow>();
+            const contradictionResults2 = await queryContradictionGate<ViolatedByEdgeRow>(
+              ctx.env.DB,
+              eligible,
+              zoneIds,
+            );
 
             const conflicts = new Map<string, Set<string>>();
-            for (const e of contradictions.results ?? []) {
+            for (const e of contradictionResults2) {
               if (candSet2.has(e.source_id) && zoneSet.has(e.target_id)) {
                 (conflicts.get(e.source_id) ?? conflicts.set(e.source_id, new Set()).get(e.source_id)!).add(e.target_id);
               } else if (candSet2.has(e.target_id) && zoneSet.has(e.source_id)) {
@@ -1866,17 +1860,21 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       // --------------------------
       // Boundary completion (cut-)
       // --------------------------
-      const zonePh = makePlaceholders(zoneIds.length);
-      const violatedEdges = await ctx.env.DB.prepare(
-        `SELECT source_id, target_id
+      const violatedEdgeResults = await queryInChunks<ViolatedByEdgeRow>(
+        ctx.env.DB,
+        (ph) => `SELECT source_id, target_id
          FROM edges
          WHERE edge_type = 'violated_by'
-           AND (source_id IN (${zonePh}) OR target_id IN (${zonePh}))`
-      ).bind(...zoneIds, ...zoneIds).all<ViolatedByEdgeRow>();
+           AND (source_id IN (${ph}) OR target_id IN (${ph}))`,
+        zoneIds,
+        [],
+        [],
+        2,
+      );
 
       const cutMinusEdges: Array<{ source_id: string; target_id: string; edge_type: 'violated_by' }> = [];
       const internalContradictions: Array<{ source_id: string; target_id: string }> = [];
-      for (const e of violatedEdges.results ?? []) {
+      for (const e of violatedEdgeResults) {
         const sourceIn = zoneSet.has(e.source_id);
         const targetIn = zoneSet.has(e.target_id);
         if (sourceIn && targetIn) {
@@ -1897,17 +1895,22 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       // --------------------------
       // External support dependency (loss+)
       // --------------------------
-      const traversalEdges = await ctx.env.DB.prepare(
-        `SELECT source_id, target_id, edge_type, strength
+      const traversalEdgeResults = await queryInChunks<TraversalEdgeRow>(
+        ctx.env.DB,
+        (ph) => `SELECT source_id, target_id, edge_type, strength
          FROM edges
          WHERE edge_type IN ('derived_from', 'confirmed_by')
-           AND (source_id IN (${zonePh}) OR target_id IN (${zonePh}))`
-      ).bind(...zoneIds, ...zoneIds).all<TraversalEdgeRow>();
+           AND (source_id IN (${ph}) OR target_id IN (${ph}))`,
+        zoneIds,
+        [],
+        [],
+        2,
+      );
 
       const internalEdges: Array<{ source_id: string; target_id: string; edge_type: string; strength: number }> = [];
       const lossPlusEdges: Array<{ source_id: string; target_id: string; edge_type: 'derived_from' | 'confirmed_by' }> = [];
       const internalKey = new Set<string>();
-      for (const e of traversalEdges.results ?? []) {
+      for (const e of traversalEdgeResults) {
         const sourceIn = zoneSet.has(e.source_id);
         const targetIn = zoneSet.has(e.target_id);
         if (sourceIn && targetIn) {
@@ -1947,11 +1950,15 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
 
       const memById = new Map<string, MemoryRow>();
       if (idsToFetch.length > 0) {
-        const allPh = makePlaceholders(idsToFetch.length);
-        const rows = await ctx.env.DB.prepare(
-          `SELECT * FROM memories WHERE id IN (${allPh}) AND retracted = 0`
-        ).bind(...idsToFetch).all<MemoryRow>();
-        for (const r of rows.results ?? []) memById.set(r.id, r);
+        const fetchedRows = await queryInChunks<MemoryRow>(
+          ctx.env.DB,
+          (ph) => `SELECT * FROM memories WHERE id IN (${ph}) AND retracted = 0`,
+          idsToFetch,
+          [],
+          [],
+          1,
+        );
+        for (const r of fetchedRows) memById.set(r.id, r);
       }
 
       const zoneMembers: Memory[] = [];
