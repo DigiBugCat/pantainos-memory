@@ -44,3 +44,15 @@ variable "resolver_github_token" {
   type        = string
   sensitive   = true
 }
+
+variable "pushover_user_key" {
+  description = "Pushover user key for push notifications on core violations"
+  type        = string
+  sensitive   = true
+}
+
+variable "pushover_app_token" {
+  description = "Pushover application token for push notifications"
+  type        = string
+  sensitive   = true
+}

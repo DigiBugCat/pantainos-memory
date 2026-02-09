@@ -82,6 +82,8 @@ locals {
     { type = "plain_text", name = "CF_ACCESS_TEAM", text = var.cf_access_team },
     { type = "plain_text", name = "CLASSIFICATION_CHALLENGE_ENABLED", text = "true" },
     { type = "service", name = "CLAUDE_PROXY", service = var.claude_proxy_worker_name },
+    { type = "secret_text", name = "PUSHOVER_USER_KEY", text = var.pushover_user_key },
+    { type = "secret_text", name = "PUSHOVER_APP_TOKEN", text = var.pushover_app_token },
   ]
 }
 

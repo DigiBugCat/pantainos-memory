@@ -94,6 +94,10 @@ export interface Env extends MCPCoreEnv {
   CONFIRM_CONFIDENCE_THRESHOLD?: string;
   MAX_CANDIDATES?: string;
   MIN_SIMILARITY?: string;
+
+  // Pushover push notifications (optional - for core violation alerts)
+  PUSHOVER_USER_KEY?: string;
+  PUSHOVER_APP_TOKEN?: string;
 }
 
 // ============================================

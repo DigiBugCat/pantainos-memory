@@ -90,6 +90,45 @@ async function insertCoreViolationNotification(env: Env, memoryId: string, shock
     JSON.stringify(shock),
     now
   ).run();
+
+  // Push notification via Pushover (non-blocking, best-effort)
+  if (env.PUSHOVER_USER_KEY && env.PUSHOVER_APP_TOKEN) {
+    sendPushoverNotification(env, msg, memoryId).catch(err => {
+      getLog().warn('pushover_failed', {
+        memory_id: memoryId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
+}
+
+/**
+ * Send a push notification via Pushover API.
+ * Best-effort: failures are logged but don't block the caller.
+ */
+async function sendPushoverNotification(
+  env: Env,
+  message: string,
+  memoryId: string
+): Promise<void> {
+  const resp = await fetch('https://api.pushover.net/1/messages.json', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      token: env.PUSHOVER_APP_TOKEN,
+      user: env.PUSHOVER_USER_KEY,
+      title: 'Memory: Core Violation',
+      message,
+      priority: 1, // high priority — bypasses quiet hours
+      url: `https://memory.pantainos.com/api/recall/${memoryId}`,
+      url_title: 'View Memory',
+    }),
+  });
+
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    throw new Error(`Pushover ${resp.status}: ${body}`);
+  }
 }
 
 
