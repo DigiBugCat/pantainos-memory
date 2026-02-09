@@ -22,6 +22,7 @@
 import type { Env } from '../types/index.js';
 import { createStandaloneLogger } from '../lib/shared/logging/index.js';
 import { DEFAULT_MAX_TIMES_TESTED, getEvidenceWeight } from './confidence.js';
+import { estimateSpectralRadius } from './spectral.js';
 
 // ============================================
 // Configuration
@@ -60,6 +61,7 @@ export interface PropagationResult {
   max_delta: number;
   total_iterations: number;
   duration_ms: number;
+  damped_components: number;
 }
 
 // ============================================
@@ -145,7 +147,7 @@ function propagateComponent(
   memoryById: Map<string, MemoryLiteRow>,
   supportEdges: EdgeRow[],
   contradictionIncoming: Map<string, Array<{ source_id: string; strength: number }>>,
-): Map<string, number> {
+): { changes: Map<string, number>; damped: boolean } {
   // Build incoming support adjacency: target → [{source, strength}]
   const incoming = new Map<string, Array<{ source_id: string; strength: number }>>();
   for (const e of supportEdges) {
@@ -175,6 +177,18 @@ function propagateComponent(
     const r = memoryById.get(id);
     return r && r.source == null;
   });
+
+  // Check contraction condition (Paper Theorem 1)
+  const updateableSet = new Set(updateableIds);
+  const r = estimateSpectralRadius(nodeIds, incoming, contradictionIncoming, ALPHA, CONTRADICTION_ETA, id => updateableSet.has(id));
+
+  let effectiveAlpha = ALPHA;
+  let damped = false;
+  if (r >= 1.0) {
+    // Dampen: need effectiveAlpha * ‖M‖₂/alpha < 1 → effectiveAlpha < alpha/r
+    effectiveAlpha = (0.95 * ALPHA) / r;
+    damped = true;
+  }
 
   // Iterate until convergence
   for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
@@ -209,7 +223,7 @@ function propagateComponent(
       // outer clamp01 on the full expression keeps final value in [0,1].
       const influence = support - CONTRADICTION_ETA * contradiction;
       const prior = computeLocalConfidence(r);
-      const updated = clamp01((1 - ALPHA) * prior + ALPHA * influence);
+      const updated = clamp01((1 - effectiveAlpha) * prior + effectiveAlpha * influence);
 
       const prev = x.get(id) ?? 0;
       const change = Math.abs(updated - prev);
@@ -223,18 +237,18 @@ function propagateComponent(
   // Return only nodes that actually changed from their stored value
   const changes = new Map<string, number>();
   for (const id of updateableIds) {
-    const r = memoryById.get(id);
-    if (!r) continue;
+    const row = memoryById.get(id);
+    if (!row) continue;
     const newVal = x.get(id);
     if (newVal == null) continue;
 
-    const oldVal = r.propagated_confidence ?? computeLocalConfidence(r);
+    const oldVal = row.propagated_confidence ?? computeLocalConfidence(row);
     if (Math.abs(newVal - oldVal) > CONVERGENCE_EPS) {
       changes.set(id, newVal);
     }
   }
 
-  return changes;
+  return { changes, damped };
 }
 
 // ============================================
@@ -285,7 +299,7 @@ export async function runFullGraphPropagation(
 
   if (allMemories.length === 0) {
     log.info('propagation_skipped', { reason: 'no_memories' });
-    return { components_processed: 0, total_memories: 0, total_updated: 0, max_delta: 0, total_iterations: 0, duration_ms: Date.now() - start };
+    return { components_processed: 0, total_memories: 0, total_updated: 0, max_delta: 0, total_iterations: 0, duration_ms: Date.now() - start, damped_components: 0 };
   }
 
   const memoryById = new Map<string, MemoryLiteRow>();
@@ -315,6 +329,7 @@ export async function runFullGraphPropagation(
   let totalUpdated = 0;
   let maxDelta = 0;
   let totalIterations = 0;
+  let dampedComponents = 0;
   const now = Date.now();
 
   // Index edges by component for fast lookup
@@ -356,10 +371,11 @@ export async function runFullGraphPropagation(
       }
     }
 
-    const changes = propagateComponent(nodeIds, memoryById, componentEdges, contradictionIncoming);
+    const result = propagateComponent(nodeIds, memoryById, componentEdges, contradictionIncoming);
+    if (result.damped) dampedComponents++;
 
     // Write back changes
-    for (const [id, newVal] of changes) {
+    for (const [id, newVal] of result.changes) {
       const oldVal = memoryById.get(id)?.propagated_confidence;
       const delta = oldVal != null ? Math.abs(newVal - oldVal) : Math.abs(newVal - computeLocalConfidence(memoryById.get(id)!));
       if (delta > maxDelta) maxDelta = delta;
@@ -382,6 +398,7 @@ export async function runFullGraphPropagation(
     total_updated: totalUpdated,
     max_delta: Math.round(maxDelta * 1000) / 1000,
     duration_ms: duration,
+    damped_components: dampedComponents,
   });
 
   return {
@@ -391,5 +408,6 @@ export async function runFullGraphPropagation(
     max_delta: maxDelta,
     total_iterations: totalIterations,
     duration_ms: duration,
+    damped_components: dampedComponents,
   };
 }

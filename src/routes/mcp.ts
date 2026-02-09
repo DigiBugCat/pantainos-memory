@@ -44,6 +44,7 @@ import {
   parseViolationCount,
   isOverwhelminglyViolated,
   addBoundaryReason,
+  checkSignedBalance,
   type SafetyRow,
 } from '../lib/zones.js';
 
@@ -1874,10 +1875,14 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       ).bind(...zoneIds, ...zoneIds).all<ViolatedByEdgeRow>();
 
       const cutMinusEdges: Array<{ source_id: string; target_id: string; edge_type: 'violated_by' }> = [];
+      const internalContradictions: Array<{ source_id: string; target_id: string }> = [];
       for (const e of violatedEdges.results ?? []) {
         const sourceIn = zoneSet.has(e.source_id);
         const targetIn = zoneSet.has(e.target_id);
-        if (sourceIn && targetIn) continue;
+        if (sourceIn && targetIn) {
+          internalContradictions.push({ source_id: e.source_id, target_id: e.target_id });
+          continue;
+        }
         if (sourceIn !== targetIn) {
           cutMinusEdges.push({ source_id: e.source_id, target_id: e.target_id, edge_type: 'violated_by' });
         }
@@ -1917,6 +1922,20 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
             target_id: e.target_id,
             edge_type: e.edge_type as 'derived_from' | 'confirmed_by',
           });
+        }
+      }
+
+      // --------------------------
+      // Signed cycle detection (Harary 2-coloring, Proposition 1)
+      // --------------------------
+      if (internalContradictions.length > 0) {
+        const balance = checkSignedBalance(internalEdges, internalContradictions);
+        if (!balance.balanced) {
+          unsafeReasons.push(balance.conflictDescription ?? 'signed cycle detected (Harary 2-coloring failed)');
+        }
+        // Add internal contradictions to edge display
+        for (const e of internalContradictions) {
+          internalEdges.push({ source_id: e.source_id, target_id: e.target_id, edge_type: 'violated_by', strength: 1.0 });
         }
       }
 

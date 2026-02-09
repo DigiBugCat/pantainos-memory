@@ -38,6 +38,87 @@ export interface SafetyRow {
 }
 
 // ============================================
+// Signed Cycle Detection (Harary 2-coloring)
+// ============================================
+
+export interface BalanceCheckResult {
+  balanced: boolean;
+  conflictEdge?: [string, string];
+  conflictDescription?: string;
+}
+
+/**
+ * Check structural balance of a signed graph via Harary 2-coloring (Proposition 1).
+ *
+ * A signed graph is balanced iff every cycle has an even number of negative edges.
+ * Equivalently, nodes can be partitioned into two sets such that positive edges
+ * connect same-set nodes and negative edges connect cross-set nodes.
+ *
+ * Algorithm: BFS 2-coloring per connected component.
+ * - Support edges (positive): endpoints must have same color.
+ * - Contradiction edges (negative): endpoints must have different color.
+ */
+export function checkSignedBalance(
+  supportEdges: Array<{ source_id: string; target_id: string; edge_type: string; strength: number }>,
+  contradictionEdges: Array<{ source_id: string; target_id: string }>,
+): BalanceCheckResult {
+  // Build undirected signed adjacency: node → [{neighbor, sign}]
+  const adj = new Map<string, Array<{ neighbor: string; sign: number; source: string; target: string }>>();
+  const nodes = new Set<string>();
+
+  const addEdge = (a: string, b: string, sign: number) => {
+    nodes.add(a);
+    nodes.add(b);
+    if (!adj.has(a)) adj.set(a, []);
+    if (!adj.has(b)) adj.set(b, []);
+    adj.get(a)!.push({ neighbor: b, sign, source: a, target: b });
+    adj.get(b)!.push({ neighbor: a, sign, source: a, target: b });
+  };
+
+  for (const e of supportEdges) {
+    addEdge(e.source_id, e.target_id, +1);
+  }
+  for (const e of contradictionEdges) {
+    addEdge(e.source_id, e.target_id, -1);
+  }
+
+  // BFS 2-coloring per connected component
+  const color = new Map<string, number>(); // 0 or 1
+
+  for (const startNode of nodes) {
+    if (color.has(startNode)) continue;
+
+    color.set(startNode, 0);
+    const queue: string[] = [startNode];
+
+    while (queue.length > 0) {
+      const node = queue.shift()!;
+      const nodeColor = color.get(node)!;
+
+      for (const { neighbor, sign, source, target } of adj.get(node) ?? []) {
+        // Positive edge → same color; Negative edge → different color
+        const expectedColor = sign > 0 ? nodeColor : 1 - nodeColor;
+
+        if (color.has(neighbor)) {
+          if (color.get(neighbor) !== expectedColor) {
+            return {
+              balanced: false,
+              conflictEdge: [source, target],
+              conflictDescription: `signed cycle detected: edge [${source}]→[${target}] violates Harary 2-coloring (structurally imbalanced)`,
+            };
+          }
+        } else {
+          color.set(neighbor, expectedColor);
+          queue.push(neighbor);
+        }
+      }
+    }
+  }
+
+  return { balanced: true };
+}
+
+// ============================================
 // Pure Functions
 // ============================================
 

@@ -147,6 +147,27 @@ describe('Full Graph Propagation', () => {
     expect(result.total_updated).toBe(0);
   });
 
+  it('reports damped_components in result', async () => {
+    // Simple chain — should not need damping under normal conditions
+    mockDb._setQueryResult("edge_type IN ('derived_from', 'confirmed_by')", {
+      allResults: [
+        { source_id: 'A', target_id: 'B', edge_type: 'derived_from', strength: 1.0 },
+      ],
+    });
+
+    mockDb._setQueryResult('SELECT id, source, starting_confidence, confirmations, times_tested, propagated_confidence', {
+      allResults: [
+        { id: 'A', source: null, starting_confidence: 0.4, confirmations: 2, times_tested: 10, propagated_confidence: null },
+        { id: 'B', source: null, starting_confidence: 0.5, confirmations: 5, times_tested: 10, propagated_confidence: null },
+      ],
+    });
+
+    const result = await runFullGraphPropagation(env as any, 'test-req');
+
+    // damped_components should be reported (0 for normal graph)
+    expect(result.damped_components).toBe(0);
+  });
+
   it('subtractive contradiction drives confidence below support-only level (Paper Eq. 5)', async () => {
     // Chain: A → B (support). V contradicts B.
     // Without contradiction, B's propagated confidence would be pulled toward A's confidence.

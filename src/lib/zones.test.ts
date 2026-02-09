@@ -12,6 +12,7 @@ import {
   parseViolationCount,
   isOverwhelminglyViolated,
   addBoundaryReason,
+  checkSignedBalance,
   type SafetyRow,
 } from './zones.js';
 import type { Memory } from './shared/types/memory.js';
@@ -460,5 +461,97 @@ describe('formatZone', () => {
     });
 
     expect(result).toContain('quality: 100%');
+  });
+});
+
+// ============================================
+// checkSignedBalance (Harary 2-coloring)
+// ============================================
+
+describe('checkSignedBalance', () => {
+  it('returns balanced for empty edges', () => {
+    const result = checkSignedBalance([], []);
+    expect(result.balanced).toBe(true);
+  });
+
+  it('returns balanced for support-only graph', () => {
+    const result = checkSignedBalance(
+      [
+        { source_id: 'A', target_id: 'B', edge_type: 'derived_from', strength: 1.0 },
+        { source_id: 'B', target_id: 'C', edge_type: 'confirmed_by', strength: 0.8 },
+      ],
+      [],
+    );
+    expect(result.balanced).toBe(true);
+  });
+
+  it('returns balanced for consistent contradiction (A supports B, C contradicts both)', () => {
+    // A → B (support), C contradicts A, C contradicts B
+    // 2-coloring: {A, B} = color 0, {C} = color 1 — balanced
+    const result = checkSignedBalance(
+      [{ source_id: 'A', target_id: 'B', edge_type: 'derived_from', strength: 1.0 }],
+      [
+        { source_id: 'C', target_id: 'A' },
+        { source_id: 'C', target_id: 'B' },
+      ],
+    );
+    expect(result.balanced).toBe(true);
+  });
+
+  it('detects unbalanced odd cycle (A→B support, B→C support, C→A contradiction)', () => {
+    // Triangle with one negative edge → structurally imbalanced
+    const result = checkSignedBalance(
+      [
+        { source_id: 'A', target_id: 'B', edge_type: 'derived_from', strength: 1.0 },
+        { source_id: 'B', target_id: 'C', edge_type: 'derived_from', strength: 1.0 },
+      ],
+      [{ source_id: 'C', target_id: 'A' }],
+    );
+    expect(result.balanced).toBe(false);
+    expect(result.conflictEdge).toBeDefined();
+    expect(result.conflictDescription).toContain('signed cycle');
+    expect(result.conflictDescription).toContain('Harary');
+  });
+
+  it('detects unbalanced mixed cycle', () => {
+    // A→B support, B→C support, C→D support, D→A contradiction, A→C contradiction
+    // Two negative edges in a 4-cycle would be balanced, but adding A→C makes it odd
+    const result = checkSignedBalance(
+      [
+        { source_id: 'A', target_id: 'B', edge_type: 'derived_from', strength: 1.0 },
+        { source_id: 'B', target_id: 'C', edge_type: 'derived_from', strength: 1.0 },
+      ],
+      [
+        { source_id: 'A', target_id: 'C' }, // A and C same color (via A→B→C support), but contradiction demands different
+      ],
+    );
+    expect(result.balanced).toBe(false);
+  });
+
+  it('handles disconnected components (one balanced, one not)', () => {
+    // Component 1: A→B (support) — balanced
+    // Component 2: X→Y (support), Y→Z (support), Z→X (contradiction) — imbalanced
+    const result = checkSignedBalance(
+      [
+        { source_id: 'A', target_id: 'B', edge_type: 'derived_from', strength: 1.0 },
+        { source_id: 'X', target_id: 'Y', edge_type: 'derived_from', strength: 1.0 },
+        { source_id: 'Y', target_id: 'Z', edge_type: 'derived_from', strength: 1.0 },
+      ],
+      [{ source_id: 'Z', target_id: 'X' }],
+    );
+    expect(result.balanced).toBe(false);
+  });
+
+  it('balanced: even number of negative edges in cycle', () => {
+    // A→B contradiction, B→C contradiction → even negative count → balanced
+    // 2-coloring: A=0, B=1 (contradiction), C=0 (contradiction from B)
+    const result = checkSignedBalance(
+      [],
+      [
+        { source_id: 'A', target_id: 'B' },
+        { source_id: 'B', target_id: 'C' },
+      ],
+    );
+    expect(result.balanced).toBe(true);
   });
 });

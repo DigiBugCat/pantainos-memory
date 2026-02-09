@@ -331,6 +331,9 @@ describe('Core Violation Notification (Pushover)', () => {
       max_confidence_drop: 0.25,
       affected_memories: [],
       is_core: true,
+      iterations: 0,
+      spectral_radius: 0,
+      backtrack_attempts: 0,
     };
 
     await insertCoreViolationNotification(env as any, 'mem-123', shock);
@@ -362,6 +365,9 @@ describe('Core Violation Notification (Pushover)', () => {
       max_confidence_drop: 0.4,
       affected_memories: [],
       is_core: true,
+      iterations: 0,
+      spectral_radius: 0,
+      backtrack_attempts: 0,
     };
 
     await insertCoreViolationNotification(env as any, 'mem-456', shock);
@@ -401,6 +407,9 @@ describe('Core Violation Notification (Pushover)', () => {
       max_confidence_drop: 0.1,
       affected_memories: [],
       is_core: true,
+      iterations: 0,
+      spectral_radius: 0,
+      backtrack_attempts: 0,
     };
 
     await insertCoreViolationNotification(env as any, 'mem-789', shock);

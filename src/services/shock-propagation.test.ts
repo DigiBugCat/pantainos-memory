@@ -170,6 +170,32 @@ describe('Shock Propagation (applyShock)', () => {
     expect(call[2]).toBeCloseTo(0.24, 2);
   });
 
+  it('returns iteration count and converges early when stable', async () => {
+    // Simple chain A → B with stable values — should converge quickly
+    mockDb._setQueryResult('SELECT source_id, target_id, edge_type, strength', {
+      allResults: [
+        { source_id: 'A', target_id: 'B', edge_type: 'derived_from', strength: 1.0 },
+      ],
+    });
+
+    mockDb._setQueryResult('SELECT id, source, starting_confidence, confirmations, times_tested, propagated_confidence, retracted', {
+      allResults: [
+        { id: 'A', source: null, starting_confidence: 0.5, confirmations: 5, times_tested: 10, propagated_confidence: null, retracted: 0 },
+        { id: 'B', source: null, starting_confidence: 0.5, confirmations: 5, times_tested: 10, propagated_confidence: null, retracted: 0 },
+      ],
+    });
+
+    const result = await applyShock(env as any, 'A', 'peripheral');
+
+    // Should report iterations (convergence-based, max 20)
+    expect(result.iterations).toBeGreaterThan(0);
+    expect(result.iterations).toBeLessThanOrEqual(20);
+    // Should report spectral radius
+    expect(typeof result.spectral_radius).toBe('number');
+    // Normal case: no backtracking needed
+    expect(result.backtrack_attempts).toBe(0);
+  });
+
   it('skips contradiction injection for peripheral with few edges', async () => {
     // Single edge, peripheral damage (shockStrength=0.4)
     // injected = RHO(0.3) * 0.4 * 1.0 = 0.12 — just above MIN_STRENGTH(0.1), should inject

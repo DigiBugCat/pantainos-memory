@@ -8,6 +8,7 @@
 import type { Env } from '../types/index.js';
 import type { DamageLevel } from '../lib/shared/types/index.js';
 import { DEFAULT_MAX_TIMES_TESTED, getEvidenceWeight } from './confidence.js';
+import { estimateSpectralRadius } from './spectral.js';
 
 export interface ShockResult {
   affected_count: number;
@@ -18,10 +19,14 @@ export interface ShockResult {
     new_confidence: number;
   }>;
   is_core: boolean;
+  iterations: number;
+  spectral_radius: number;
+  backtrack_attempts: number;
 }
 
 const MAX_HOPS = 2;
-const MAX_ITERATIONS = 3;
+const MAX_ITERATIONS = 20;
+const CONVERGENCE_EPS = 1e-3;
 const MIN_STRENGTH = 0.1;
 const ALPHA = 0.6;
 const CONTRADICTION_ETA = 0.8;
@@ -135,7 +140,7 @@ export async function applyShock(env: Env, memoryId: string, damageLevel: Damage
 
   const allNodeIds = Array.from(nodeIds);
   if (allNodeIds.length <= 1) {
-    return { affected_count: 0, max_confidence_drop: 0, affected_memories: [], is_core: damageLevel === 'core' };
+    return { affected_count: 0, max_confidence_drop: 0, affected_memories: [], is_core: damageLevel === 'core', iterations: 0, spectral_radius: 0, backtrack_attempts: 0 };
   }
 
   // 2) Load edges within discovered subgraph.
@@ -145,7 +150,7 @@ export async function applyShock(env: Env, memoryId: string, damageLevel: Damage
   // 3) Load memory confidence rows.
   const rows = await fetchMemoriesLite(env, allNodeIds);
   if (rows.length === 0) {
-    return { affected_count: 0, max_confidence_drop: 0, affected_memories: [], is_core: damageLevel === 'core' };
+    return { affected_count: 0, max_confidence_drop: 0, affected_memories: [], is_core: damageLevel === 'core', iterations: 0, spectral_radius: 0, backtrack_attempts: 0 };
   }
 
   const byId = new Map<string, MemoryLiteRow>();
@@ -179,6 +184,7 @@ export async function applyShock(env: Env, memoryId: string, damageLevel: Damage
     }
   }
 
+  const injectedEdgeKeys = new Set<string>();
   const totalSuppStrength = seedSupportOut.reduce((sum, e) => sum + e.strength, 0);
   if (totalSuppStrength > 0) {
     const shockStrength = damageLevel === 'core' ? 1.0 : 0.4;
@@ -189,6 +195,8 @@ export async function applyShock(env: Env, memoryId: string, damageLevel: Damage
       const injectedStrength = RHO * shockStrength * proportionalShare;
 
       if (injectedStrength < MIN_STRENGTH) continue;
+
+      injectedEdgeKeys.add(`${memoryId}|${e.target_id}`);
 
       await env.DB.prepare(`
         INSERT INTO edges (source_id, target_id, edge_type, strength, created_at, updated_at)
@@ -227,6 +235,42 @@ export async function applyShock(env: Env, memoryId: string, damageLevel: Damage
     incoming.get(e.target_id)!.push({ source_id: e.source_id, strength: e.strength });
   }
 
+  // 4b) Spectral radius check + backtracking (Paper Algorithm 3).
+  // Halve injected contradiction strengths until α·‖Â⁺ − η·Â⁻‖₂ < 1.
+  const MAX_BACKTRACK = 5;
+  const updateableForSpectral = (id: string): boolean => {
+    if (id === memoryId) return false;
+    const r = byId.get(id);
+    if (!r) return false;
+    if (r.source != null) return false;
+    return true;
+  };
+
+  let spectralRadius = estimateSpectralRadius(allNodeIds, incoming, contradictionIncoming, ALPHA, CONTRADICTION_ETA, updateableForSpectral);
+  let backtrackAttempts = 0;
+
+  if (spectralRadius >= 1.0 && injectedEdgeKeys.size > 0) {
+    const now4b = Date.now();
+    while (spectralRadius >= 1.0 && backtrackAttempts < MAX_BACKTRACK) {
+      backtrackAttempts++;
+      // Halve injected contradiction strengths in DB
+      for (const key of injectedEdgeKeys) {
+        const [src, tgt] = key.split('|');
+        await env.DB.prepare(
+          `UPDATE edges SET strength = strength * 0.5, updated_at = ? WHERE source_id = ? AND target_id = ? AND edge_type = 'violated_by'`
+        ).bind(now4b, src, tgt).run();
+      }
+      // Reload contradiction edges
+      const refreshed = await fetchIncomingContradictions(env, allNodeIds);
+      contradictionIncoming.clear();
+      for (const ce of refreshed) {
+        if (!contradictionIncoming.has(ce.target_id)) contradictionIncoming.set(ce.target_id, []);
+        contradictionIncoming.get(ce.target_id)!.push({ source_id: ce.source_id, strength: ce.strength });
+      }
+      spectralRadius = estimateSpectralRadius(allNodeIds, incoming, contradictionIncoming, ALPHA, CONTRADICTION_ETA, updateableForSpectral);
+    }
+  }
+
   // 5) Initialize x from propagated_confidence or local.
   const local = new Map<string, number>();
   const x = new Map<string, number>();
@@ -255,7 +299,9 @@ export async function applyShock(env: Env, memoryId: string, damageLevel: Damage
     return true;
   };
 
+  let totalIterations = 0;
   for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
+    let maxChange = 0;
     const xNew = new Map<string, number>(x);
 
     for (const id of allNodeIds) {
@@ -289,12 +335,17 @@ export async function applyShock(env: Env, memoryId: string, damageLevel: Damage
       const influence = support - CONTRADICTION_ETA * contradiction;
       const prior = local.get(id) ?? computeLocalConfidence(r);
       const updated = clamp01((1 - ALPHA) * prior + ALPHA * influence);
+
+      const prev = x.get(id) ?? 0;
+      if (Math.abs(updated - prev) > maxChange) maxChange = Math.abs(updated - prev);
       xNew.set(id, updated);
     }
 
     // Next iteration
     x.clear();
     for (const [k, v] of xNew) x.set(k, v);
+    totalIterations = iter + 1;
+    if (maxChange < CONVERGENCE_EPS) break;
   }
 
   // 7) Write back propagated_confidence for changed neighbors.
@@ -340,5 +391,8 @@ export async function applyShock(env: Env, memoryId: string, damageLevel: Damage
     max_confidence_drop: Math.max(0, maxDrop),
     affected_memories: affectedCapped,
     is_core: damageLevel === 'core',
+    iterations: totalIterations,
+    spectral_radius: spectralRadius,
+    backtrack_attempts: backtrackAttempts,
   };
 }
