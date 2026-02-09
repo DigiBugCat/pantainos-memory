@@ -78,7 +78,15 @@ function formatPct(x: number): string {
 }
 
 export async function insertCoreViolationNotification(env: Env, memoryId: string, shock: ShockResult): Promise<void> {
+  // Fetch memory content for richer notification
+  const mem = await env.DB.prepare(
+    `SELECT content, state FROM memories WHERE id = ?`
+  ).bind(memoryId).first<{ content: string; state: string }>();
+
+  const content = mem?.content ?? '(unknown)';
+
   const msg = `CORE VIOLATION: [${memoryId}] shock propagated to ${shock.affected_count} memories (max drop ${formatPct(shock.max_confidence_drop)}).`;
+  const pushMsg = `[${memoryId}] ${content}\n\nShock propagated to ${shock.affected_count} memories (max drop ${formatPct(shock.max_confidence_drop)}).`;
   const now = Date.now();
   await env.DB.prepare(
     `INSERT INTO notifications (id, type, memory_id, content, context, created_at)
@@ -93,7 +101,7 @@ export async function insertCoreViolationNotification(env: Env, memoryId: string
 
   // Push notification via Pushover (non-blocking, best-effort)
   if (env.PUSHOVER_USER_KEY && env.PUSHOVER_APP_TOKEN) {
-    sendPushoverNotification(env, msg, memoryId).catch(err => {
+    sendPushoverNotification(env, pushMsg).catch(err => {
       getLog().warn('pushover_failed', {
         memory_id: memoryId,
         error: err instanceof Error ? err.message : String(err),
@@ -108,8 +116,7 @@ export async function insertCoreViolationNotification(env: Env, memoryId: string
  */
 async function sendPushoverNotification(
   env: Env,
-  message: string,
-  memoryId: string
+  message: string
 ): Promise<void> {
   const resp = await fetch('https://api.pushover.net/1/messages.json', {
     method: 'POST',
@@ -120,8 +127,6 @@ async function sendPushoverNotification(
       title: 'Memory: Core Violation',
       message,
       priority: 1, // high priority — bypasses quiet hours
-      url: `https://memory.pantainos.com/api/recall/${memoryId}`,
-      url_title: 'View Memory',
     }),
   });
 

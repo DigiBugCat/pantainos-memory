@@ -310,6 +310,11 @@ describe('Core Violation Notification (Pushover)', () => {
   beforeEach(() => {
     mockDb = createMockD1();
 
+    // SELECT memory content for notification
+    mockDb._setQueryResult('SELECT content, state FROM memories', {
+      firstResult: { content: 'Test memory content for notification', state: 'violated' },
+    });
+
     // INSERT INTO notifications succeeds
     mockDb._setQueryResult('INSERT INTO notifications', {
       runResult: { success: true, meta: { changes: 1 } },
@@ -375,7 +380,9 @@ describe('Core Violation Notification (Pushover)', () => {
     expect(body.title).toBe('Memory: Core Violation');
     expect(body.priority).toBe(1);
     expect(body.message).toContain('mem-456');
+    expect(body.message).toContain('Test memory content for notification');
     expect(body.message).toContain('5 memories');
+    expect(body.url).toBeUndefined();
 
     vi.unstubAllGlobals();
   });
