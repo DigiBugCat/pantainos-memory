@@ -78,6 +78,13 @@ describe('scoreZone', () => {
     expect(scoreZone(members, 0, 0)).toBeCloseTo(0.5, 2);
   });
 
+  it('prefers propagated_confidence when present', () => {
+    const members = [
+      makeMemory({ confirmations: 10, times_tested: 10, propagated_confidence: 0.2 }), // local=1.0, propagated=0.2
+    ];
+    expect(scoreZone(members, 0, 0)).toBeCloseTo(0.2, 2);
+  });
+
   it('penalizes boundary contradictions (cut-)', () => {
     const members = [
       makeMemory({ confirmations: 8, times_tested: 10 }), // 0.8

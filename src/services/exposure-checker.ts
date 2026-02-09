@@ -17,6 +17,7 @@ import type {
 } from '../lib/shared/types/index.js';
 import { createLazyLogger } from '../lib/lazy-logger.js';
 import { getDamageLevel } from './confidence.js';
+import { applyShock, type ShockResult } from './shock-propagation.js';
 
 const getLog = createLazyLogger('ExposureChecker', 'exposure-check-init');
 import { generateId } from '../lib/id.js';
@@ -70,6 +71,25 @@ interface ConditionMatch {
   confidence: number;
   reasoning?: string;
   relevantButNotViolation?: boolean;
+}
+
+function formatPct(x: number): string {
+  return `${Math.round(x * 100)}%`;
+}
+
+async function insertCoreViolationNotification(env: Env, memoryId: string, shock: ShockResult): Promise<void> {
+  const msg = `CORE VIOLATION: [${memoryId}] shock propagated to ${shock.affected_count} memories (max drop ${formatPct(shock.max_confidence_drop)}).`;
+  const now = Date.now();
+  await env.DB.prepare(
+    `INSERT INTO notifications (id, type, memory_id, content, context, created_at)
+     VALUES (?, 'core_violation', ?, ?, ?, ?)`
+  ).bind(
+    generateId(),
+    memoryId,
+    msg,
+    JSON.stringify(shock),
+    now
+  ).run();
 }
 
 
@@ -981,6 +1001,19 @@ async function recordViolation(
     )
     .bind(damageFactor, memoryId)
     .run();
+
+  // Phase B-alpha: local shock propagation (non-blocking)
+  try {
+    const shock = await applyShock(env, memoryId, violation.damage_level);
+    if (violation.damage_level === 'core') {
+      await insertCoreViolationNotification(env, memoryId, shock);
+    }
+  } catch (err) {
+    getLog().warn('shock_propagation_failed', {
+      memory_id: memoryId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 /**
@@ -1198,6 +1231,19 @@ export async function manualViolate(
     )
     .bind(damageFactor, memoryId)
     .run();
+
+  // Phase B-alpha: local shock propagation (non-blocking)
+  try {
+    const shock = await applyShock(env, memoryId, damageLevel);
+    if (damageLevel === 'core') {
+      await insertCoreViolationNotification(env, memoryId, shock);
+    }
+  } catch (err) {
+    getLog().warn('shock_propagation_failed', {
+      memory_id: memoryId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 
   // Create edge if observation provided
   if (observationId) {

@@ -89,6 +89,12 @@ export const DEFAULT_MAX_TIMES_TESTED = 10;
 // Core Functions
 // ============================================
 
+function clamp01(x: number): number {
+  if (x < 0) return 0;
+  if (x > 1) return 1;
+  return x;
+}
+
 /**
  * Calculate evidence weight using log-scale normalization.
  * This determines how much to trust earned evidence vs prior belief.
@@ -111,9 +117,9 @@ export function getEarnedConfidence(memory: Memory): number {
 }
 
 /**
- * Calculate effective confidence using Subjective Logic blend.
+ * Calculate local (non-graph) confidence using Subjective Logic blend.
  *
- * Formula: effective = startingConfidence * (1 - evidenceWeight) + earned * evidenceWeight
+ * Formula: local = startingConfidence * (1 - evidenceWeight) + earned * evidenceWeight
  *
  * - If never tested: returns starting_confidence (prior)
  * - As testing increases: transitions toward earned confidence
@@ -122,12 +128,30 @@ export function getEarnedConfidence(memory: Memory): number {
  * @param memory - The memory to evaluate
  * @param maxTimesTested - Global max for normalization (from system_stats)
  */
-export function getEffectiveConfidence(memory: Memory, maxTimesTested: number = DEFAULT_MAX_TIMES_TESTED): number {
+export function getLocalConfidence(memory: Memory, maxTimesTested: number = DEFAULT_MAX_TIMES_TESTED): number {
   const evidenceWeight = getEvidenceWeight(memory.times_tested, maxTimesTested);
   const earned = getEarnedConfidence(memory);
 
   // Blend prior with evidence
-  return memory.starting_confidence * (1 - evidenceWeight) + earned * evidenceWeight;
+  return clamp01(memory.starting_confidence * (1 - evidenceWeight) + earned * evidenceWeight);
+}
+
+/**
+ * Calculate effective confidence.
+ *
+ * If propagated_confidence is present, blend it with local confidence.
+ * This keeps confidence grounded in direct evidence while allowing
+ * graph-aware propagation to influence ranking and zones.
+ */
+export function getEffectiveConfidence(memory: Memory, maxTimesTested: number = DEFAULT_MAX_TIMES_TESTED): number {
+  const local = getLocalConfidence(memory, maxTimesTested);
+
+  if (memory.propagated_confidence != null) {
+    const blended = 0.6 * memory.propagated_confidence + 0.4 * local;
+    return clamp01(blended);
+  }
+
+  return local;
 }
 
 /**

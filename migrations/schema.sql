@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS memories (
   confirmations INTEGER DEFAULT 0,
   times_tested INTEGER DEFAULT 0,
   contradictions INTEGER DEFAULT 0,
+  propagated_confidence REAL,
 
   -- Graph
   centrality INTEGER DEFAULT 0,
@@ -78,6 +79,24 @@ CREATE INDEX IF NOT EXISTS idx_memories_thoughts ON memories(created_at DESC)
 -- Predictions (resolves_by IS NOT NULL)
 CREATE INDEX IF NOT EXISTS idx_memories_predictions ON memories(resolves_by)
   WHERE resolves_by IS NOT NULL AND retracted = 0;
+
+
+-- ============================================
+-- NOTIFICATIONS (Lightweight Alerts)
+-- ============================================
+-- Persisted alerts surfaced on next MCP tools/call response.
+CREATE TABLE IF NOT EXISTS notifications (
+  id TEXT PRIMARY KEY,
+  type TEXT NOT NULL,        -- 'core_violation'
+  memory_id TEXT NOT NULL,
+  content TEXT NOT NULL,
+  context TEXT,              -- JSON string (ShockResult)
+  read INTEGER DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_unread
+ON notifications(read, created_at DESC);
 
 -- Confidence-based ranking
 CREATE INDEX IF NOT EXISTS idx_memories_confidence ON memories(

@@ -106,6 +106,11 @@ export interface Memory {
   times_tested: number;
   contradictions: number;
   centrality: number;
+  /**
+   * Graph-aware confidence propagated from neighbors.
+   * NULL in DB means never propagated; callers should fall back to local confidence.
+   */
+  propagated_confidence?: number;
 
   // State machine
   state: MemoryState;
@@ -152,6 +157,7 @@ export interface MemoryRow {
   times_tested: number;
   contradictions: number;
   centrality: number;
+  propagated_confidence: number | null;
   state: string;
   violations: string;
   retracted: number;

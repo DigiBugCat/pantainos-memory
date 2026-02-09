@@ -198,6 +198,55 @@ function textResult(text: string) {
   return { content: [{ type: 'text' as const, text }] };
 }
 
+type NotificationRow = {
+  id: string;
+  type: string;
+  memory_id: string;
+  content: string;
+  context: string | null;
+  created_at: number;
+};
+
+async function prependUnreadNotifications(db: D1Database, response: unknown): Promise<void> {
+  const resp = response as { result?: unknown } | null;
+  if (!resp || typeof resp !== 'object') return;
+
+  const result = (resp as { result?: unknown }).result as { content?: unknown } | undefined;
+  if (!result || typeof result !== 'object') return;
+  const content = (result as { content?: unknown }).content;
+  if (!Array.isArray(content)) return;
+
+  const unread = await db.prepare(
+    `SELECT id, type, memory_id, content, context, created_at
+     FROM notifications
+     WHERE read = 0
+     ORDER BY created_at DESC
+     LIMIT 5`
+  ).all<NotificationRow>();
+
+  const notifications = unread.results ?? [];
+  if (notifications.length === 0) return;
+
+  const header = [
+    '=== NOTIFICATIONS ===',
+    ...notifications.map(n => `- ${n.content}`),
+    '',
+  ].join('\n');
+
+  // Prepend to tool result text if possible.
+  const first = content[0] as { type?: unknown; text?: unknown } | undefined;
+  if (first && first.type === 'text' && typeof first.text === 'string') {
+    (first as { text: string }).text = header + (first as { text: string }).text;
+  } else {
+    content.unshift({ type: 'text', text: header.trimEnd() });
+  }
+
+  // Mark as read.
+  const ids = notifications.map(n => n.id);
+  const placeholders = ids.map(() => '?').join(',');
+  await db.prepare(`UPDATE notifications SET read = 1 WHERE id IN (${placeholders})`).bind(...ids).run();
+}
+
 /** Build LLM prompt for session recap summarization */
 function buildRecapPrompt(accesses: SessionMemoryAccess[]): string {
   const memoryList = accesses.map(a => {
@@ -2329,6 +2378,11 @@ mcpRouter.post('/', async (c) => {
     return c.body(null, 204);
   }
 
+  if (parsed.request.method === 'tools/call') {
+    // Best-effort: do not fail the tool call if notifications table isn't present yet.
+    await prependUnreadNotifications(c.env.DB, response).catch(() => undefined);
+  }
+
   return c.json(response);
 });
 
@@ -2367,7 +2421,7 @@ export async function handleMCPMessage(
     sessionId: undefined,
   };
 
-  return handleMcpMessage(
+  const resp = await handleMcpMessage(
     message as Parameters<typeof handleMcpMessage>[0],
     {
       name: 'pantainos-memory',
@@ -2376,6 +2430,12 @@ export async function handleMCPMessage(
     },
     context
   );
+
+  if ((message as { method?: unknown } | null)?.method === 'tools/call' && resp !== null) {
+    await prependUnreadNotifications(env.DB, resp).catch(() => undefined);
+  }
+
+  return resp;
 }
 
 export default mcpRouter;

@@ -91,8 +91,10 @@ export function scoreZone(
 ): number {
   if (zoneMembers.length === 0) return 0;
   const meanConf = zoneMembers.reduce((s, m) => {
-    const earned = m.times_tested > 0 ? m.confirmations / m.times_tested : m.starting_confidence;
-    return s + earned;
+    const earnedOrProp = m.propagated_confidence != null
+      ? m.propagated_confidence
+      : (m.times_tested > 0 ? m.confirmations / m.times_tested : m.starting_confidence);
+    return s + earnedOrProp;
   }, 0) / zoneMembers.length;
 
   const lambda = 0.2; // contradiction penalty weight
