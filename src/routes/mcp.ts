@@ -1602,8 +1602,6 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         return errorResult('max_size must be between 5 and 100');
       }
 
-      const makePlaceholders = (n: number) => new Array(n).fill('?').join(',');
-
       // SafetyRow, parseViolationCount, isOverwhelminglyViolated, addBoundaryReason
       // imported from ../lib/zones.js
 
@@ -1706,13 +1704,17 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         // Mark all as seen to avoid re-processing across depths.
         for (const id of candidates) seen.add(id);
 
-        const candPh = makePlaceholders(candidates.length);
-        const safetyRows = await ctx.env.DB.prepare(
-          `SELECT id, state, outcome, retracted, violations, times_tested, confirmations FROM memories WHERE id IN (${candPh})`
-        ).bind(...candidates).all<SafetyRow>();
+        const safetyResults = await queryInChunks<SafetyRow>(
+          ctx.env.DB,
+          (ph) => `SELECT id, state, outcome, retracted, violations, times_tested, confirmations FROM memories WHERE id IN (${ph})`,
+          candidates,
+          [],
+          [],
+          1,
+        );
 
         const safetyById = new Map<string, SafetyRow>();
-        for (const r of safetyRows.results ?? []) safetyById.set(r.id, r);
+        for (const r of safetyResults) safetyById.set(r.id, r);
 
         const eligible: string[] = [];
         for (const id of candidates) {
@@ -1791,13 +1793,17 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         if (candidates.length > 0) {
           for (const id of candidates) seen.add(id);
 
-          const candPh = makePlaceholders(candidates.length);
-          const safetyRows = await ctx.env.DB.prepare(
-            `SELECT id, state, outcome, retracted, violations, times_tested, confirmations FROM memories WHERE id IN (${candPh})`
-          ).bind(...candidates).all<SafetyRow>();
+          const safetyResults2 = await queryInChunks<SafetyRow>(
+            ctx.env.DB,
+            (ph) => `SELECT id, state, outcome, retracted, violations, times_tested, confirmations FROM memories WHERE id IN (${ph})`,
+            candidates,
+            [],
+            [],
+            1,
+          );
 
           const safetyById = new Map<string, SafetyRow>();
-          for (const r of safetyRows.results ?? []) safetyById.set(r.id, r);
+          for (const r of safetyResults2) safetyById.set(r.id, r);
 
           const eligible: string[] = [];
           for (const id of candidates) {
