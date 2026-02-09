@@ -77,7 +77,7 @@ function formatPct(x: number): string {
   return `${Math.round(x * 100)}%`;
 }
 
-async function insertCoreViolationNotification(env: Env, memoryId: string, shock: ShockResult): Promise<void> {
+export async function insertCoreViolationNotification(env: Env, memoryId: string, shock: ShockResult): Promise<void> {
   const msg = `CORE VIOLATION: [${memoryId}] shock propagated to ${shock.affected_count} memories (max drop ${formatPct(shock.max_confidence_drop)}).`;
   const now = Date.now();
   await env.DB.prepare(

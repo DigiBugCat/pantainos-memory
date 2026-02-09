@@ -7,7 +7,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createMockD1 } from '../lib/shared/testing/d1-mock.js';
 import type { MockD1Database } from '../lib/shared/testing/d1-mock.js';
-import { manualConfirm, manualViolate } from './exposure-checker.js';
+import { manualConfirm, manualViolate, insertCoreViolationNotification } from './exposure-checker.js';
 
 // Mock dependencies that exposure-checker imports
 vi.mock('../lib/lazy-logger.js', () => ({
@@ -301,5 +301,106 @@ describe('Edge Decay/Recovery Dynamics', () => {
       call[0].includes('strength = strength * (1.0 - ?)')
     );
     expect(decayCall![0]).toContain('WHERE source_id = ?');
+  });
+});
+
+describe('Core Violation Notification (Pushover)', () => {
+  let mockDb: MockD1Database;
+
+  beforeEach(() => {
+    mockDb = createMockD1();
+
+    // INSERT INTO notifications succeeds
+    mockDb._setQueryResult('INSERT INTO notifications', {
+      runResult: { success: true, meta: { changes: 1 } },
+    });
+  });
+
+  it('inserts notification row into D1', async () => {
+    const env = {
+      DB: mockDb as unknown as D1Database,
+    };
+
+    const shock = {
+      affected_count: 3,
+      max_confidence_drop: 0.25,
+      affected_memories: [],
+      is_core: true,
+    };
+
+    await insertCoreViolationNotification(env as any, 'mem-123', shock);
+
+    // Verify the INSERT was called
+    const prepareCalls = mockDb.prepare.mock.calls;
+    const insertCall = prepareCalls.find((call: string[]) =>
+      call[0].includes('INSERT INTO notifications')
+    );
+    expect(insertCall).toBeDefined();
+    expect(insertCall![0]).toContain("'core_violation'");
+  });
+
+  it('calls Pushover API when credentials are set', async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      text: async () => '{"status":1}',
+    });
+    vi.stubGlobal('fetch', mockFetch);
+
+    const env = {
+      DB: mockDb as unknown as D1Database,
+      PUSHOVER_USER_KEY: 'test-user-key',
+      PUSHOVER_APP_TOKEN: 'test-app-token',
+    };
+
+    const shock = {
+      affected_count: 5,
+      max_confidence_drop: 0.4,
+      affected_memories: [],
+      is_core: true,
+    };
+
+    await insertCoreViolationNotification(env as any, 'mem-456', shock);
+
+    // Give the async Pushover call a tick to execute
+    await new Promise(resolve => setTimeout(resolve, 10));
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+    const [url, options] = mockFetch.mock.calls[0];
+    expect(url).toBe('https://api.pushover.net/1/messages.json');
+    expect(options.method).toBe('POST');
+
+    const body = JSON.parse(options.body);
+    expect(body.token).toBe('test-app-token');
+    expect(body.user).toBe('test-user-key');
+    expect(body.title).toBe('Memory: Core Violation');
+    expect(body.priority).toBe(1);
+    expect(body.message).toContain('mem-456');
+    expect(body.message).toContain('5 memories');
+
+    vi.unstubAllGlobals();
+  });
+
+  it('skips Pushover when credentials not set', async () => {
+    const mockFetch = vi.fn();
+    vi.stubGlobal('fetch', mockFetch);
+
+    const env = {
+      DB: mockDb as unknown as D1Database,
+      // No PUSHOVER_USER_KEY or PUSHOVER_APP_TOKEN
+    };
+
+    const shock = {
+      affected_count: 2,
+      max_confidence_drop: 0.1,
+      affected_memories: [],
+      is_core: true,
+    };
+
+    await insertCoreViolationNotification(env as any, 'mem-789', shock);
+    await new Promise(resolve => setTimeout(resolve, 10));
+
+    expect(mockFetch).not.toHaveBeenCalled();
+
+    vi.unstubAllGlobals();
   });
 });

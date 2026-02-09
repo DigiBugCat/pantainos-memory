@@ -17,6 +17,7 @@
 import type { Env } from '../types/index.js';
 import { createStandaloneLogger } from '../lib/shared/logging/index.js';
 import { applyShock } from './shock-propagation.js';
+import { insertCoreViolationNotification } from './exposure-checker.js';
 
 // Lazy logger - avoids crypto in global scope
 let _log: ReturnType<typeof createStandaloneLogger> | null = null;
@@ -268,6 +269,15 @@ async function applyAutomaticPropagation(
         affected: shock.affected_count,
         max_drop: Math.round(shock.max_confidence_drop * 100),
       });
+
+      // Send Pushover notification for core violation (non-blocking)
+      await insertCoreViolationNotification(env, memoryId, shock).catch(err => {
+        getLog().warn('cascade_notification_failed', {
+          memory_id: memoryId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+
       return shock.affected_count;
     } catch (error) {
       getLog().warn('cascade_shock_failed', {
