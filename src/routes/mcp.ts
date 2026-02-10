@@ -333,6 +333,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       properties: {
         content: { type: 'string', description: 'The memory content' },
         source: { type: 'string', enum: ['market', 'news', 'earnings', 'email', 'human', 'tool'], description: 'Observation source (mutually exclusive with derived_from)' },
+        source_url: { type: 'string', description: 'URL/link where this information came from' },
         derived_from: { type: 'array', items: { type: 'string' }, description: 'Source memory IDs (mutually exclusive with source)' },
         invalidates_if: { type: 'array', items: { type: 'string' }, description: 'Conditions that would prove this wrong' },
         confirms_if: { type: 'array', items: { type: 'string' }, description: 'Conditions that would strengthen this' },
@@ -348,6 +349,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       const {
         content,
         source,
+        source_url,
         derived_from,
         invalidates_if,
         confirms_if,
@@ -359,6 +361,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       } = args as {
         content: string;
         source?: string;
+        source_url?: string;
         derived_from?: string[];
         invalidates_if?: string[];
         confirms_if?: string[];
@@ -475,17 +478,18 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       // Unified INSERT into memories table
       await ctx.env.DB.prepare(
         `INSERT INTO memories (
-          id, content, source, derived_from,
+          id, content, source, source_url, derived_from,
           assumes, invalidates_if, confirms_if,
           outcome_condition, resolves_by,
           starting_confidence, confirmations, times_tested, contradictions,
           centrality, state, violations,
           retracted, tags, obsidian_sources, session_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'active', '[]', 0, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'active', '[]', 0, ?, ?, ?, ?)`
       ).bind(
         id,
         content,
         hasSource ? source : null,
+        source_url || null,
         hasDerivedFrom ? JSON.stringify(derived_from) : null,
         assumes ? JSON.stringify(assumes) : null,
         invalidates_if ? JSON.stringify(invalidates_if) : null,
@@ -522,6 +526,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
           id,
           content,
           source: hasSource ? source : undefined,
+          source_url: source_url || undefined,
           derived_from: hasDerivedFrom ? derived_from : undefined,
           assumes,
           invalidates_if,
@@ -627,6 +632,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         memory_id: { type: 'string', description: 'ID of the memory to update' },
         content: { type: 'string', description: 'New content text (replaces existing)' },
         source: { type: 'string', enum: ['market', 'news', 'earnings', 'email', 'human', 'tool'], description: 'Change observation source (only for observations)' },
+        source_url: { type: 'string', description: 'URL/link where this information came from' },
         derived_from: { type: 'array', items: { type: 'string' }, description: 'Replace derived_from IDs (only for thoughts)' },
         invalidates_if: { type: 'array', items: { type: 'string' }, description: 'Conditions to ADD (not replace)' },
         confirms_if: { type: 'array', items: { type: 'string' }, description: 'Conditions to ADD (not replace)' },
@@ -644,6 +650,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         id: rawId,
         content: newContent,
         source: newSource,
+        source_url: newSourceUrl,
         derived_from: newDerivedFrom,
         invalidates_if,
         confirms_if,
@@ -657,6 +664,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         id?: string;
         content?: string;
         source?: string;
+        source_url?: string;
         derived_from?: string[];
         invalidates_if?: string[];
         confirms_if?: string[];
@@ -789,11 +797,15 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         return errorResult(`Memory still incomplete after update. Add the suggested fields and retry:\n${suggestions}`);
       }
 
+      // Resolve source_url: explicit update wins, otherwise keep existing
+      const effectiveSourceUrl = newSourceUrl !== undefined ? (newSourceUrl || null) : row.source_url ?? null;
+
       // Update the memory
       await ctx.env.DB.prepare(
         `UPDATE memories SET
           content = ?,
           source = ?,
+          source_url = ?,
           derived_from = ?,
           invalidates_if = ?,
           confirms_if = ?,
@@ -807,6 +819,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       ).bind(
         finalContent,
         hasEffectiveSource ? effectiveSource : null,
+        effectiveSourceUrl,
         effectiveDerivedFrom ? JSON.stringify(effectiveDerivedFrom) : null,
         newInvalidatesIf.length > 0 ? JSON.stringify(newInvalidatesIf) : null,
         newConfirmsIf.length > 0 ? JSON.stringify(newConfirmsIf) : null,

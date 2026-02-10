@@ -89,6 +89,7 @@ export interface Memory {
 
   // Origin fields (mutually exclusive in practice)
   source?: ObservationSource;
+  source_url?: string;
   derived_from?: string[];
 
   // Thought fields
@@ -145,6 +146,7 @@ export interface MemoryRow {
   id: string;
   content: string;
   source: string | null;
+  source_url: string | null;
   derived_from: string | null;
   assumes: string | null;
   invalidates_if: string | null;
@@ -311,6 +313,8 @@ export interface MemoryRequest {
   content: string;
   /** Source of observation (mutually exclusive with derived_from) */
   source?: ObservationSource;
+  /** URL/link where this information came from */
+  source_url?: string;
   /** IDs of source memories this thought is based on (mutually exclusive with source) */
   derived_from?: string[];
   /** Conditions that would prove this wrong */

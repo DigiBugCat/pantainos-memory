@@ -158,17 +158,18 @@ app.post('/', async (c) => {
   // Unified INSERT into memories table
   await c.env.DB.prepare(
     `INSERT INTO memories (
-      id, content, source, derived_from,
+      id, content, source, source_url, derived_from,
       assumes, invalidates_if, confirms_if,
       outcome_condition, resolves_by,
       starting_confidence, confirmations, times_tested, contradictions,
       centrality, state, violations,
       retracted, tags, session_id, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'active', '[]', 0, ?, ?, ?)`
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'active', '[]', 0, ?, ?, ?)`
   ).bind(
     id,
     body.content,
     hasSource ? body.source : null,
+    body.source_url || null,
     hasDerivedFrom ? JSON.stringify(body.derived_from) : null,
     body.assumes ? JSON.stringify(body.assumes) : null,
     body.invalidates_if ? JSON.stringify(body.invalidates_if) : null,
@@ -204,6 +205,7 @@ app.post('/', async (c) => {
       id,
       content: body.content,
       source: hasSource ? body.source : undefined,
+      source_url: body.source_url || undefined,
       derived_from: hasDerivedFrom ? body.derived_from : undefined,
       assumes: body.assumes,
       invalidates_if: body.invalidates_if,
