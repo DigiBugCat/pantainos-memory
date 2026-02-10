@@ -34,8 +34,6 @@ function makeMemory(overrides: Partial<Memory> = {}): Memory {
     violations: [],
     retracted: false,
     exposure_check_status: 'completed',
-    cascade_boosts: 0,
-    cascade_damages: 0,
     created_at: Date.now(),
     ...overrides,
   };

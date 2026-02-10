@@ -41,10 +41,6 @@ export function rowToMemory(row: MemoryRow): Memory {
     // Exposure check tracking
     exposure_check_status: (row.exposure_check_status as ExposureCheckStatus) || 'pending',
     exposure_check_completed_at: row.exposure_check_completed_at || undefined,
-    // Cascade tracking
-    cascade_boosts: row.cascade_boosts || 0,
-    cascade_damages: row.cascade_damages || 0,
-    last_cascade_at: row.last_cascade_at || undefined,
   };
 }
 
@@ -83,9 +79,5 @@ export function memoryToRow(memory: Memory): Partial<MemoryRow> {
     // Exposure check tracking
     exposure_check_status: memory.exposure_check_status,
     exposure_check_completed_at: memory.exposure_check_completed_at,
-    // Cascade tracking
-    cascade_boosts: memory.cascade_boosts,
-    cascade_damages: memory.cascade_damages,
-    last_cascade_at: memory.last_cascade_at,
   };
 }

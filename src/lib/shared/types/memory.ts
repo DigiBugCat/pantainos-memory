@@ -128,11 +128,6 @@ export interface Memory {
   exposure_check_status: ExposureCheckStatus;
   exposure_check_completed_at?: number;
 
-  // Cascade tracking
-  cascade_boosts: number;
-  cascade_damages: number;
-  last_cascade_at?: number;
-
   // Metadata
   tags?: string[];
   obsidian_sources?: string[];
@@ -168,10 +163,6 @@ export interface MemoryRow {
   // Exposure check tracking
   exposure_check_status: string;
   exposure_check_completed_at: number | null;
-  // Cascade tracking
-  cascade_boosts: number;
-  cascade_damages: number;
-  last_cascade_at: number | null;
   // Metadata
   tags: string | null;
   obsidian_sources: string | null;
@@ -269,10 +260,6 @@ export interface ConfidenceStats {
   violation_count: number;
   /** Exposure check status for async processing tracking */
   exposure_check_status: ExposureCheckStatus;
-  /** Times boosted via cascade from downstream memories */
-  cascade_boosts: number;
-  /** Times damaged via cascade from downstream memories */
-  cascade_damages: number;
 }
 
 /** Scored memory for search results */

@@ -36,12 +36,6 @@ export interface StatsResponse {
   exposure_status: Record<ExposureCheckStatus, number>;
   // Robustness tier distribution (for thoughts only)
   robustness_tiers: Record<Robustness, number>;
-  // Cascade event counts
-  cascade_events: {
-    pending: number;
-    total_boosts: number;
-    total_damages: number;
-  };
   // State distribution (for thoughts)
   state_distribution: {
     active: number;
@@ -129,23 +123,6 @@ app.get('/', async (c) => {
     robustnessMap[row.tier as Robustness] = row.count;
   }
 
-  // Cascade event counts
-  const cascadeEvents = await c.env.DB.prepare(`
-    SELECT
-      COUNT(*) as pending_count
-    FROM memory_events
-    WHERE status = 'pending'
-      AND event_type LIKE '%:cascade_%'
-  `).first<{ pending_count: number }>();
-
-  const cascadeTotals = await c.env.DB.prepare(`
-    SELECT
-      SUM(COALESCE(cascade_boosts, 0)) as total_boosts,
-      SUM(COALESCE(cascade_damages, 0)) as total_damages
-    FROM memories
-    WHERE retracted = 0
-  `).first<{ total_boosts: number; total_damages: number }>();
-
   // State distribution (for thoughts)
   const stateDistribution = await c.env.DB.prepare(`
     SELECT
@@ -180,11 +157,6 @@ app.get('/', async (c) => {
     },
     exposure_status: exposureStatusMap,
     robustness_tiers: robustnessMap,
-    cascade_events: {
-      pending: cascadeEvents?.pending_count || 0,
-      total_boosts: cascadeTotals?.total_boosts || 0,
-      total_damages: cascadeTotals?.total_damages || 0,
-    },
     state_distribution: stateMap,
   };
 

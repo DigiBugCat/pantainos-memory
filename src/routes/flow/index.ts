@@ -21,8 +21,6 @@ import observeRoute from './observe.js';
 import confirmRoute from './confirm.js';
 import violateRoute from './violate.js';
 import retractRoute from './retract.js';
-import cascadeEventsRoute from './cascade-events.js';
-import cascadeApplyRoute from './cascade-apply.js';
 
 type Variables = {
   config: Config;
@@ -51,9 +49,5 @@ app.route('/observe', observeRoute);
 app.route('/confirm', confirmRoute);
 app.route('/violate', violateRoute);
 app.route('/retract', retractRoute);
-
-// Cascade routes (for processing cascade events)
-app.route('/cascade', cascadeEventsRoute);
-app.route('/cascade', cascadeApplyRoute);
 
 export default app;

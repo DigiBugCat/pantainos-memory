@@ -601,6 +601,16 @@ async function dispatchSessionEvents(
     event_count: events.length,
   });
 
+  // Safe JSON.parse wrapper — malformed context must not kill the entire batch
+  const safeParseContext = (raw: string | null | undefined): Record<string, unknown> => {
+    try {
+      return JSON.parse(raw || '{}');
+    } catch {
+      log.warn('bad_event_context', { raw: String(raw).slice(0, 200) });
+      return {};
+    }
+  };
+
   // Group events by type
   const violations: ViolationEvent[] = events
     .filter((e) => e.event_type === 'violation')
@@ -609,7 +619,7 @@ async function dispatchSessionEvents(
       memory_id: e.memory_id,
       violated_by: e.violated_by,
       damage_level: e.damage_level,
-      context: JSON.parse(e.context || '{}'),
+      context: safeParseContext(e.context),
     }));
 
   const confirmations: ConfirmationEvent[] = events
@@ -617,24 +627,24 @@ async function dispatchSessionEvents(
     .map((e) => ({
       id: e.id,
       memory_id: e.memory_id,
-      context: JSON.parse(e.context || '{}'),
+      context: safeParseContext(e.context),
     }));
 
   const cascades: CascadeEvent[] = events
     .filter((e) => e.event_type.includes(':cascade_'))
     .map((e) => {
-      const context = JSON.parse(e.context || '{}');
+      const context = safeParseContext(e.context);
       return {
         id: e.id,
         memory_id: e.memory_id,
         cascade_type: 'review' as const,
         memory_type: 'thought' as const,
         context: {
-          reason: context.reason || '',
-          source_id: context.source_id || '',
-          source_outcome: context.source_outcome || 'void',
-          edge_type: context.edge_type || '',
-          suggested_action: context.suggested_action || 'review',
+          reason: (context.reason as string) || '',
+          source_id: (context.source_id as string) || '',
+          source_outcome: (context.source_outcome as 'correct' | 'incorrect' | 'void') || 'void',
+          edge_type: (context.edge_type as string) || '',
+          suggested_action: (context.suggested_action as string) || 'review',
         },
       };
     });
@@ -642,16 +652,16 @@ async function dispatchSessionEvents(
   const overduePredictions: OverduePredictionEvent[] = events
     .filter((e) => e.event_type === 'thought:pending_resolution')
     .map((e) => {
-      const context = JSON.parse(e.context || '{}');
+      const context = safeParseContext(e.context);
       return {
         id: e.id,
         memory_id: e.memory_id,
         context: {
-          content: context.content || '',
-          outcome_condition: context.outcome_condition || null,
-          resolves_by: context.resolves_by || 0,
-          invalidates_if: context.invalidates_if,
-          confirms_if: context.confirms_if,
+          content: (context.content as string) || '',
+          outcome_condition: (context.outcome_condition as string) || null,
+          resolves_by: (context.resolves_by as number) || 0,
+          invalidates_if: context.invalidates_if as string[] | undefined,
+          confirms_if: context.confirms_if as string[] | undefined,
         },
       };
     });
@@ -719,7 +729,14 @@ async function dispatchSessionEvents(
         return payload.batchId;
       } catch (error) {
         // Release failed events back to pending so next cron tick can retry
-        await releaseClaimedEvents(env, eventIds);
+        try {
+          await releaseClaimedEvents(env, eventIds);
+        } catch (releaseError) {
+          log.error('release_claimed_events_failed', {
+            error: releaseError instanceof Error ? releaseError.message : String(releaseError),
+            event_ids: eventIds,
+          });
+        }
         throw error;
       }
     })

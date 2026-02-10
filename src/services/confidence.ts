@@ -204,8 +204,6 @@ export function getConfidenceStats(
     centrality: memory.centrality,
     violation_count: memory.violations.length,
     exposure_check_status: memory.exposure_check_status,
-    cascade_boosts: memory.cascade_boosts,
-    cascade_damages: memory.cascade_damages,
   };
 }
 
