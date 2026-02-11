@@ -11,8 +11,11 @@ import { createWorkerApp, type LoggingEnv } from './lib/shared/hono/index.js';
 import { logField } from './lib/shared/logging/index.js';
 import { cors } from 'hono/cors';
 import type { Env as BaseEnv } from './types/index.js';
+import type { Violation } from './lib/shared/types/index.js';
 import { getConfig, type Config } from './lib/config.js';
 import { authorizeHandler, tokenHandler, registerHandler, validateAccessToken } from '@pantainos/mcp-core';
+import { callExternalLLM } from './lib/embeddings.js';
+import { buildInvalidatesIfPrompt, parseConditionResponse } from './services/exposure-checker.js';
 
 // Route imports
 import adminMcpRoutes from './routes/admin-mcp.js';
@@ -233,6 +236,163 @@ app.use('/mcp/*', async (c, next) => {
 });
 
 app.route('/mcp', adminMcpRoutes);
+
+// ============================================
+// Internal REST Routes (CF Access protected — no OAuth needed)
+// ============================================
+
+app.post('/internal/re-evaluate', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const batchSize = Math.min((body.batch_size as number) || 10, 50);
+  const dryRun = body.dry_run !== false;
+  const confidenceThreshold = (body.confidence_threshold as number) || 0.7;
+
+  if (!c.env.LLM_JUDGE_URL) {
+    return c.json({ error: 'LLM_JUDGE_URL not configured' }, 500);
+  }
+
+  // Fetch violated memories (skip recently re-evaluated within last hour)
+  const oneHourAgo = Date.now() - 3600_000;
+  const result = await c.env.DB.prepare(
+    `SELECT id, content, violations, contradictions, times_tested, state
+     FROM memories
+     WHERE state = 'violated' AND retracted = 0
+       AND updated_at < ?
+     ORDER BY updated_at ASC
+     LIMIT ?`
+  ).bind(oneHourAgo, batchSize).all<{
+    id: string; content: string; violations: string;
+    contradictions: number; times_tested: number; state: string;
+  }>();
+
+  const violatedMemories = result.results || [];
+
+  if (violatedMemories.length === 0) {
+    return c.json({ message: 'No violated memories to re-evaluate', cleared: 0, kept: 0 });
+  }
+
+  // Stream NDJSON so curl shows progress in real-time
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+
+  const write = (obj: Record<string, unknown>) => {
+    writer.write(encoder.encode(JSON.stringify(obj) + '\n'));
+  };
+
+  const processAll = async () => {
+    let cleared = 0;
+    let kept = 0;
+    let errors = 0;
+
+    write({ type: 'start', total: violatedMemories.length, dry_run: dryRun });
+
+    for (const memory of violatedMemories) {
+      const violations: Violation[] = JSON.parse(memory.violations || '[]');
+
+      if (violations.length === 0) {
+        if (!dryRun) {
+          await c.env.DB.prepare(
+            `UPDATE memories SET state = 'active', updated_at = ? WHERE id = ?`
+          ).bind(Date.now(), memory.id).run();
+        }
+        write({ type: 'result', id: memory.id, action: 'clear', reason: 'empty violations array' });
+        cleared++;
+        continue;
+      }
+
+      const keptViolations: Violation[] = [];
+      const clearedViolations: Violation[] = [];
+
+      for (const violation of violations) {
+        try {
+          const obs = await c.env.DB.prepare(
+            'SELECT content FROM memories WHERE id = ?'
+          ).bind(violation.obs_id).first<{ content: string }>();
+
+          if (!obs) {
+            keptViolations.push(violation);
+            write({ type: 'skip', id: memory.id, condition: violation.condition, reason: 'obs not found' });
+            continue;
+          }
+
+          const prompt = buildInvalidatesIfPrompt(obs.content, violation.condition, memory.content);
+          const responseText = await callExternalLLM(
+            c.env.LLM_JUDGE_URL!,
+            prompt,
+            { apiKey: c.env.LLM_JUDGE_API_KEY, model: c.env.LLM_JUDGE_MODEL }
+          );
+          const judge = parseConditionResponse(responseText);
+
+          if (judge.matches && judge.confidence >= confidenceThreshold) {
+            keptViolations.push(violation);
+            write({
+              type: 'result', id: memory.id, action: 'keep',
+              condition: violation.condition,
+              confidence: judge.confidence,
+              reasoning: judge.reasoning?.slice(0, 150),
+            });
+          } else {
+            clearedViolations.push(violation);
+            write({
+              type: 'result', id: memory.id, action: 'clear',
+              condition: violation.condition,
+              confidence: judge.confidence,
+              reasoning: judge.reasoning?.slice(0, 150),
+            });
+          }
+        } catch (err) {
+          keptViolations.push(violation);
+          errors++;
+          write({ type: 'error', id: memory.id, condition: violation.condition, error: String(err) });
+        }
+      }
+
+      // Apply changes
+      if (clearedViolations.length > 0 && !dryRun) {
+        const now = Date.now();
+        const newContradictions = Math.max(0, memory.contradictions - clearedViolations.length);
+
+        if (keptViolations.length === 0) {
+          await c.env.DB.prepare(
+            `UPDATE memories SET violations = '[]', contradictions = ?, state = 'active', updated_at = ? WHERE id = ?`
+          ).bind(newContradictions, now, memory.id).run();
+        } else {
+          await c.env.DB.prepare(
+            `UPDATE memories SET violations = ?, contradictions = ?, updated_at = ? WHERE id = ?`
+          ).bind(JSON.stringify(keptViolations), newContradictions, now, memory.id).run();
+        }
+
+        for (const v of clearedViolations) {
+          await c.env.DB.prepare(
+            `DELETE FROM edges WHERE source_id = ? AND target_id = ? AND edge_type = 'violated_by'`
+          ).bind(v.obs_id, memory.id).run();
+        }
+      }
+
+      if (clearedViolations.length > 0) cleared++;
+      if (keptViolations.length > 0) kept++;
+    }
+
+    write({ type: 'done', cleared, kept, errors, dry_run: dryRun });
+    writer.close();
+  };
+
+  // Fire and don't await — the stream stays open
+  processAll().catch(async (err) => {
+    try {
+      write({ type: 'fatal', error: String(err) });
+    } catch { /* stream may be closed */ }
+    writer.close().catch(() => {});
+  });
+
+  return new Response(readable, {
+    headers: {
+      'Content-Type': 'application/x-ndjson',
+      'Transfer-Encoding': 'chunked',
+    },
+  });
+});
 
 // Export for Cloudflare Workers
 export default {

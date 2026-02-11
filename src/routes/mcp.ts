@@ -2351,11 +2351,11 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       try {
         let summary: string;
 
-        if (ctx.env.CLAUDE_PROXY || ctx.env.LLM_JUDGE_URL) {
+        if (ctx.env.LLM_JUDGE_URL) {
           summary = await callExternalLLM(
-            ctx.env.CLAUDE_PROXY ?? ctx.env.LLM_JUDGE_URL!,
+            ctx.env.LLM_JUDGE_URL,
             prompt,
-            { apiKey: ctx.env.LLM_JUDGE_API_KEY, requestId }
+            { apiKey: ctx.env.LLM_JUDGE_API_KEY, model: ctx.env.LLM_JUDGE_MODEL, requestId }
           );
         } else {
           // Workers AI fallback

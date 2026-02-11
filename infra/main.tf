@@ -81,7 +81,9 @@ locals {
     { type = "secret_text", name = "RESOLVER_GITHUB_TOKEN", text = var.resolver_github_token },
     { type = "plain_text", name = "CF_ACCESS_TEAM", text = var.cf_access_team },
     { type = "plain_text", name = "CLASSIFICATION_CHALLENGE_ENABLED", text = "true" },
-    { type = "service", name = "CLAUDE_PROXY", service = var.claude_proxy_worker_name },
+    { type = "plain_text", name = "LLM_JUDGE_URL", text = var.llm_judge_url },
+    { type = "plain_text", name = "LLM_JUDGE_MODEL", text = var.llm_judge_model },
+    { type = "secret_text", name = "LLM_JUDGE_API_KEY", text = var.llm_judge_api_key },
     { type = "secret_text", name = "PUSHOVER_USER_KEY", text = var.pushover_user_key },
     { type = "secret_text", name = "PUSHOVER_APP_TOKEN", text = var.pushover_app_token },
   ]
@@ -420,6 +422,47 @@ resource "cloudflare_zero_trust_access_application" "admin_endpoint" {
       everyone = {}
     }]
   }]
+}
+
+# CF Access app for admin /internal REST endpoints - requires Google login
+resource "cloudflare_zero_trust_access_application" "admin_internal" {
+  account_id = var.account_id
+  name       = "Pantainos Memory Admin Internal${local.is_prod ? "" : " (${title(var.environment)})"}"
+  type       = "self_hosted"
+
+  domain = "${local.admin_url}/internal"
+
+  allowed_idps              = [local.google_id]
+  auto_redirect_to_identity = true
+  session_duration          = "24h"
+  app_launcher_visible      = false
+
+  enable_binding_cookie      = true
+  http_only_cookie_attribute = true
+  same_site_cookie_attribute = "lax"
+
+  policies = [
+    {
+      name       = "Allow service token"
+      decision   = "non_identity"
+      precedence = 1
+      include = [{
+        service_token = {
+          token_id = cloudflare_zero_trust_access_service_token.mcp.id
+        }
+      }]
+    },
+    {
+      name       = "Allow authorized users"
+      decision   = "allow"
+      precedence = 2
+      include = [{
+        group = {
+          id = cloudflare_zero_trust_access_group.memory_users.id
+        }
+      }]
+    },
+  ]
 }
 
 # =============================================================================

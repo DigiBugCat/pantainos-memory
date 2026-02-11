@@ -217,14 +217,15 @@ pnpm deploy:dev   # Deploy API worker to dev
 | `CF_ACCESS_TEAM` | Cloudflare Access team name | - |
 | `CF_ACCESS_AUD` | Access application AUD tag | - |
 
-### External LLM Endpoint
+### LLM Judge Endpoint
 
-LLM judge calls use a `CLAUDE_PROXY` service binding by default (worker-to-worker). Alternatively, configure an external endpoint:
+LLM judge calls (exposure checking, dedup, classification) use an OpenAI-compatible endpoint. Falls back to Workers AI if not configured.
 
-| Variable | Description |
-|----------|-------------|
-| `LLM_JUDGE_URL` | OpenAI-compatible chat completions endpoint |
-| `LLM_JUDGE_API_KEY` | Bearer token for authentication (optional) |
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `LLM_JUDGE_URL` | OpenAI-compatible chat completions endpoint | - |
+| `LLM_JUDGE_API_KEY` | Bearer token for authentication | - |
+| `LLM_JUDGE_MODEL` | Model name to use | `gpt-5-mini` |
 
 ### Event Dispatch
 

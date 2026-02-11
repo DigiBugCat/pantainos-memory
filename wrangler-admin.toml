@@ -50,11 +50,6 @@ id = "44a53cd6bcbd4aadae45c51d1769b204"
 binding = "ANALYTICS"
 dataset = "memory_admin_prod"
 
-# Service Binding to claude-proxy
-[[services]]
-binding = "CLAUDE_PROXY"
-service = "claude-proxy"
-
 # Configuration Variables
 [vars]
 REASONING_MODEL = "@cf/openai/gpt-oss-120b"
@@ -71,10 +66,6 @@ name = "pantainos-memory-admin-dev"
 
 [env.dev.ai]
 binding = "AI"
-
-[[env.dev.services]]
-binding = "CLAUDE_PROXY"
-service = "claude-proxy-dev"
 
 [env.dev.vars]
 REASONING_MODEL = "@cf/openai/gpt-oss-120b"

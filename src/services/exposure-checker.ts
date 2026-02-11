@@ -7,7 +7,7 @@
  *   - assumes: Underlying assumptions that if contradicted, damage the memory (violation)
  *   - confirms_if: Conditions that would strengthen a prediction (auto-confirm)
  *
- * Uses configurable model (default: gpt-oss-120b) with JSON schema enforcement.
+ * Uses configurable LLM endpoint (default: OpenAI gpt-5-mini) with JSON schema enforcement.
  */
 
 import type {
@@ -66,7 +66,7 @@ function getThresholds(env: Env) {
 /** Condition type being checked */
 type ConditionType = 'invalidates_if' | 'assumes' | 'confirms_if';
 
-interface ConditionMatch {
+export interface ConditionMatch {
   matches: boolean;
   confidence: number;
   reasoning?: string;
@@ -218,7 +218,7 @@ function extractContent(response: unknown): string {
  * Parse AI response with JSON schema enforcement and regex fallback.
  * Tries structured output first, falls back to regex extraction.
  */
-function parseConditionResponse(responseText: string): ConditionMatch {
+export function parseConditionResponse(responseText: string): ConditionMatch {
   try {
     // Try direct JSON parse first (structured output)
     const parsed = JSON.parse(responseText);
@@ -263,12 +263,12 @@ function parseConditionResponse(responseText: string): ConditionMatch {
  * Build prompt for invalidates_if condition check.
  * Checks if observation indicates the invalidation condition is TRUE.
  */
-function buildInvalidatesIfPrompt(
+export function buildInvalidatesIfPrompt(
   observationContent: string,
   condition: string,
   memoryContent: string
 ): string {
-  return `You are checking if an observation matches a condition that would invalidate a belief.
+  return `You are a precise fact-checker determining if an observation proves an invalidation condition is TRUE.
 
 MEMORY: "${memoryContent}"
 
@@ -276,19 +276,20 @@ INVALIDATION CONDITION: "${condition}"
 
 OBSERVATION: "${observationContent}"
 
-Does this observation indicate that the invalidation condition is TRUE?
+CRITICAL RULES — only return matches=true if ALL of these hold:
+1. ENTITY CHECK: The observation must be about the SAME specific entity (company, person, asset) referenced in the condition. An observation about Company A cannot invalidate a condition about Company B, even if they are in the same sector.
+2. PROOF vs RISK: The observation must provide evidence the condition ACTUALLY HAPPENED, not merely that it COULD happen. Historical analogs, risk factors, supply chain constraints, and theoretical frameworks are NOT proof. "Turbine blades are constrained" ≠ "capacity target was missed."
+3. DIRECTIONAL PRECISION: Parse the exact wording. "Decelerates" ≠ "reverses." "Slows growth" ≠ "declines." If the condition says "drops below X" the observation must show the value actually went below X.
+4. THRESHOLD MET: If the condition specifies a threshold (e.g., "above $3.5B", "below 80%", "majority"), the observation must show that specific threshold was crossed, not just movement in that direction.
 
-Consider:
-1. Does the observation directly state or strongly imply the condition is met?
-2. Is the observation merely related but doesn't actually satisfy the condition?
-3. How confident are you in this assessment?
+If the observation is topically related but fails any rule above, return matches=false with relevantButNotViolation=true.
 
 Respond with JSON only:
 {
   "matches": boolean,
   "confidence": number (0-1),
-  "reasoning": "brief explanation",
-  "relevantButNotViolation": boolean (true if related but doesn't invalidate)
+  "reasoning": "brief explanation citing which rules passed/failed",
+  "relevantButNotViolation": boolean
 }`;
 }
 
@@ -296,12 +297,12 @@ Respond with JSON only:
  * Build prompt for assumes condition check.
  * Checks if observation CONTRADICTS the underlying assumption.
  */
-function buildAssumesPrompt(
+export function buildAssumesPrompt(
   observationContent: string,
   assumption: string,
   memoryContent: string
 ): string {
-  return `You are checking if an observation contradicts an underlying assumption.
+  return `You are a precise fact-checker determining if an observation CONTRADICTS an underlying assumption.
 
 MEMORY: "${memoryContent}"
 
@@ -309,16 +310,16 @@ ASSUMPTION: The memory assumes "${assumption}"
 
 OBSERVATION: "${observationContent}"
 
-Does this observation CONTRADICT or NEGATE this assumption?
-
-Important: Only return matches=true if the observation clearly contradicts the assumption.
-A lack of confirmation is NOT a contradiction.
+CRITICAL RULES — only return matches=true if ALL hold:
+1. ENTITY CHECK: The observation must be about the SAME entity as the assumption.
+2. DIRECT CONTRADICTION: The observation must clearly negate the assumption with factual evidence. A lack of confirmation is NOT a contradiction. A risk factor is NOT a contradiction.
+3. SAME SCOPE: The observation must address the assumption at the same level of specificity. A broad industry trend does not contradict a company-specific assumption unless it directly applies.
 
 Respond with JSON only:
 {
   "matches": boolean,
   "confidence": number (0-1),
-  "reasoning": "brief explanation",
+  "reasoning": "brief explanation citing which rules passed/failed",
   "relevantButNotViolation": boolean (true if related but doesn't contradict)
 }`;
 }
@@ -332,7 +333,7 @@ function buildConfirmsIfPrompt(
   condition: string,
   memoryContent: string
 ): string {
-  return `You are checking if an observation confirms a prediction.
+  return `You are a precise fact-checker determining if an observation confirms a prediction.
 
 PREDICTION: "${memoryContent}"
 
@@ -340,18 +341,16 @@ CONFIRMATION CONDITION: "${condition}"
 
 OBSERVATION: "${observationContent}"
 
-Does this observation indicate that the confirmation condition is TRUE, thereby confirming the prediction?
-
-Consider:
-1. Does the observation directly satisfy the confirmation condition?
-2. Is it merely related but not conclusive?
-3. How confident are you?
+CRITICAL RULES — only return matches=true if ALL hold:
+1. ENTITY CHECK: The observation must be about the SAME entity as the prediction.
+2. DIRECT EVIDENCE: The observation must provide concrete evidence the confirmation condition was met, not just directional movement or sentiment.
+3. THRESHOLD MET: If the condition specifies a threshold, the observation must show it was crossed.
 
 Respond with JSON only:
 {
   "matches": boolean,
   "confidence": number (0-1),
-  "reasoning": "brief explanation"
+  "reasoning": "brief explanation citing which rules passed/failed"
 }`;
 }
 
@@ -886,13 +885,13 @@ async function checkConditionMatch(
   try {
     let responseText: string;
 
-    // Use external LLM endpoint if configured (service binding or URL)
-    if (env.CLAUDE_PROXY || env.LLM_JUDGE_URL) {
+    // Use external LLM endpoint if configured
+    if (env.LLM_JUDGE_URL) {
       responseText = await withRetry(
         () => callExternalLLM(
-          env.CLAUDE_PROXY ?? env.LLM_JUDGE_URL!,
+          env.LLM_JUDGE_URL!,
           prompt,
-          { apiKey: env.LLM_JUDGE_API_KEY }
+          { apiKey: env.LLM_JUDGE_API_KEY, model: env.LLM_JUDGE_MODEL }
         ),
         { retries: 2, delay: 100 }
       );

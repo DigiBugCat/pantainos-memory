@@ -19,6 +19,12 @@ import {
 } from '../lib/shared/mcp/index.js';
 import { deleteConditionVectors } from '../services/embedding-tables.js';
 import { propagateResolution } from '../services/cascade.js';
+import { callExternalLLM } from '../lib/embeddings.js';
+import {
+  buildInvalidatesIfPrompt,
+  parseConditionResponse,
+} from '../services/exposure-checker.js';
+import type { Violation } from '../lib/shared/types/index.js';
 // Available for future admin tools:
 // import { computeSystemStats, getSystemStatsSummary } from '../jobs/compute-stats.js';
 
@@ -879,6 +885,214 @@ const createAdminTools = () => createToolRegistry<Env>([
       }
 
       return textResult(`Retracted ${toRetract.length} memor${toRetract.length === 1 ? 'y' : 'ies'}.\n\nReason: ${reason}`);
+    },
+  }),
+
+  // ----------------------------------------
+  // re_evaluate_violations - Re-check false violations with improved LLM judge
+  // ----------------------------------------
+  defineTool({
+    name: 're_evaluate_violations',
+    description: 'Re-evaluate violated memories using the current LLM judge (gpt-5-mini + improved prompts). Identifies false positive violations and optionally clears them, restoring memories to active state. Use after prompt improvements or model upgrades to clean up historical false violations.',
+    annotations: {
+      title: 'Re-evaluate Violations',
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        memory_id: {
+          type: 'string',
+          description: 'Re-evaluate a specific memory ID (optional, omit for batch)',
+        },
+        batch_size: {
+          type: 'number',
+          description: 'How many violated memories to process (default: 10, max: 50)',
+        },
+        dry_run: {
+          type: 'boolean',
+          description: 'Preview results without modifying state (default: true)',
+        },
+        confidence_threshold: {
+          type: 'number',
+          description: 'Minimum confidence to keep a violation as valid (default: 0.7)',
+        },
+      },
+    },
+    handler: async (args: Record<string, unknown>, ctx: ToolContext<Env>) => {
+      const memoryId = args.memory_id as string | undefined;
+      const batchSize = Math.min((args.batch_size as number) || 10, 50);
+      const dryRun = args.dry_run !== false; // default true
+      const confidenceThreshold = (args.confidence_threshold as number) || 0.7;
+
+      // Check LLM judge is configured
+      if (!ctx.env.LLM_JUDGE_URL) {
+        return errorResult('LLM_JUDGE_URL not configured. Cannot re-evaluate without LLM judge.');
+      }
+
+      // Fetch violated memories
+      let violatedMemories: Array<{
+        id: string;
+        content: string;
+        violations: string;
+        contradictions: number;
+        times_tested: number;
+        state: string;
+      }>;
+
+      if (memoryId) {
+        const row = await ctx.env.DB.prepare(
+          `SELECT id, content, violations, contradictions, times_tested, state
+           FROM memories WHERE id = ? AND retracted = 0`
+        ).bind(memoryId).first();
+        violatedMemories = row ? [row as typeof violatedMemories[0]] : [];
+      } else {
+        // Order by updated_at ASC so recently re-evaluated (kept) violations
+        // don't keep appearing at the top of every batch
+        const oneHourAgo = Date.now() - 3600_000;
+        const result = await ctx.env.DB.prepare(
+          `SELECT id, content, violations, contradictions, times_tested, state
+           FROM memories
+           WHERE state = 'violated' AND retracted = 0
+             AND updated_at < ?
+           ORDER BY updated_at ASC
+           LIMIT ?`
+        ).bind(oneHourAgo, batchSize).all();
+        violatedMemories = (result.results || []) as typeof violatedMemories;
+      }
+
+      if (violatedMemories.length === 0) {
+        return textResult('No violated memories found to re-evaluate.');
+      }
+
+      let text = `${dryRun ? '[DRY RUN] ' : ''}Re-evaluating ${violatedMemories.length} violated memor${violatedMemories.length === 1 ? 'y' : 'ies'}...\n\n`;
+
+      let cleared = 0;
+      let kept = 0;
+      let errors = 0;
+
+      for (const memory of violatedMemories) {
+        const violations: Violation[] = JSON.parse(memory.violations || '[]');
+        if (violations.length === 0) {
+          text += `[${memory.id}] No violations in array (state mismatch) — ${dryRun ? 'would clear' : 'clearing'} state\n`;
+          if (!dryRun) {
+            await ctx.env.DB.prepare(
+              `UPDATE memories SET state = 'active', updated_at = ? WHERE id = ?`
+            ).bind(Date.now(), memory.id).run();
+          }
+          cleared++;
+          continue;
+        }
+
+        text += `--- [${memory.id}] ${memory.content.slice(0, 80)}... ---\n`;
+
+        // Re-evaluate each violation in this memory
+        const keptViolations: Violation[] = [];
+        const clearedViolations: Violation[] = [];
+
+        for (const violation of violations) {
+          try {
+            // Fetch the triggering observation
+            const obs = await ctx.env.DB.prepare(
+              'SELECT content FROM memories WHERE id = ?'
+            ).bind(violation.obs_id).first<{ content: string }>();
+
+            if (!obs) {
+              text += `  [SKIP] obs ${violation.obs_id} not found — keeping violation\n`;
+              keptViolations.push(violation);
+              continue;
+            }
+
+            // Build prompt based on violation source type
+            const prompt = buildInvalidatesIfPrompt(
+              obs.content,
+              violation.condition,
+              memory.content
+            );
+
+            // Call LLM judge
+            const responseText = await callExternalLLM(
+              ctx.env.LLM_JUDGE_URL!,
+              prompt,
+              { apiKey: ctx.env.LLM_JUDGE_API_KEY, model: ctx.env.LLM_JUDGE_MODEL }
+            );
+
+            const result = parseConditionResponse(responseText);
+
+            if (result.matches && result.confidence >= confidenceThreshold) {
+              // Violation is still valid
+              keptViolations.push(violation);
+              text += `  [KEEP] "${violation.condition}" — matches=${result.matches} conf=${result.confidence.toFixed(2)} — ${result.reasoning?.slice(0, 100) || ''}\n`;
+            } else {
+              // False positive!
+              clearedViolations.push(violation);
+              text += `  [CLEAR] "${violation.condition}" — matches=${result.matches} conf=${result.confidence.toFixed(2)} — ${result.reasoning?.slice(0, 100) || ''}\n`;
+            }
+          } catch (err) {
+            text += `  [ERROR] "${violation.condition}" — ${err instanceof Error ? err.message : String(err)}\n`;
+            keptViolations.push(violation); // keep on error (conservative)
+            errors++;
+          }
+        }
+
+        // Apply changes if not dry run
+        if (clearedViolations.length > 0 && !dryRun) {
+          const now = Date.now();
+          const contradictionsRemoved = clearedViolations.length;
+          const newContradictions = Math.max(0, memory.contradictions - contradictionsRemoved);
+
+          if (keptViolations.length === 0) {
+            // All violations cleared — restore to active
+            await ctx.env.DB.prepare(
+              `UPDATE memories
+               SET violations = '[]',
+                   contradictions = ?,
+                   state = 'active',
+                   updated_at = ?
+               WHERE id = ?`
+            ).bind(newContradictions, now, memory.id).run();
+
+            // Remove violated_by edges for cleared violations
+            for (const v of clearedViolations) {
+              await ctx.env.DB.prepare(
+                `DELETE FROM edges WHERE source_id = ? AND target_id = ? AND edge_type = 'violated_by'`
+              ).bind(v.obs_id, memory.id).run();
+            }
+          } else {
+            // Some violations remain — keep violated state but update violations array
+            await ctx.env.DB.prepare(
+              `UPDATE memories
+               SET violations = ?,
+                   contradictions = ?,
+                   updated_at = ?
+               WHERE id = ?`
+            ).bind(JSON.stringify(keptViolations), newContradictions, now, memory.id).run();
+
+            // Remove edges for cleared violations only
+            for (const v of clearedViolations) {
+              await ctx.env.DB.prepare(
+                `DELETE FROM edges WHERE source_id = ? AND target_id = ? AND edge_type = 'violated_by'`
+              ).bind(v.obs_id, memory.id).run();
+            }
+          }
+        }
+
+        if (clearedViolations.length > 0) cleared++;
+        if (keptViolations.length > 0) kept++;
+        text += '\n';
+      }
+
+      text += `\n--- Summary ---\n`;
+      text += `Memories with false positives cleared: ${cleared}\n`;
+      text += `Memories with valid violations kept: ${kept}\n`;
+      text += `Errors: ${errors}\n`;
+      if (dryRun) {
+        text += `\nThis was a DRY RUN. Set dry_run: false to apply changes.`;
+      }
+
+      return textResult(text);
     },
   }),
 

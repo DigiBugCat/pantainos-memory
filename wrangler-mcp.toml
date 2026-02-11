@@ -56,11 +56,6 @@ dataset = "memory_mcp_prod"
 queue = "pantainos-memory-detection"
 binding = "DETECTION_QUEUE"
 
-# Service Binding to claude-proxy (worker-to-worker, bypasses CF Access)
-[[services]]
-binding = "CLAUDE_PROXY"
-service = "claude-proxy"
-
 # Configuration Variables
 [vars]
 REASONING_MODEL = "@cf/openai/gpt-oss-120b"
@@ -71,7 +66,8 @@ DEDUP_CONFIDENCE_THRESHOLD = "0.8"
 RESOLVER_TYPE = "github"
 RESOLVER_GITHUB_REPO = "DigiBugCat/Cassandra-Finance"
 CLASSIFICATION_CHALLENGE_ENABLED = "true"
-LLM_JUDGE_URL = "https://claude-proxy.pantainos.workers.dev/v1/chat/completions"
+LLM_JUDGE_URL = "https://api.openai.com/v1/chat/completions"
+LLM_JUDGE_MODEL = "gpt-5-mini"
 
 # ============================================
 # Dev Environment
@@ -86,10 +82,6 @@ binding = "AI"
 queue = "pantainos-memory-dev-detection"
 binding = "DETECTION_QUEUE"
 
-[[env.dev.services]]
-binding = "CLAUDE_PROXY"
-service = "claude-proxy-dev"
-
 [env.dev.vars]
 REASONING_MODEL = "@cf/openai/gpt-oss-120b"
 DEDUP_MODEL = "@cf/openai/gpt-oss-20b"
@@ -99,7 +91,8 @@ DEDUP_CONFIDENCE_THRESHOLD = "0.8"
 RESOLVER_TYPE = "github"
 RESOLVER_GITHUB_REPO = "DigiBugCat/Cassandra-Finance"
 CLASSIFICATION_CHALLENGE_ENABLED = "true"
-LLM_JUDGE_URL = "https://claude-proxy-dev.pantainos.workers.dev/v1/chat/completions"
+LLM_JUDGE_URL = "https://api.openai.com/v1/chat/completions"
+LLM_JUDGE_MODEL = "gpt-5-mini"
 MIN_SIMILARITY = "0.35"
 VIOLATION_CONFIDENCE_THRESHOLD = "0.6"
 CONFIRM_CONFIDENCE_THRESHOLD = "0.7"

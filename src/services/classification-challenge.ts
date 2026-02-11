@@ -231,13 +231,13 @@ export async function challengeClassification(
   try {
     let responseText: string;
 
-    if (env.CLAUDE_PROXY || env.LLM_JUDGE_URL) {
-      // Route through external LLM (service binding or URL)
+    if (env.LLM_JUDGE_URL) {
+      // Route through external LLM
       responseText = await withRetry(
         () => callExternalLLM(
-          env.CLAUDE_PROXY ?? env.LLM_JUDGE_URL!,
+          env.LLM_JUDGE_URL!,
           prompt,
-          { apiKey: env.LLM_JUDGE_API_KEY, requestId: params.requestId }
+          { apiKey: env.LLM_JUDGE_API_KEY, model: env.LLM_JUDGE_MODEL, requestId: params.requestId }
         ),
         { retries: 2, delay: 100 }
       );
@@ -581,13 +581,13 @@ export async function checkMemoryCompleteness(
   try {
     let responseText: string;
 
-    if (env.CLAUDE_PROXY || env.LLM_JUDGE_URL) {
-      // Route through external LLM (service binding or URL)
+    if (env.LLM_JUDGE_URL) {
+      // Route through external LLM
       responseText = await withRetry(
         () => callExternalLLM(
-          env.CLAUDE_PROXY ?? env.LLM_JUDGE_URL!,
+          env.LLM_JUDGE_URL!,
           prompt,
-          { apiKey: env.LLM_JUDGE_API_KEY, requestId: params.requestId }
+          { apiKey: env.LLM_JUDGE_API_KEY, model: env.LLM_JUDGE_MODEL, requestId: params.requestId }
         ),
         { retries: 2, delay: 100 }
       );

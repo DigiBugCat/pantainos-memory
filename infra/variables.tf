@@ -27,10 +27,22 @@ variable "cf_access_team" {
   type        = string
 }
 
-variable "claude_proxy_worker_name" {
-  description = "Name of the claude-proxy worker for service binding"
+variable "llm_judge_url" {
+  description = "OpenAI-compatible chat completions endpoint for LLM judge"
   type        = string
-  default     = "claude-proxy"
+  default     = "https://api.openai.com/v1/chat/completions"
+}
+
+variable "llm_judge_model" {
+  description = "Model name for LLM judge calls"
+  type        = string
+  default     = "gpt-5-mini"
+}
+
+variable "llm_judge_api_key" {
+  description = "API key for LLM judge endpoint"
+  type        = string
+  sensitive   = true
 }
 
 variable "resolver_github_repo" {

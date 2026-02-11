@@ -49,14 +49,11 @@ export interface Env extends MCPCoreEnv {
   CF_ACCOUNT_ID?: string;
   AI_GATEWAY_ID?: string;
 
-  // External LLM endpoint (optional - if set, routes LLM judge calls here instead of Workers AI)
-  // Should be OpenAI-compatible endpoint (e.g., n8n workflow, OpenRouter, etc.)
+  // External LLM endpoint (OpenAI-compatible chat completions)
+  // e.g., https://api.openai.com/v1/chat/completions
   LLM_JUDGE_URL?: string;
   LLM_JUDGE_API_KEY?: string;
-
-  // Service binding to claude-proxy worker (preferred over LLM_JUDGE_URL for worker-to-worker calls)
-  // Bypasses CF Access — no auth headers needed
-  CLAUDE_PROXY?: Fetcher;
+  LLM_JUDGE_MODEL?: string; // default: gpt-5-mini
 
   // Configurable via wrangler.toml [vars]
   EMBEDDING_MODEL?: string;

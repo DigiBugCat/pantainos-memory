@@ -19,15 +19,13 @@ function getGatewayOptions(config: Config): { gateway: { id: string } } | undefi
 }
 
 /**
- * Call external LLM endpoint (OpenAI-compatible).
- * Supports two modes:
- *   1. Service binding (fetcher) — direct worker-to-worker, bypasses CF Access
- *   2. URL + optional API key — external HTTP endpoint
+ * Call external LLM endpoint (OpenAI-compatible chat completions).
+ * Sends requests directly to the configured URL with optional API key auth.
  */
 export async function callExternalLLM(
-  urlOrFetcher: string | Fetcher,
+  url: string,
   prompt: string,
-  options?: { apiKey?: string; requestId?: string; path?: string }
+  options?: { apiKey?: string; model?: string; requestId?: string }
 ): Promise<string> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -39,28 +37,14 @@ export async function callExternalLLM(
     headers['X-Request-Id'] = options.requestId;
   }
 
-  const body = JSON.stringify({
-    model: 'claude-haiku-4-5-20251001',
-    messages: [{ role: 'user', content: prompt }],
+  const response = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model: options?.model ?? 'gpt-5-mini',
+      messages: [{ role: 'user', content: prompt }],
+    }),
   });
-
-  let response: Response;
-  if (typeof urlOrFetcher === 'string') {
-    // External URL fetch
-    response = await fetch(urlOrFetcher, {
-      method: 'POST',
-      headers,
-      body,
-    });
-  } else {
-    // Service binding — call worker directly, path routes within the worker
-    const path = options?.path ?? '/v1/chat/completions';
-    response = await urlOrFetcher.fetch(new Request(`https://internal${path}`, {
-      method: 'POST',
-      headers,
-      body,
-    }));
-  }
 
   if (!response.ok) {
     throw new Error(`External LLM call failed: ${response.status} ${response.statusText}`);
@@ -187,10 +171,10 @@ Respond with ONLY a JSON object (no markdown, no explanation): {"verdict": "dupl
 
   let responseContent: string;
 
-  // Use external LLM endpoint if configured (service binding or URL)
-  if (env?.CLAUDE_PROXY || env?.LLM_JUDGE_URL) {
+  // Use external LLM endpoint if configured
+  if (env?.LLM_JUDGE_URL) {
     responseContent = await withRetry(
-      () => callExternalLLM(env.CLAUDE_PROXY ?? env.LLM_JUDGE_URL!, prompt, { apiKey: env.LLM_JUDGE_API_KEY, requestId }),
+      () => callExternalLLM(env.LLM_JUDGE_URL!, prompt, { apiKey: env.LLM_JUDGE_API_KEY, model: env.LLM_JUDGE_MODEL, requestId }),
       { retries: 2, delay: 100, name: 'checkDuplicateWithLLM_external', requestId }
     );
   } else {
