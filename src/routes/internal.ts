@@ -67,7 +67,7 @@ function getFilterType(row: MemoryRow): 'obs' | 'thought' {
 /**
  * POST /internal/observe
  * Unified memory creation endpoint.
- * Creates either observation (has source) or thought (has derived_from).
+ * Creates observations, thoughts/predictions, or hybrids (source + derived_from).
  */
 internalRouter.post('/observe', async (c) => {
   const body = await c.req.json<{
@@ -100,7 +100,7 @@ internalRouter.post('/observe', async (c) => {
     return errorResponse(c, 'content is required');
   }
 
-  // Validate origin: exactly one of source XOR derived_from
+  // Validate origin: at least one of source or derived_from
   const hasSource = source !== undefined && source !== null;
   const hasDerivedFrom = derived_from !== undefined && derived_from !== null && derived_from.length > 0;
 
@@ -108,17 +108,23 @@ internalRouter.post('/observe', async (c) => {
     return errorResponse(c, 'Either "source" or "derived_from" is required');
   }
 
-  if (hasSource && hasDerivedFrom) {
-    return errorResponse(c, '"source" and "derived_from" are mutually exclusive');
-  }
-
-  // Mode-specific validation
+  // Field-specific validation
   if (hasSource) {
     if (!VALID_SOURCES.includes(source as typeof VALID_SOURCES[number])) {
       return errorResponse(c, `source must be one of: ${VALID_SOURCES.join(', ')}`);
     }
-    if (assumes && assumes.length > 0) {
-      return errorResponse(c, '"assumes" is only valid for thoughts, not observations');
+  }
+
+  if (hasDerivedFrom) {
+    const placeholders = derived_from!.map(() => '?').join(',');
+    const sources = await c.env.DB.prepare(
+      `SELECT id FROM memories WHERE id IN (${placeholders}) AND retracted = 0`
+    ).bind(...derived_from!).all<{ id: string }>();
+
+    if (!sources.results || sources.results.length !== derived_from!.length) {
+      const foundIds = new Set(sources.results?.map((r) => r.id) || []);
+      const missing = derived_from!.filter((id) => !foundIds.has(id));
+      return errorResponse(c, `Source memories not found: ${missing.join(', ')}`, 404);
     }
   }
 
@@ -395,11 +401,11 @@ internalRouter.get('/stats', async (c) => {
   ).first<{ count: number }>();
 
   const thoughtCount = await c.env.DB.prepare(
-    `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND derived_from IS NOT NULL AND resolves_by IS NULL`
+    `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND source IS NULL AND derived_from IS NOT NULL AND resolves_by IS NULL`
   ).first<{ count: number }>();
 
   const predictionCount = await c.env.DB.prepare(
-    `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND resolves_by IS NOT NULL`
+    `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND source IS NULL AND resolves_by IS NOT NULL`
   ).first<{ count: number }>();
 
   // Count edges

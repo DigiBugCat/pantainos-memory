@@ -57,9 +57,9 @@ app.get('/', async (c) => {
     SELECT
       COUNT(*) as total,
       SUM(CASE WHEN source IS NOT NULL AND retracted = 0 THEN 1 ELSE 0 END) as obs,
-      SUM(CASE WHEN derived_from IS NOT NULL AND retracted = 0 THEN 1 ELSE 0 END) as thought,
-      SUM(CASE WHEN resolves_by IS NOT NULL AND retracted = 0 THEN 1 ELSE 0 END) as time_bound,
-      SUM(CASE WHEN derived_from IS NOT NULL AND resolves_by IS NULL AND retracted = 0 THEN 1 ELSE 0 END) as general,
+      SUM(CASE WHEN source IS NULL AND derived_from IS NOT NULL AND retracted = 0 THEN 1 ELSE 0 END) as thought,
+      SUM(CASE WHEN source IS NULL AND resolves_by IS NOT NULL AND retracted = 0 THEN 1 ELSE 0 END) as time_bound,
+      SUM(CASE WHEN source IS NULL AND derived_from IS NOT NULL AND resolves_by IS NULL AND retracted = 0 THEN 1 ELSE 0 END) as general,
       SUM(CASE WHEN retracted = 1 THEN 1 ELSE 0 END) as retracted
     FROM memories
   `).first<{
@@ -105,6 +105,7 @@ app.get('/', async (c) => {
       COUNT(*) as count
     FROM memories
     WHERE retracted = 0
+      AND source IS NULL
       AND derived_from IS NOT NULL
     GROUP BY tier
   `).bind(
@@ -129,7 +130,8 @@ app.get('/', async (c) => {
       state,
       COUNT(*) as count
     FROM memories
-    WHERE derived_from IS NOT NULL
+    WHERE source IS NULL
+      AND derived_from IS NOT NULL
     GROUP BY state
   `).all<{ state: string; count: number }>();
 

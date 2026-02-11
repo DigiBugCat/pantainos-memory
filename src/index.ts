@@ -319,11 +319,11 @@ app.get('/api/stats', async (c) => {
   ).first<{ count: number }>();
 
   const thoughtCount = await c.env.DB.prepare(
-    `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND derived_from IS NOT NULL AND resolves_by IS NULL`
+    `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND source IS NULL AND derived_from IS NOT NULL AND resolves_by IS NULL`
   ).first<{ count: number }>();
 
   const predictionCount = await c.env.DB.prepare(
-    `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND resolves_by IS NOT NULL`
+    `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND source IS NULL AND resolves_by IS NOT NULL`
   ).first<{ count: number }>();
 
   const counts = {

@@ -2,9 +2,9 @@
  * Memory system types - Unified Memory Model
  *
  * Everything is a memory. Fields determine semantics:
- *   - source IS NOT NULL → observation (intake from reality)
- *   - derived_from IS NOT NULL → thought (derived belief)
- *   - resolves_by IS NOT NULL → time-bound thought (prediction)
+ *   - source IS NOT NULL → observation (takes precedence for type labeling)
+ *   - source IS NULL and derived_from IS NOT NULL → thought (derived belief)
+ *   - source IS NULL and resolves_by IS NOT NULL → time-bound thought (prediction)
  *
  * Core principle: Memories are weighted bets, not facts.
  * Confidence = survival rate under test (confirmations / times_tested)
@@ -87,7 +87,7 @@ export interface Memory {
   id: string;
   content: string;
 
-  // Origin fields (mutually exclusive in practice)
+  // Origin fields (can coexist in hybrid memories)
   source?: ObservationSource;
   source_url?: string;
   derived_from?: string[];
@@ -291,24 +291,24 @@ export interface ObserveRequest {
  * Unified memory creation request.
  * Memory type is determined by field presence:
  * - source IS NOT NULL → observation
- * - derived_from IS NOT NULL → thought
- * - derived_from + resolves_by → time-bound thought (prediction)
+ * - source IS NULL and derived_from IS NOT NULL → thought
+ * - source IS NULL and resolves_by IS NOT NULL → time-bound thought (prediction)
  *
- * Exactly one of source OR derived_from is required (mutually exclusive).
+ * At least one of source OR derived_from is required.
  */
 export interface MemoryRequest {
   content: string;
-  /** Source of observation (mutually exclusive with derived_from) */
+  /** Source of observation */
   source?: ObservationSource;
   /** URL/link where this information came from */
   source_url?: string;
-  /** IDs of source memories this thought is based on (mutually exclusive with source) */
+  /** IDs of source memories this memory is based on */
   derived_from?: string[];
   /** Conditions that would prove this wrong */
   invalidates_if?: string[];
   /** Conditions that would strengthen this */
   confirms_if?: string[];
-  /** Underlying thoughts this belief rests on (thoughts only) */
+  /** Underlying assumptions this memory rests on */
   assumes?: string[];
   /** Unix timestamp deadline for time-bound predictions */
   resolves_by?: number;
@@ -593,7 +593,7 @@ export interface MemoryEvent {
  * Job queued for async exposure checking.
  * Supports bi-directional checking:
  * - When source is set: check if this observation violates existing thoughts
- * - When derived_from is set: check if existing observations would violate this
+ * - When only derived_from is set: check if existing observations would violate this
  */
 export interface ExposureCheckJob {
   /** The memory being checked */

@@ -5,9 +5,10 @@
  * - OBSERVATION (has source) - facts from reality
  * - THOUGHT (has derived_from) - derived beliefs
  * - PREDICTION (has derived_from + resolves_by) - time-bound thoughts
+ * - HYBRID (has source + derived_from) - observed facts linked to prior memories
  *
  * Memory type is determined by field presence, not a type column.
- * Exactly one of "source" OR "derived_from" is required (mutually exclusive).
+ * At least one of "source" OR "derived_from" is required.
  *
  * Flow (FAST - exposure checking queued for async processing):
  * 1. Validate request
@@ -86,7 +87,7 @@ app.post('/', async (c) => {
     return c.json({ success: false, error: 'content is required' }, 400);
   }
 
-  // Validate origin: exactly one of source XOR derived_from required
+  // Validate origin: at least one of source or derived_from required
   const hasSource = body.source !== undefined && body.source !== null;
   const hasDerivedFrom = body.derived_from !== undefined && body.derived_from !== null && body.derived_from.length > 0;
 
@@ -97,14 +98,7 @@ app.post('/', async (c) => {
     );
   }
 
-  if (hasSource && hasDerivedFrom) {
-    return c.json(
-      { success: false, error: '"source" and "derived_from" are mutually exclusive' },
-      400
-    );
-  }
-
-  // Mode-specific validation
+  // Field-specific validation
   if (hasSource) {
     if (!VALID_SOURCES.includes(body.source as typeof VALID_SOURCES[number])) {
       return c.json(
@@ -112,14 +106,9 @@ app.post('/', async (c) => {
         400
       );
     }
-    if (body.assumes && body.assumes.length > 0) {
-      return c.json(
-        { success: false, error: '"assumes" is only valid for thoughts, not observations' },
-        400
-      );
-    }
-  } else {
-    // Thought mode - validate derived_from existence
+  }
+  if (hasDerivedFrom) {
+    // Validate derived_from existence
     const placeholders = body.derived_from!.map(() => '?').join(',');
     const sources = await c.env.DB.prepare(
       `SELECT id FROM memories WHERE id IN (${placeholders}) AND retracted = 0`

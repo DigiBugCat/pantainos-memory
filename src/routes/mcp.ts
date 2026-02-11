@@ -312,13 +312,13 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
 defineTool({
     name: 'observe',
-    description: `Record a memory. Two modes based on origin:
+    description: `Record a memory using the unified model:
 
-OBSERVATION (reality intake): Set "source" (market, news, earnings, email, human, tool)
-THOUGHT (derived belief): Set "derived_from" with source memory IDs
+OBSERVATION: set "source" (market, news, earnings, email, human, tool)
+THOUGHT/PREDICTION: set "derived_from" with source memory IDs
+HYBRID: source + derived_from is allowed
 
-Exactly one of "source" OR "derived_from" required (mutually exclusive).
-
+At least one of "source" or "derived_from" is required.
 Both modes support invalidates_if/confirms_if conditions.
 For predictions: add resolves_by (date string or timestamp) + outcome_condition.`,
     annotations: {
@@ -332,12 +332,12 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       type: 'object',
       properties: {
         content: { type: 'string', description: 'The memory content' },
-        source: { type: 'string', enum: ['market', 'news', 'earnings', 'email', 'human', 'tool'], description: 'Observation source (mutually exclusive with derived_from)' },
+        source: { type: 'string', enum: ['market', 'news', 'earnings', 'email', 'human', 'tool'], description: 'Observation source' },
         source_url: { type: 'string', description: 'URL/link where this information came from' },
-        derived_from: { type: 'array', items: { type: 'string' }, description: 'Source memory IDs (mutually exclusive with source)' },
+        derived_from: { type: 'array', items: { type: 'string' }, description: 'Source memory IDs this memory derives from' },
         invalidates_if: { type: 'array', items: { type: 'string' }, description: 'Conditions that would prove this wrong' },
         confirms_if: { type: 'array', items: { type: 'string' }, description: 'Conditions that would strengthen this' },
-        assumes: { type: 'array', items: { type: 'string' }, description: 'Underlying assumptions (thoughts only)' },
+        assumes: { type: 'array', items: { type: 'string' }, description: 'Underlying assumptions' },
         resolves_by: { type: 'string', description: 'Deadline as date string (e.g. "2026-03-15") or Unix timestamp' },
         outcome_condition: { type: 'string', description: 'Success/failure criteria (required if resolves_by set)' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for categorization' },
@@ -378,7 +378,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         return errorResult(`Could not parse resolves_by: "${rawResolvesBy}". Use a date string (e.g. "2026-03-15") or Unix timestamp.`);
       }
 
-      // Validate origin: exactly one of source XOR derived_from required
+      // Validate origin: at least one of source or derived_from required
       const hasSource = source !== undefined && source !== null;
       const hasDerivedFrom = derived_from !== undefined && derived_from !== null && derived_from.length > 0;
 
@@ -386,22 +386,14 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         return errorResult('Either "source" or "derived_from" is required. Set "source" for observations, "derived_from" for thoughts.');
       }
 
-      if (hasSource && hasDerivedFrom) {
-        return errorResult('"source" and "derived_from" are mutually exclusive. Use "source" for observations (reality intake) or "derived_from" for thoughts (derived beliefs).');
-      }
-
-      // Mode-specific validation
+      // Field-specific validation
       if (hasSource) {
-        // Observation mode
         if (!VALID_SOURCES.includes(source as typeof VALID_SOURCES[number])) {
           return errorResult(`source must be one of: ${VALID_SOURCES.join(', ')}`);
         }
-        // Observations can't have assumes
-        if (assumes && assumes.length > 0) {
-          return errorResult('"assumes" is only valid for thoughts (derived_from mode), not observations');
-        }
-      } else {
-        // Thought mode - validate derived_from existence
+      }
+      if (hasDerivedFrom) {
+        // Validate derived_from existence
         const placeholders = derived_from!.map(() => '?').join(',');
         const sources = await ctx.env.DB.prepare(
           `SELECT id FROM memories WHERE id IN (${placeholders}) AND retracted = 0`
@@ -607,7 +599,9 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       }
 
       // Format response based on mode
-      if (hasSource) {
+      if (hasSource && hasDerivedFrom) {
+        return textResult(`✓ Observed [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}\n\nDerived from: ${derived_from!.map(d => `[${d}]`).join(', ')}`);
+      } else if (hasSource) {
         return textResult(`✓ Observed [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}`);
       } else {
         const typeLabel = timeBound ? 'Predicted' : 'Thought';
@@ -631,12 +625,12 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       properties: {
         memory_id: { type: 'string', description: 'ID of the memory to update' },
         content: { type: 'string', description: 'New content text (replaces existing)' },
-        source: { type: 'string', enum: ['market', 'news', 'earnings', 'email', 'human', 'tool'], description: 'Change observation source (only for observations)' },
+        source: { type: 'string', enum: ['market', 'news', 'earnings', 'email', 'human', 'tool'], description: 'Change observation source' },
         source_url: { type: 'string', description: 'URL/link where this information came from' },
-        derived_from: { type: 'array', items: { type: 'string' }, description: 'Replace derived_from IDs (only for thoughts)' },
+        derived_from: { type: 'array', items: { type: 'string' }, description: 'Replace derived_from IDs' },
         invalidates_if: { type: 'array', items: { type: 'string' }, description: 'Conditions to ADD (not replace)' },
         confirms_if: { type: 'array', items: { type: 'string' }, description: 'Conditions to ADD (not replace)' },
-        assumes: { type: 'array', items: { type: 'string' }, description: 'Assumptions to ADD (thoughts only)' },
+        assumes: { type: 'array', items: { type: 'string' }, description: 'Assumptions to ADD' },
         resolves_by: { type: 'string', description: 'Deadline as date string (e.g. "2026-03-15") or Unix timestamp' },
         outcome_condition: { type: 'string', description: 'Success/failure criteria (required if resolves_by set)' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Tags to ADD (not replace)' },
@@ -712,26 +706,12 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       }
 
       // Determine current memory type
-      const wasObservation = row.source !== null;
       const hasDerivedFrom = row.derived_from !== null;
-
-      // Validate source/derived_from changes don't cross types
-      if (newSource !== undefined && hasDerivedFrom) {
-        return errorResult('Cannot set source on a thought (has derived_from). These are mutually exclusive.');
-      }
-      if (newDerivedFrom !== undefined && wasObservation && newSource === undefined) {
-        return errorResult('Cannot set derived_from on an observation (has source). These are mutually exclusive.');
-      }
 
       // After update, determine the effective type
       const effectiveSource = newSource !== undefined ? newSource : row.source;
       const effectiveDerivedFrom = newDerivedFrom !== undefined ? newDerivedFrom : (hasDerivedFrom ? JSON.parse(row.derived_from!) : null);
       const hasEffectiveSource = effectiveSource !== null;
-
-      // Validate assumes is only for thoughts
-      if (assumes && assumes.length > 0 && hasEffectiveSource) {
-        return errorResult('"assumes" can only be added to thoughts (derived_from mode), not observations');
-      }
 
       // Validate new derived_from IDs exist
       if (newDerivedFrom && newDerivedFrom.length > 0) {
@@ -1126,11 +1106,11 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       ).first<{ count: number }>();
 
       const thoughtCount = await ctx.env.DB.prepare(
-        `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND derived_from IS NOT NULL AND resolves_by IS NULL`
+        `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND source IS NULL AND derived_from IS NOT NULL AND resolves_by IS NULL`
       ).first<{ count: number }>();
 
       const predictionCount = await ctx.env.DB.prepare(
-        `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND resolves_by IS NOT NULL`
+        `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND source IS NULL AND resolves_by IS NOT NULL`
       ).first<{ count: number }>();
 
       // Count edges
