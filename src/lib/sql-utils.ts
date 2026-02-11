@@ -1,13 +1,13 @@
 /**
  * SQL Utilities for D1
  *
- * Helpers for working within D1's 999 bind-parameter limit.
+ * Helpers for working within D1's 100 bind-parameter limit.
  */
 
 const MAX_PARAMS = 95; // D1 limit is 100, leave headroom for scalar params
 
 /**
- * Execute a query with IN-clause chunking to stay under D1's 999-variable limit.
+ * Execute a query with IN-clause chunking to stay under D1's 100-variable limit.
  *
  * Splits `ids` into chunks, runs the query for each chunk, and merges results.
  *

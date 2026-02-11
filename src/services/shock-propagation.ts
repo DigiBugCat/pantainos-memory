@@ -9,6 +9,7 @@ import type { Env } from '../types/index.js';
 import type { DamageLevel } from '../lib/shared/types/index.js';
 import { DEFAULT_MAX_TIMES_TESTED, getEvidenceWeight } from './confidence.js';
 import { estimateSpectralRadius } from './spectral.js';
+import { queryInChunks } from '../lib/sql-utils.js';
 
 export interface ShockResult {
   affected_count: number;
@@ -72,48 +73,57 @@ function computeLocalConfidence(row: Pick<MemoryLiteRow, 'starting_confidence' |
 async function fetchIncidentSupportEdges(env: Env, ids: string[]): Promise<EdgeRow[]> {
   if (ids.length === 0) return [];
 
-  const placeholders = ids.map(() => '?').join(',');
-  const sql = `
-    SELECT source_id, target_id, edge_type, strength
-    FROM edges
-    WHERE (source_id IN (${placeholders}) OR target_id IN (${placeholders}))
-      AND edge_type IN ('derived_from', 'confirmed_by')
-      AND strength >= ?
-  `;
-
-  const res = await env.DB
-    .prepare(sql)
-    .bind(...ids, ...ids, MIN_STRENGTH)
-    .all<EdgeRow>();
-
-  return res.results ?? [];
+  return queryInChunks<EdgeRow>(
+    env.DB,
+    (ph) => `
+      SELECT source_id, target_id, edge_type, strength
+      FROM edges
+      WHERE (source_id IN (${ph}) OR target_id IN (${ph}))
+        AND edge_type IN ('derived_from', 'confirmed_by')
+        AND strength >= ?
+    `,
+    ids,
+    [],
+    [MIN_STRENGTH],
+    2,
+  );
 }
 
 async function fetchMemoriesLite(env: Env, ids: string[]): Promise<MemoryLiteRow[]> {
   if (ids.length === 0) return [];
-  const placeholders = ids.map(() => '?').join(',');
-  const sql = `
-    SELECT id, source, starting_confidence, confirmations, times_tested, propagated_confidence, retracted
-    FROM memories
-    WHERE id IN (${placeholders})
-      AND retracted = 0
-  `;
-  const res = await env.DB.prepare(sql).bind(...ids).all<MemoryLiteRow>();
-  return res.results ?? [];
+
+  return queryInChunks<MemoryLiteRow>(
+    env.DB,
+    (ph) => `
+      SELECT id, source, starting_confidence, confirmations, times_tested, propagated_confidence, retracted
+      FROM memories
+      WHERE id IN (${ph})
+        AND retracted = 0
+    `,
+    ids,
+    [],
+    [],
+    1,
+  );
 }
 
 async function fetchIncomingContradictions(env: Env, targetIds: string[]): Promise<ContradictionEdgeRow[]> {
   if (targetIds.length === 0) return [];
-  const placeholders = targetIds.map(() => '?').join(',');
-  const sql = `
-    SELECT source_id, target_id, strength
-    FROM edges
-    WHERE target_id IN (${placeholders})
-      AND edge_type = 'violated_by'
-      AND strength >= ?
-  `;
-  const res = await env.DB.prepare(sql).bind(...targetIds, MIN_STRENGTH).all<ContradictionEdgeRow>();
-  return res.results ?? [];
+
+  return queryInChunks<ContradictionEdgeRow>(
+    env.DB,
+    (ph) => `
+      SELECT source_id, target_id, strength
+      FROM edges
+      WHERE target_id IN (${ph})
+        AND edge_type = 'violated_by'
+        AND strength >= ?
+    `,
+    targetIds,
+    [],
+    [MIN_STRENGTH],
+    1,
+  );
 }
 
 export async function applyShock(env: Env, memoryId: string, damageLevel: DamageLevel): Promise<ShockResult> {
