@@ -10,6 +10,9 @@ import type { DamageLevel } from '../lib/shared/types/index.js';
 import { DEFAULT_MAX_TIMES_TESTED, getEvidenceWeight } from './confidence.js';
 import { estimateSpectralRadius } from './spectral.js';
 import { queryInChunks } from '../lib/sql-utils.js';
+import { createLazyLogger } from '../lib/lazy-logger.js';
+
+const getLog = createLazyLogger('ShockPropagation');
 
 export interface ShockResult {
   affected_count: number;
@@ -127,6 +130,9 @@ async function fetchIncomingContradictions(env: Env, targetIds: string[]): Promi
 }
 
 export async function applyShock(env: Env, memoryId: string, damageLevel: DamageLevel): Promise<ShockResult> {
+  const shockStart = Date.now();
+  getLog().info('shock_starting', { memory_id: memoryId, damage_level: damageLevel });
+
   // 1) Discover local subgraph (<= 2 hops) using support edges only.
   const nodeIds = new Set<string>([memoryId]);
   let frontier = new Set<string>([memoryId]);
@@ -396,7 +402,7 @@ export async function applyShock(env: Env, memoryId: string, damageLevel: Damage
   affected.sort((a, b) => (b.old_confidence - b.new_confidence) - (a.old_confidence - a.new_confidence));
   const affectedCapped = affected.slice(0, 25);
 
-  return {
+  const result: ShockResult = {
     affected_count: affectedCount,
     max_confidence_drop: Math.max(0, maxDrop),
     affected_memories: affectedCapped,
@@ -405,4 +411,29 @@ export async function applyShock(env: Env, memoryId: string, damageLevel: Damage
     spectral_radius: spectralRadius,
     backtrack_attempts: backtrackAttempts,
   };
+
+  const duration_ms = Date.now() - shockStart;
+  getLog().info('shock_complete', {
+    memory_id: memoryId,
+    damage_level: damageLevel,
+    neighborhood_size: allNodeIds.length,
+    affected_count: affectedCount,
+    max_confidence_drop: Math.max(0, maxDrop),
+    iterations: totalIterations,
+    spectral_radius: spectralRadius,
+    backtrack_attempts: backtrackAttempts,
+    duration_ms,
+  });
+
+  if (env.ANALYTICS) {
+    try {
+      env.ANALYTICS.writeDataPoint({
+        indexes: [memoryId],
+        doubles: [affectedCount, Math.max(0, maxDrop), allNodeIds.length, totalIterations, spectralRadius, backtrackAttempts, duration_ms],
+        blobs: [damageLevel, 'shock'],
+      });
+    } catch { /* swallow */ }
+  }
+
+  return result;
 }

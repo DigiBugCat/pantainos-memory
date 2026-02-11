@@ -20,6 +20,9 @@ import {
   parseViolationCount,
 } from '../lib/zones.js';
 import { queryInChunks, queryContradictionGate } from '../lib/sql-utils.js';
+import { createLazyLogger } from '../lib/lazy-logger.js';
+
+const getLog = createLazyLogger('ZoneBuilder');
 
 // ============================================
 // Types
@@ -84,6 +87,7 @@ export async function buildZoneHealth(
   seedId: string,
   options?: ZoneHealthOptions,
 ): Promise<ZoneHealthReport> {
+  const zoneStart = Date.now();
   const maxDepth = options?.maxDepth ?? 2;
   const maxSize = options?.maxSize ?? 20;
   const minEdgeStrength = options?.minEdgeStrength ?? 0.3;
@@ -354,6 +358,16 @@ export async function buildZoneHealth(
   );
 
   const boundaryIds = Array.from(boundaryReasons.keys()).filter(id => !zoneSet.has(id));
+
+  getLog().info('zone_built', {
+    seed_id: seedId,
+    zone_size: zoneIds.length,
+    quality_pct: Math.round(qualityScore * 100),
+    balanced,
+    boundary_contradictions: cutMinusCount,
+    external_support_leaks: lossPlusCount,
+    duration_ms: Date.now() - zoneStart,
+  });
 
   return {
     seed_id: seedId,

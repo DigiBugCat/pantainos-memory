@@ -421,6 +421,7 @@ export async function checkExposures(
   observationContent: string,
   embedding: number[]
 ): Promise<ExposureCheckResult> {
+  const overallStart = Date.now();
   const config = getConfig(env as unknown as Record<string, string | undefined>);
   const thresholds = getThresholds(env);
 
@@ -450,12 +451,18 @@ export async function checkExposures(
   });
 
   // 1. Search INVALIDATES_VECTORS for conditions this observation might match
+  const invalidatesSearchStart = Date.now();
   const invalidatesCandidates = await searchInvalidatesConditions(
     env,
     embedding,
     thresholds.maxCandidates,
     thresholds.minSimilarity
   );
+
+  getLog().info('invalidates_search_complete', {
+    candidates_found: invalidatesCandidates.length,
+    duration_ms: Date.now() - invalidatesSearchStart,
+  });
 
   getLog().info('invalidates_candidates', {
     count: invalidatesCandidates.length,
@@ -494,6 +501,7 @@ export async function checkExposures(
     }
 
     // LLM-judge this specific condition
+    const llmStart = Date.now();
     const match = await checkConditionMatch(
       env,
       config,
@@ -510,6 +518,7 @@ export async function checkExposures(
       confidence: match.confidence,
       reasoning: match.reasoning,
       threshold: thresholds.violationConfidence,
+      duration_ms: Date.now() - llmStart,
     });
 
     if (match.matches && match.confidence >= thresholds.violationConfidence) {
@@ -559,12 +568,18 @@ export async function checkExposures(
   }
 
   // 3. Search CONFIRMS_VECTORS for conditions this observation might support
+  const confirmsSearchStart = Date.now();
   const confirmsCandidates = await searchConfirmsConditions(
     env,
     embedding,
     thresholds.maxCandidates,
     thresholds.minSimilarity
   );
+
+  getLog().info('confirms_search_complete', {
+    candidates_found: confirmsCandidates.length,
+    duration_ms: Date.now() - confirmsSearchStart,
+  });
 
   getLog().debug('confirms_candidates', { count: confirmsCandidates.length });
 
@@ -628,12 +643,31 @@ export async function checkExposures(
     }
   }
 
+  const overallDuration = Date.now() - overallStart;
   getLog().info('exposure_check_complete', {
     observation_id: observationId,
     violations: result.violations.length,
     confirmations: result.confirmations.length,
     autoConfirmed: result.autoConfirmed.length,
+    duration_ms: overallDuration,
   });
+
+  if (env.ANALYTICS) {
+    try {
+      env.ANALYTICS.writeDataPoint({
+        indexes: [observationId],
+        doubles: [
+          invalidatesCandidates.length,
+          confirmsCandidates.length,
+          result.violations.length,
+          result.confirmations.length,
+          result.autoConfirmed.length,
+          overallDuration,
+        ],
+        blobs: ['exposure_check'],
+      });
+    } catch { /* swallow */ }
+  }
 
   return result;
 }
@@ -1100,7 +1134,15 @@ async function recordViolation(
     } else {
       // Peripheral violation: check zone health, notify if zone became unbalanced
       try {
+        const zoneHealthStart = Date.now();
         const zoneHealth = await buildZoneHealth(env.DB, memoryId, { maxDepth: 2, maxSize: 20 });
+        getLog().info('zone_health_checked', {
+          memory_id: memoryId,
+          zone_size: zoneHealth.zone_size,
+          quality_pct: zoneHealth.quality_pct,
+          balanced: zoneHealth.balanced,
+          duration_ms: Date.now() - zoneHealthStart,
+        });
         if (!zoneHealth.balanced || zoneHealth.quality_pct < 50) {
           await insertPeripheralViolationNotification(env, memoryId, shock, zoneHealth);
         }

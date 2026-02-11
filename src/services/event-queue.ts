@@ -11,6 +11,9 @@
  */
 
 import type { Env } from '../types/index.js';
+import { createLazyLogger } from '../lib/lazy-logger.js';
+
+const getLog = createLazyLogger('EventQueue');
 
 export type SignificantEventType =
   | 'violation'
@@ -70,6 +73,12 @@ export async function queueSignificantEvent(env: Env, event: SignificantEvent): 
     JSON.stringify(event.context || {}),
     Date.now()
   ).run();
+
+  getLog().debug('event_queued', {
+    event_type: event.event_type,
+    memory_id: event.memory_id,
+    session_id: sessionId,
+  });
 }
 
 /**
@@ -122,6 +131,8 @@ export async function markEventsDispatched(
     SET dispatched = 1, dispatched_at = ?, workflow_id = ?
     WHERE id IN (${placeholders})
   `).bind(Date.now(), workflowId, ...eventIds).run();
+
+  getLog().info('events_dispatched', { event_count: eventIds.length });
 }
 
 /**
@@ -175,6 +186,8 @@ export async function claimEventsForDispatch(
     WHERE id IN (${placeholders}) AND dispatched = 0
   `).bind(Date.now(), workflowId, ...ids).run();
 
+  getLog().info('events_claimed', { session_id: sessionId, event_count: events.length });
+
   return events;
 }
 
@@ -194,6 +207,8 @@ export async function releaseClaimedEvents(
     SET dispatched = 0, dispatched_at = NULL, workflow_id = NULL
     WHERE id IN (${placeholders})
   `).bind(...eventIds).run();
+
+  getLog().warn('events_released', { event_count: eventIds.length });
 }
 
 /**
@@ -251,5 +266,9 @@ export async function findInactiveSessions(
     HAVING MAX(created_at) < ?
   `).bind(cutoff).all();
 
-  return result.results as { session_id: string; event_count: number; last_activity: number }[];
+  const sessions = result.results as { session_id: string; event_count: number; last_activity: number }[];
+
+  getLog().debug('inactive_sessions_found', { session_count: sessions.length });
+
+  return sessions;
 }
