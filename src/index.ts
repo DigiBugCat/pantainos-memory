@@ -44,6 +44,8 @@ import {
 } from './services/resolver.js';
 import { computeSystemStats } from './jobs/compute-stats.js';
 import { runFullGraphPropagation } from './services/propagation.js';
+import { buildZoneHealth } from './services/zone-builder.js';
+import type { ZoneHealthReport } from './services/zone-builder.js';
 
 // Extend Env with LoggingEnv for proper typing
 type Env = BaseEnv & LoggingEnv;
@@ -538,6 +540,17 @@ async function processExposureCheck(
 
   if (hasSignificantEvents) {
     for (const v of results.violations) {
+      // Post-shock zone health check (non-blocking best-effort)
+      let zoneHealth: ZoneHealthReport | undefined;
+      try {
+        zoneHealth = await buildZoneHealth(env.DB, v.memory_id, { maxDepth: 2, maxSize: 20 });
+      } catch (err) {
+        log.warn('zone_health_check_failed', {
+          memory_id: v.memory_id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+
       await queueSignificantEvent(env, {
         session_id: job.session_id,
         event_type: 'violation',
@@ -550,6 +563,7 @@ async function processExposureCheck(
           condition_type: v.condition_type,
           check_direction: isObservation ? 'obs_to_thought' : 'thought_to_obs',
           triggering_memory: memoryId,
+          zone_health: zoneHealth,
         },
       });
     }

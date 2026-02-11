@@ -31,6 +31,7 @@ import {
   deleteConditionVectors,
 } from './embedding-tables.js';
 import { propagateResolution } from './cascade.js';
+import { buildZoneHealth } from './zone-builder.js';
 import type { Env } from '../types/index.js';
 
 // ============================================
@@ -111,12 +112,58 @@ export async function insertCoreViolationNotification(env: Env, memoryId: string
 }
 
 /**
+ * Insert a notification for peripheral violations that destabilize a zone.
+ * Only triggers Pushover if zone is unbalanced (priority -1 = low/quiet).
+ */
+async function insertPeripheralViolationNotification(
+  env: Env,
+  memoryId: string,
+  shock: ShockResult,
+  zoneHealth: { balanced: boolean; quality_pct: number; zone_size: number; unsafe_reasons: string[] }
+): Promise<void> {
+  const mem = await env.DB.prepare(
+    `SELECT content FROM memories WHERE id = ?`
+  ).bind(memoryId).first<{ content: string }>();
+
+  const content = mem?.content ?? '(unknown)';
+  const status = zoneHealth.balanced ? 'balanced' : 'UNBALANCED';
+  const msg = `PERIPHERAL VIOLATION: [${memoryId}] zone ${status} (quality ${zoneHealth.quality_pct}%, ${zoneHealth.zone_size} members). Shock affected ${shock.affected_count} memories.`;
+
+  const now = Date.now();
+  await env.DB.prepare(
+    `INSERT INTO notifications (id, type, memory_id, content, context, created_at)
+     VALUES (?, 'peripheral_violation', ?, ?, ?, ?)`
+  ).bind(
+    generateId(),
+    memoryId,
+    msg,
+    JSON.stringify({ shock, zone_health: zoneHealth }),
+    now
+  ).run();
+
+  // Pushover only for unbalanced zones (low priority, won't bypass quiet hours)
+  if (!zoneHealth.balanced && env.PUSHOVER_USER_KEY && env.PUSHOVER_APP_TOKEN) {
+    const pushMsg = `[${memoryId}] ${content}\n\nZone UNBALANCED (quality ${zoneHealth.quality_pct}%). Shock affected ${shock.affected_count} memories.`;
+    sendPushoverNotification(env, pushMsg, {
+      title: 'Memory: Zone Destabilized',
+      priority: -1,
+    }).catch(err => {
+      getLog().warn('pushover_failed', {
+        memory_id: memoryId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
+}
+
+/**
  * Send a push notification via Pushover API.
  * Best-effort: failures are logged but don't block the caller.
  */
 async function sendPushoverNotification(
   env: Env,
-  message: string
+  message: string,
+  opts?: { title?: string; priority?: number }
 ): Promise<void> {
   const resp = await fetch('https://api.pushover.net/1/messages.json', {
     method: 'POST',
@@ -124,9 +171,9 @@ async function sendPushoverNotification(
     body: JSON.stringify({
       token: env.PUSHOVER_APP_TOKEN,
       user: env.PUSHOVER_USER_KEY,
-      title: 'Memory: Core Violation',
+      title: opts?.title ?? 'Memory: Core Violation',
       message,
-      priority: 1, // high priority — bypasses quiet hours
+      priority: opts?.priority ?? 1, // default high priority — bypasses quiet hours
     }),
   });
 
@@ -1050,6 +1097,19 @@ async function recordViolation(
     const shock = await applyShock(env, memoryId, violation.damage_level);
     if (violation.damage_level === 'core') {
       await insertCoreViolationNotification(env, memoryId, shock);
+    } else {
+      // Peripheral violation: check zone health, notify if zone became unbalanced
+      try {
+        const zoneHealth = await buildZoneHealth(env.DB, memoryId, { maxDepth: 2, maxSize: 20 });
+        if (!zoneHealth.balanced || zoneHealth.quality_pct < 50) {
+          await insertPeripheralViolationNotification(env, memoryId, shock, zoneHealth);
+        }
+      } catch (zoneErr) {
+        getLog().warn('peripheral_zone_health_failed', {
+          memory_id: memoryId,
+          error: zoneErr instanceof Error ? zoneErr.message : String(zoneErr),
+        });
+      }
     }
   } catch (err) {
     getLog().warn('shock_propagation_failed', {

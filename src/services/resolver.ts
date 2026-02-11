@@ -1,12 +1,10 @@
 /**
  * Resolver Service
  *
- * Generic dispatch endpoint for session batches. Supports resolver backends:
- * - 'webhook': POST to a configured webhook URL
- * - 'none': No-op (for testing or when resolver is disabled)
- *
- * The resolver receives batched events for a session and triggers agentic
- * processing to reason about violations and their implications.
+ * Dispatches memory events to resolver agents via GitHub issues.
+ * Different event types get different labels → different workflow files:
+ *   - memory-violation: violations + cascades + confirmations (zone-health-aware triage)
+ *   - memory-prediction: overdue predictions (research + observe)
  */
 
 import type { Env } from '../types/index.js';
@@ -83,15 +81,17 @@ export interface ResolverPayload {
 export type ResolverType = 'webhook' | 'github' | 'none';
 
 /**
+ * Determine the dispatch type from payload content.
+ * Violations/cascades/confirmations → 'violation'
+ * Overdue predictions → 'prediction'
+ */
+function getDispatchType(payload: ResolverPayload): 'violation' | 'prediction' {
+  if (payload.overduePredictions.length > 0) return 'prediction';
+  return 'violation';
+}
+
+/**
  * Dispatch session batch to the configured resolver.
- *
- * The resolver backend is configured via RESOLVER_TYPE env var:
- * - 'webhook': POSTs to RESOLVER_WEBHOOK_URL with bearer token auth
- * - 'none' (default): Logs and returns (for testing)
- *
- * @param env - Worker environment with resolver configuration
- * @param payload - The session batch payload
- * @throws Error if resolver type is unknown or required config is missing
  */
 export async function dispatchToResolver(env: Env, payload: ResolverPayload): Promise<void> {
   const resolverType = (env.RESOLVER_TYPE || 'none') as ResolverType;
@@ -99,6 +99,7 @@ export async function dispatchToResolver(env: Env, payload: ResolverPayload): Pr
   getLog().info('dispatching', {
     batch_id: payload.batchId,
     resolver_type: resolverType,
+    dispatch_type: getDispatchType(payload),
     session_id: payload.sessionId,
     violations: payload.summary.violationCount,
     confirmations: payload.summary.confirmationCount,
@@ -156,8 +157,9 @@ async function dispatchViaWebhook(env: Env, payload: ResolverPayload): Promise<v
 /**
  * Dispatch via GitHub issue creation.
  *
- * Creates an issue in the configured repo with the `memory-resolver` label.
- * A GitHub Actions workflow watches for this label and spawns Claude to resolve.
+ * Uses type-specific labels so different workflows handle each event type:
+ * - memory-violation → .github/workflows/memory-violation-resolver.yml
+ * - memory-prediction → .github/workflows/memory-prediction-resolver.yml
  */
 async function dispatchViaGitHub(env: Env, payload: ResolverPayload): Promise<void> {
   if (!env.RESOLVER_GITHUB_TOKEN) {
@@ -167,15 +169,10 @@ async function dispatchViaGitHub(env: Env, payload: ResolverPayload): Promise<vo
     throw new Error('GitHub resolver requires RESOLVER_GITHUB_REPO');
   }
 
-  const { summary } = payload;
-  const parts: string[] = [];
-  if (summary.violationCount > 0) parts.push(`${summary.violationCount} violation${summary.violationCount > 1 ? 's' : ''}`);
-  if (summary.confirmationCount > 0) parts.push(`${summary.confirmationCount} confirmation${summary.confirmationCount > 1 ? 's' : ''}`);
-  if (summary.cascadeCount > 0) parts.push(`${summary.cascadeCount} cascade${summary.cascadeCount > 1 ? 's' : ''}`);
-  if (summary.overduePredictionCount > 0) parts.push(`${summary.overduePredictionCount} overdue prediction${summary.overduePredictionCount > 1 ? 's' : ''}`);
-  const title = `Memory Resolver: ${parts.join(', ')}`;
-
-  const body = formatGitHubIssueBody(payload);
+  const dispatchType = getDispatchType(payload);
+  const label = `memory-${dispatchType}`;
+  const title = buildIssueTitle(payload, dispatchType);
+  const body = formatGitHubIssueBody(payload, dispatchType);
 
   const response = await fetch(`https://api.github.com/repos/${env.RESOLVER_GITHUB_REPO}/issues`, {
     method: 'POST',
@@ -188,7 +185,7 @@ async function dispatchViaGitHub(env: Env, payload: ResolverPayload): Promise<vo
     body: JSON.stringify({
       title,
       body,
-      labels: ['memory-resolver'],
+      labels: [label],
     }),
   });
 
@@ -202,31 +199,75 @@ async function dispatchViaGitHub(env: Env, payload: ResolverPayload): Promise<vo
     repo: env.RESOLVER_GITHUB_REPO,
     issue_number: issue.number,
     url: issue.html_url,
+    label,
+    dispatch_type: dispatchType,
   });
+}
+
+/**
+ * Build issue title based on dispatch type.
+ */
+function buildIssueTitle(payload: ResolverPayload, dispatchType: 'violation' | 'prediction'): string {
+  const { summary } = payload;
+
+  if (dispatchType === 'prediction') {
+    const pred = payload.overduePredictions[0];
+    const content = pred?.context.content || '';
+    const preview = content.length > 80 ? content.slice(0, 77) + '...' : content;
+    return `Prediction Overdue: ${preview}`;
+  }
+
+  // Violation dispatch
+  const parts: string[] = [];
+  if (summary.violationCount > 0) parts.push(`${summary.violationCount} violation${summary.violationCount > 1 ? 's' : ''}`);
+  if (summary.cascadeCount > 0) parts.push(`${summary.cascadeCount} cascade${summary.cascadeCount > 1 ? 's' : ''}`);
+  if (summary.confirmationCount > 0) parts.push(`${summary.confirmationCount} confirmation${summary.confirmationCount > 1 ? 's' : ''}`);
+  return `Violation Alert: ${parts.join(', ')}`;
 }
 
 /**
  * Format the resolver payload into a structured GitHub issue body.
  */
-function formatGitHubIssueBody(payload: ResolverPayload): string {
+function formatGitHubIssueBody(payload: ResolverPayload, dispatchType: 'violation' | 'prediction'): string {
   const sections: string[] = [];
 
-  sections.push(`## Memory Resolver Event\n`);
+  if (dispatchType === 'violation') {
+    sections.push(`## Violation Alert\n`);
+  } else {
+    sections.push(`## Prediction Resolution\n`);
+  }
+
   sections.push(`- **Batch ID:** \`${payload.batchId}\``);
   sections.push(`- **Session ID:** \`${payload.sessionId}\``);
   sections.push(`- **Affected Memories:** ${payload.summary.affectedMemories.map(id => `\`${id}\``).join(', ')}\n`);
 
+  // --- Violations ---
   if (payload.violations.length > 0) {
+    const hasZoneHealth = payload.violations.some(v => v.context.zone_health);
+
     sections.push(`### Violations (${payload.violations.length})\n`);
-    sections.push(`| Memory ID | Violated By | Damage Level | Context |`);
-    sections.push(`|-----------|-------------|--------------|---------|`);
-    for (const v of payload.violations) {
-      const ctx = v.context.condition || v.context.reason || '';
-      sections.push(`| \`${v.memory_id}\` | \`${v.violated_by || 'N/A'}\` | ${v.damage_level || 'N/A'} | ${ctx} |`);
+    if (hasZoneHealth) {
+      sections.push(`| Memory ID | Violated By | Damage | Zone Status | Quality | Condition |`);
+      sections.push(`|-----------|-------------|--------|-------------|---------|-----------|`);
+      for (const v of payload.violations) {
+        const zh = v.context.zone_health as { balanced?: boolean; quality_pct?: number; zone_size?: number } | undefined;
+        const zoneStatus = zh ? (zh.balanced ? 'balanced' : '**UNBALANCED**') : 'N/A';
+        const quality = zh ? `${zh.quality_pct}%` : 'N/A';
+        const ctx = (v.context.condition || v.context.reason || '') as string;
+        sections.push(`| \`${v.memory_id}\` | \`${v.violated_by || 'N/A'}\` | ${v.damage_level || 'N/A'} | ${zoneStatus} | ${quality} | ${ctx} |`);
+      }
+    } else {
+      sections.push(`| Memory ID | Violated By | Damage Level | Condition |`);
+      sections.push(`|-----------|-------------|--------------|-----------|`);
+      for (const v of payload.violations) {
+        const ctx = v.context.condition || v.context.reason || '';
+        sections.push(`| \`${v.memory_id}\` | \`${v.violated_by || 'N/A'}\` | ${v.damage_level || 'N/A'} | ${ctx} |`);
+      }
     }
     sections.push('');
   }
 
+  // --- Confirmations ---
   if (payload.confirmations.length > 0) {
     sections.push(`### Confirmations (${payload.confirmations.length})\n`);
     sections.push(`| Memory ID | Context |`);
@@ -238,6 +279,7 @@ function formatGitHubIssueBody(payload: ResolverPayload): string {
     sections.push('');
   }
 
+  // --- Cascades ---
   if (payload.cascades.length > 0) {
     sections.push(`### Cascades (${payload.cascades.length})\n`);
     sections.push(`| Memory ID | Source | Reason |`);
@@ -248,13 +290,13 @@ function formatGitHubIssueBody(payload: ResolverPayload): string {
     sections.push('');
   }
 
+  // --- Overdue Predictions ---
   if (payload.overduePredictions.length > 0) {
-    sections.push(`### Overdue Predictions (${payload.overduePredictions.length})\n`);
+    sections.push(`### Overdue Prediction\n`);
     for (const p of payload.overduePredictions) {
-      sections.push(`#### \`${p.memory_id}\`\n`);
+      sections.push(`- **Memory ID:** \`${p.memory_id}\``);
       sections.push(`- **Content:** ${p.context.content}`);
       sections.push(`- **Outcome Condition:** ${p.context.outcome_condition || 'N/A'}`);
-      // resolves_by is stored as Unix seconds, Date() expects milliseconds
       const deadlineMs = p.context.resolves_by < 1e12 ? p.context.resolves_by * 1000 : p.context.resolves_by;
       sections.push(`- **Deadline:** ${new Date(deadlineMs).toISOString()}`);
       if (p.context.invalidates_if && p.context.invalidates_if.length > 0) {
