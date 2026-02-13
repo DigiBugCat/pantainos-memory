@@ -4,7 +4,7 @@
  * Convert between database row types and API types.
  */
 
-import type { Memory, MemoryRow, MemoryState, ObservationSource, ExposureCheckStatus } from './shared/types/index.js';
+import type { Memory, MemoryRow, MemoryState, MemoryOutcome, ExposureCheckStatus } from './shared/types/index.js';
 
 /**
  * Convert a MemoryRow from D1 to a Memory object for API responses.
@@ -13,7 +13,7 @@ export function rowToMemory(row: MemoryRow): Memory {
   return {
     id: row.id,
     content: row.content,
-    source: (row.source as ObservationSource) || undefined,
+    source: row.source || undefined,
     source_url: row.source_url || undefined,
     derived_from: row.derived_from ? JSON.parse(row.derived_from) : undefined,
     assumes: row.assumes ? JSON.parse(row.assumes) : undefined,
@@ -29,6 +29,8 @@ export function rowToMemory(row: MemoryRow): Memory {
     centrality: row.centrality,
     propagated_confidence: row.propagated_confidence ?? undefined,
     state: (row.state as MemoryState) || 'active',
+    outcome: (row.outcome as MemoryOutcome) || undefined,
+    resolved_at: row.resolved_at || undefined,
     violations: row.violations ? JSON.parse(row.violations) : [],
     retracted: Boolean(row.retracted),
     retracted_at: row.retracted_at || undefined,
@@ -67,6 +69,8 @@ export function memoryToRow(memory: Memory): Partial<MemoryRow> {
     centrality: memory.centrality,
     propagated_confidence: memory.propagated_confidence ?? null,
     state: memory.state,
+    outcome: memory.outcome ?? null,
+    resolved_at: memory.resolved_at ?? null,
     violations: memory.violations ? JSON.stringify(memory.violations) : '[]',
     retracted: memory.retracted ? 1 : 0,
     retracted_at: memory.retracted_at,

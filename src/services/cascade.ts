@@ -44,19 +44,21 @@ export type CascadeReason =
   | 'derived_evidence_validated'   // A prediction/inference derived from this was confirmed
   | 'derived_evidence_invalidated'; // A prediction/inference derived from this was violated
 
+export type CascadeOutcome = 'correct' | 'incorrect' | 'void';
+
 export interface CascadeEffect {
   target_id: string;
   target_type: string;
   reason: CascadeReason;
   source_id: string;
-  source_outcome: 'correct' | 'incorrect' | 'void';
+  source_outcome: CascadeOutcome;
   edge_type: string;
   suggested_action: 'review';
 }
 
 export interface CascadeResult {
   source_id: string;
-  outcome: 'correct' | 'incorrect' | 'void';
+  outcome: CascadeOutcome;
   effects: CascadeEffect[];
   events_queued: number;
 }
@@ -181,7 +183,7 @@ async function findConnectedMemories(
  */
 export function determineCascadeEffects(
   sourceId: string,
-  sourceOutcome: 'correct' | 'incorrect' | 'void',
+  sourceOutcome: CascadeOutcome,
   connections: { memory: MemoryRow; edge: EdgeRow; direction: 'incoming' | 'outgoing' }[]
 ): CascadeEffect[] {
   const effects: CascadeEffect[] = [];
@@ -256,7 +258,7 @@ export function determineCascadeEffects(
 async function applyAutomaticPropagation(
   env: Env,
   memoryId: string,
-  outcome: 'correct' | 'incorrect' | 'void',
+  outcome: CascadeOutcome,
 ): Promise<number> {
   if (outcome === 'void') return 0;
 
@@ -329,7 +331,7 @@ async function applyAutomaticPropagation(
 export async function propagateResolution(
   env: Env,
   memoryId: string,
-  outcome: 'correct' | 'incorrect' | 'void',
+  outcome: CascadeOutcome,
   _sessionId?: string
 ): Promise<CascadeResult> {
   getLog().info('propagating', { memory_id: memoryId, outcome });
@@ -360,7 +362,7 @@ export async function propagateResolution(
 export async function previewCascade(
   env: Env,
   memoryId: string,
-  outcome: 'correct' | 'incorrect' | 'void'
+  outcome: CascadeOutcome
 ): Promise<CascadeEffect[]> {
   const connections = await findConnectedMemories(env.DB, memoryId);
   return determineCascadeEffects(memoryId, outcome, connections);

@@ -96,10 +96,3 @@ export interface Env extends MCPCoreEnv {
   PUSHOVER_USER_KEY?: string;
   PUSHOVER_APP_TOKEN?: string;
 }
-
-// ============================================
-// Type Aliases
-// ============================================
-
-// Source for observations
-export type ObservationSource = 'market' | 'news' | 'earnings' | 'email' | 'human' | 'tool';

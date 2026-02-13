@@ -21,7 +21,6 @@ import type {
   GraveyardResponse,
   ViolationPattern,
   Violation,
-  ObservationSource,
 } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
 
@@ -166,7 +165,7 @@ app.get('/', async (c) => {
 async function computeTopSources(
   db: D1Database,
   obsIds: string[]
-): Promise<Array<{ source: ObservationSource; count: number }>> {
+): Promise<Array<{ source: string; count: number }>> {
   if (obsIds.length === 0) return [];
 
   // Deduplicate
@@ -185,7 +184,7 @@ async function computeTopSources(
   ).bind(...uniqueIds).all<{ source: string; count: number }>();
 
   return (result.results || []).map(row => ({
-    source: row.source as ObservationSource,
+    source: row.source,
     count: row.count,
   }));
 }

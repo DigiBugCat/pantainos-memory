@@ -80,6 +80,8 @@ export const SCORING_WEIGHTS = {
   CENTRALITY_WEIGHT: 0.1,
   /** Weight for confidence boost in search scoring */
   CONFIDENCE_BOOST_WEIGHT: 0.5,
+  /** Penalty multiplier for incorrect/superseded resolved memories */
+  INCORRECT_PENALTY: 0.3,
 } as const;
 
 /** Default max_times_tested if not available from system_stats */
@@ -241,7 +243,14 @@ export function calculateScore(
   const effective = getEffectiveConfidence(memory, maxTimesTested);
 
   // New formula: similarity with confidence boost
-  return similarity * (1 + effective * SCORING_WEIGHTS.CONFIDENCE_BOOST_WEIGHT);
+  let score = similarity * (1 + effective * SCORING_WEIGHTS.CONFIDENCE_BOOST_WEIGHT);
+
+  // Penalize resolved-incorrect/superseded memories (still visible but ranked lower)
+  if (memory.state === 'resolved' && (memory.outcome === 'incorrect' || memory.outcome === 'superseded')) {
+    score *= SCORING_WEIGHTS.INCORRECT_PENALTY;
+  }
+
+  return score;
 }
 
 /**
