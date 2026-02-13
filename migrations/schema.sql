@@ -16,8 +16,9 @@ CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY,
   content TEXT NOT NULL,
 
-  -- Origin fields (mutually exclusive in practice)
-  source TEXT CHECK(source IN ('market', 'news', 'earnings', 'email', 'human', 'tool')),
+  -- Origin fields (can coexist in hybrid memories)
+  source TEXT,
+  source_url TEXT,
   derived_from TEXT,         -- JSON array of source memory IDs
 
   -- Thought fields (only meaningful when derived_from is set)
@@ -42,7 +43,7 @@ CREATE TABLE IF NOT EXISTS memories (
   -- State
   violations TEXT DEFAULT '[]',
   state TEXT DEFAULT 'active' CHECK(state IN ('active', 'confirmed', 'violated', 'resolved')),
-  outcome TEXT CHECK(outcome IN ('correct', 'incorrect', 'voided')),
+  outcome TEXT CHECK(outcome IN ('correct', 'incorrect', 'voided', 'superseded')),
   resolved_at INTEGER,
   retracted INTEGER DEFAULT 0,
   retracted_at INTEGER,
@@ -167,7 +168,8 @@ CREATE TABLE IF NOT EXISTS edges (
   edge_type TEXT DEFAULT 'derived_from' CHECK(edge_type IN (
     'derived_from',  -- Normal derivation
     'violated_by',   -- Observation that damaged this
-    'confirmed_by'   -- Observation that strengthened this
+    'confirmed_by',  -- Observation that strengthened this
+    'supersedes'     -- Memory replaced by newer memory (via resolve)
   )),
   strength REAL DEFAULT 1.0,  -- For strengthen/weaken operations
   created_at INTEGER NOT NULL,

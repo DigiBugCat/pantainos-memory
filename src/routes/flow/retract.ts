@@ -104,7 +104,7 @@ app.post('/:id', async (c) => {
   // Record version for audit trail
   await recordVersion(c.env.DB, {
     entityId: observationId,
-    entityType: 'observation',
+    entityType: 'memory',
     changeType: 'retracted',
     contentSnapshot: {
       id: observationId,

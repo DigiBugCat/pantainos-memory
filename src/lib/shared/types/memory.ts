@@ -1,10 +1,10 @@
 /**
  * Memory system types - Unified Memory Model
  *
- * Everything is a memory. Fields determine semantics:
- *   - source IS NOT NULL → observation (takes precedence for type labeling)
- *   - source IS NULL and derived_from IS NOT NULL → thought (derived belief)
- *   - source IS NULL and resolves_by IS NOT NULL → time-bound thought (prediction)
+ * Everything is a memory. No type taxonomy. Fields determine semantics:
+ *   - source: provenance (what external reality was perceived)
+ *   - derived_from: lineage (what existing memories informed this)
+ *   - resolves_by: time-bound (deadline for resolution)
  *
  * Core principle: Memories are weighted bets, not facts.
  * Confidence = survival rate under test (confirmations / times_tested)
@@ -14,17 +14,15 @@
 // Source and Edge Types
 // ============================================
 
-/** Source of an observation */
-export type ObservationSource =
-  | 'market'
-  | 'news'
-  | 'earnings'
-  | 'email'
-  | 'human'
-  | 'tool';
+/**
+ * Source is a free-text provenance string for flexible tracking.
+ * Well-known bootstrap priors:
+ * market (0.75), tool (0.70), earnings (0.70), news (0.55), email (0.50), human (0.50)
+ * Any other source defaults to 0.50 prior before learned track record.
+ */
 
 /** Edge type in the derivation graph */
-export type EdgeType = 'derived_from' | 'violated_by' | 'confirmed_by';
+export type EdgeType = 'derived_from' | 'violated_by' | 'confirmed_by' | 'supersedes';
 
 /** Damage level when a violation occurs */
 export type DamageLevel = 'core' | 'peripheral';
@@ -37,6 +35,9 @@ export type ExposureCheckStatus = 'pending' | 'processing' | 'completed' | 'skip
 
 /** Source of a violation (direct observation match or cascade from related memory) */
 export type ViolationSource = 'direct' | 'cascade';
+
+/** Resolution outcome for resolved memories */
+export type MemoryOutcome = 'correct' | 'incorrect' | 'voided' | 'superseded';
 
 /**
  * Memory state in the state machine.
@@ -88,7 +89,7 @@ export interface Memory {
   content: string;
 
   // Origin fields (can coexist in hybrid memories)
-  source?: ObservationSource;
+  source?: string;
   source_url?: string;
   derived_from?: string[];
 
@@ -115,6 +116,8 @@ export interface Memory {
 
   // State machine
   state: MemoryState;
+  outcome?: MemoryOutcome;
+  resolved_at?: number;
 
   // Violations as data (mark, don't delete)
   violations: Violation[];
@@ -156,6 +159,8 @@ export interface MemoryRow {
   centrality: number;
   propagated_confidence: number | null;
   state: string;
+  outcome: string | null;
+  resolved_at: number | null;
   violations: string;
   retracted: number;
   retracted_at: number | null;
@@ -202,14 +207,11 @@ export function isTimeBound(memory: TypeDetectable): boolean {
 
 /**
  * Get display type for a memory.
- * Used for UI display and analytics, not for logic.
- * Accepts partial objects with just the type-determining fields.
+ * Returns 'memory' for all memories — no type distinction.
+ * Field presence (source, derived_from, resolves_by) determines semantics, not a type label.
  */
-export function getDisplayType(memory: TypeDetectable): 'observation' | 'thought' | 'prediction' {
-  if (memory.source != null) return 'observation';
-  if (memory.resolves_by != null) return 'prediction';
-  if (isThought(memory)) return 'thought';
-  return 'observation'; // fallback
+export function getDisplayType(_memory: TypeDetectable): 'memory' {
+  return 'memory';
 }
 
 // ============================================
@@ -278,7 +280,7 @@ export interface ScoredMemory {
 /** Create an observation (intake from reality) */
 export interface ObserveRequest {
   content: string;
-  source: ObservationSource;
+  source: string;
   /** Conditions that would prove this wrong (optional for observations) */
   invalidates_if?: string[];
   /** Conditions that would strengthen this (optional for observations) */
@@ -299,7 +301,7 @@ export interface ObserveRequest {
 export interface MemoryRequest {
   content: string;
   /** Source of observation */
-  source?: ObservationSource;
+  source?: string;
   /** URL/link where this information came from */
   source_url?: string;
   /** IDs of source memories this memory is based on */
@@ -492,7 +494,7 @@ export interface GraveyardResponse {
   /** Most common violated conditions */
   top_conditions: Array<{ condition: string; count: number }>;
   /** Sources that cause most violations */
-  top_sources: Array<{ source: ObservationSource; count: number }>;
+  top_sources: Array<{ source: string; count: number }>;
 }
 
 /** Response from pending endpoint (predictions past deadline) */
@@ -668,9 +670,9 @@ export interface MemoryHealthStatus {
 
 export interface MemoryStatsResponse {
   total_memories: number;
-  observations: number;
-  thoughts: number;
-  predictions: number;
+  sourced: number;
+  derived: number;
+  time_bound: number;
   total_edges: number;
   avg_confidence: number;
   avg_exposures: number;

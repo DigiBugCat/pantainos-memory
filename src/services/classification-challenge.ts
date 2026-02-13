@@ -15,7 +15,6 @@
 
 import type { Env } from '../types/index.js';
 import type { Config } from '../lib/config.js';
-import type { ObservationSource } from '../lib/shared/types/index.js';
 import { createLazyLogger } from '../lib/lazy-logger.js';
 import { withRetry } from '../lib/retry.js';
 import { callExternalLLM } from '../lib/embeddings.js';
@@ -23,7 +22,7 @@ import { callExternalLLM } from '../lib/embeddings.js';
 const getLog = createLazyLogger('ClassificationChallenge', 'classification-init');
 
 /** Display type for memories (determined by field presence) */
-type DisplayType = 'observation' | 'thought' | 'prediction';
+type DisplayType = 'memory';
 
 /** Fields that might be missing from a memory */
 export type MissingFieldType = 'invalidates_if' | 'confirms_if' | 'derived_from' | 'source' | 'resolves_by';
@@ -49,7 +48,7 @@ export interface ClassificationChallenge {
   confidence: number;
   reasoning: string;
   suggested_fields?: {
-    source?: ObservationSource;
+    source?: string;
   };
   /** New field for completeness suggestions */
   missing_fields?: MissingField[];
@@ -131,19 +130,11 @@ function parseClassificationResponse(responseText: string): {
   reasoning: string;
 } | null {
   try {
-    // Try direct JSON parse
     const parsed = JSON.parse(responseText);
     if (typeof parsed.correctly_classified === 'boolean' && typeof parsed.confidence === 'number') {
-      // Map legacy 'obs' to 'observation'
-      let suggestedType: DisplayType = 'thought';
-      if (parsed.suggested_type === 'obs' || parsed.suggested_type === 'observation') {
-        suggestedType = 'observation';
-      } else if (parsed.suggested_type === 'prediction') {
-        suggestedType = 'prediction';
-      }
       return {
         correctly_classified: parsed.correctly_classified,
-        suggested_type: suggestedType,
+        suggested_type: 'memory',
         confidence: Number(parsed.confidence),
         reasoning: String(parsed.reasoning || ''),
       };
@@ -152,21 +143,13 @@ function parseClassificationResponse(responseText: string): {
     // Not valid JSON, try regex extraction
   }
 
-  // Fallback: Extract JSON from response text
   const jsonMatch = responseText.match(/\{[\s\S]*\}/);
   if (jsonMatch) {
     try {
       const parsed = JSON.parse(jsonMatch[0]);
-      // Map legacy 'obs' to 'observation'
-      let suggestedType: DisplayType = 'thought';
-      if (parsed.suggested_type === 'obs' || parsed.suggested_type === 'observation') {
-        suggestedType = 'observation';
-      } else if (parsed.suggested_type === 'prediction') {
-        suggestedType = 'prediction';
-      }
       return {
         correctly_classified: Boolean(parsed.correctly_classified),
-        suggested_type: suggestedType,
+        suggested_type: 'memory',
         confidence: Number(parsed.confidence) || 0,
         reasoning: String(parsed.reasoning || ''),
       };
@@ -347,7 +330,7 @@ export async function challengeClassification(
  * Infer the most likely observation source based on content.
  * This is a heuristic - the user should verify.
  */
-function inferLikelySource(content: string): ObservationSource {
+function inferLikelySource(content: string): string {
   const lowerContent = content.toLowerCase();
 
   // Market data indicators
@@ -422,18 +405,17 @@ export function formatChallengeOutput(challenge: ClassificationChallenge, curren
     });
   }
 
-  // Legacy format for type misclassification
+  // Legacy format for type misclassification (deprecated — types are unified now)
   let output = `\n⚠️ Classification Challenge:\n`;
-  output += `This might be better classified as an ${challenge.suggested_type} rather than an ${currentType}.\n`;
+  output += `This memory may need additional fields.\n`;
   output += `Confidence: ${Math.round(challenge.confidence * 100)}%\n`;
   output += `Reasoning: "${challenge.reasoning}"\n`;
 
-  if (challenge.suggested_type === 'observation' && challenge.suggested_fields?.source) {
+  if (challenge.suggested_fields?.source) {
     output += `\nSuggested source: ${challenge.suggested_fields.source}\n`;
   }
 
-  output += `\nTo fix: Retract this memory and recreate it with the correct fields `;
-  output += `(use observe with ${challenge.suggested_type === 'observation' ? '"source"' : '"derived_from"'}).`;
+  output += `\nTo fix: Update this memory with the appropriate fields (source, derived_from, etc).`;
 
   return output;
 }
@@ -455,38 +437,38 @@ function buildCompletenessPrompt(
     has_resolves_by?: boolean;
   }
 ): string {
-  const isObservation = currentFields.has_source === true;
+  const hasSource = currentFields.has_source === true;
 
   return `Analyze whether this memory is complete and well-formed.
 
 Content: "${content}"
 
 Current fields present: ${JSON.stringify(currentFields)}
-Memory type: ${isObservation ? 'OBSERVATION (recording what was seen/heard/read)' : 'THOUGHT (inference derived from other memories)'}
+Origin: ${hasSource ? 'Sourced perception (recorded from external input)' : 'Derived perception (inferred from other memories)'}
 
 Field definitions:
-- source: Where the information came from (for observations: market, news, tool, human, etc.)
-- derived_from: IDs of memories this belief is based on (for thoughts/inferences)
+- source: Where the information came from (market, news, tool, human, etc.)
+- derived_from: IDs of memories this perception is based on
 - invalidates_if: Conditions that would prove this memory wrong (makes claims falsifiable)
 - confirms_if: Conditions that would strengthen confidence in this memory
 - resolves_by: Deadline for time-bound predictions (Unix timestamp)
-${isObservation ? `
-IMPORTANT — Observation leniency rules:
-Observations record WHAT WAS SAID or WHAT HAPPENED. They are not the author's own claims.
+${hasSource ? `
+IMPORTANT — Sourced perception leniency rules:
+Sourced perceptions record WHAT WAS SAID or WHAT HAPPENED. They are not the author's own claims.
 - If someone said "X will happen in 3 years," that is a QUOTE, not a prediction by the memory author. Do NOT require resolves_by.
 - Falsifiable claims WITHIN quotes belong to the speaker, not the memory. Do NOT require invalidates_if for quoted/attributed claims.
-- invalidates_if and confirms_if are NICE TO HAVE on observations, never required. Only flag them if truly obvious and simple (1 condition max).
-- confirms_if is NEVER required for observations.
-- An observation with source + content is COMPLETE. Err heavily toward marking observations as complete.
+- invalidates_if and confirms_if are NICE TO HAVE on sourced perceptions, never required. Only flag them if truly obvious and simple (1 condition max).
+- confirms_if is NEVER required for sourced perceptions.
+- A sourced perception with source + content is COMPLETE. Err heavily toward marking sourced perceptions as complete.
 ` : ''}
 Check for these completeness issues:
-1. ${isObservation ? 'SKIP for observations unless the memory itself (not quoted speakers) makes a novel prediction' : 'Falsifiable claims without invalidates_if conditions - any claim that could be proven wrong should ideally have kill conditions'}
+1. ${hasSource ? 'SKIP for sourced perceptions unless the memory itself (not quoted speakers) makes a novel prediction' : 'Falsifiable claims without invalidates_if conditions - any claim that could be proven wrong should ideally have kill conditions'}
 2. Apparent inferences without derived_from - if this seems like a conclusion based on other information, it should trace its reasoning
-3. ${isObservation ? 'SKIP for observations — quoted time-bound claims belong to the speaker' : 'Time-bound predictions without resolves_by/outcome_condition - predictions with implicit deadlines should make them explicit'}
+3. ${hasSource ? 'SKIP for sourced perceptions — quoted time-bound claims belong to the speaker' : 'Time-bound predictions without resolves_by/outcome_condition - predictions with implicit deadlines should make them explicit'}
 4. Claims that reference external information without source attribution
 
-Note: Not every memory needs every field. Simple facts or observations may be complete as-is.
-${isObservation ? 'Observations are almost always complete if they have a source. Be very reluctant to flag missing fields.' : 'Focus on genuinely missing fields that would strengthen the memory, not theoretical completeness.'}
+Note: Not every memory needs every field. Simple perceptions may be complete as-is.
+${hasSource ? 'Sourced perceptions are almost always complete if they have a source. Be very reluctant to flag missing fields.' : 'Focus on genuinely missing fields that would strengthen the memory, not theoretical completeness.'}
 
 Respond with JSON only:
 {

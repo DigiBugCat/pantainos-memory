@@ -22,7 +22,7 @@ type Variables = {
 };
 
 /** Display type for memory entities */
-type DisplayType = 'observation' | 'thought' | 'prediction';
+type DisplayType = 'memory';
 
 export interface KnowledgeAssessment {
   topic: string;

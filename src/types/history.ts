@@ -1,10 +1,7 @@
 /**
  * History & Audit Tracking Types - Unified Memory Model
  *
- * Three semantic types (determined by field presence):
- * - observation: has source field
- * - thought: has derived_from field (no resolves_by)
- * - prediction: has resolves_by field
+ * All memories use 'memory' as entity type. 'edge' for graph edges.
  */
 
 // ============================================
@@ -13,9 +10,9 @@
 
 /**
  * Entity types tracked in history.
- * Display types plus 'edge' for graph edges.
+ * 'memory' for all memories, 'edge' for graph edges.
  */
-export type HistoryEntityType = 'observation' | 'thought' | 'prediction' | 'edge';
+export type HistoryEntityType = 'memory' | 'edge';
 
 // ============================================
 // Version History Types

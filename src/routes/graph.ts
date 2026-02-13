@@ -13,7 +13,7 @@ import type { Env } from '../types/index.js';
 const app = new Hono<{ Bindings: Env }>();
 
 /** Display type for graph nodes */
-type DisplayType = 'observation' | 'thought' | 'prediction';
+type DisplayType = 'memory';
 
 interface GraphEntity {
   id: string;

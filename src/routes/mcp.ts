@@ -14,7 +14,7 @@ import { Hono } from 'hono';
 import type { Env as BaseEnv, MemoryRow, ScoredMemory, RecordAccessParams, EdgeRow } from '../types/index.js';
 import type { Config } from '../lib/config.js';
 import type { ExposureCheckJob } from '../lib/shared/types/index.js';
-import { getDisplayType, isObservation } from '../lib/shared/types/index.js';
+import { getDisplayType } from '../lib/shared/types/index.js';
 import {
   handleMcpMessage,
   parseJsonRpcRequest,
@@ -34,6 +34,7 @@ import { storeObservationEmbeddings, storeObservationWithConditions, storeThough
 import { recordVersion } from '../services/history-service.js';
 import { recordAccessBatch, querySessionMemories, type SessionMemoryAccess } from '../services/access-service.js';
 import { rowToMemory } from '../lib/transforms.js';
+import { normalizeSource, isNonEmptySource } from '../lib/source.js';
 import { createScoredMemory } from '../lib/scoring.js';
 import { incrementCentrality } from '../services/exposure-checker.js';
 import { checkMemoryCompleteness } from '../services/classification-challenge.js';
@@ -58,9 +59,6 @@ type Variables = {
   userAgent: string | undefined;
   ipHash: string | undefined;
 };
-
-/** Valid observation sources */
-const VALID_SOURCES = ['market', 'news', 'earnings', 'email', 'human', 'tool'] as const;
 
 /**
  * Parse a resolves_by value into Unix seconds.
@@ -118,15 +116,28 @@ function formatMemory(m: { id: string; content: string; state?: string; times_te
   return `[${m.id}] ${m.content}${stateIcon}${confidence}`;
 }
 
+/** Get outcome/state icon for display */
+function getOutcomeIcon(state?: string, outcome?: string): string {
+  if (state === 'resolved') {
+    if (outcome === 'incorrect') return ' ❌';
+    if (outcome === 'superseded') return ' ⏰';
+    if (outcome === 'correct') return ' ✅';
+    if (outcome === 'voided') return ' 🚫';
+  }
+  if (state === 'violated') return ' ⚠️';
+  if (state === 'confirmed') return ' ✓';
+  return '';
+}
+
 /** Format search results */
-function formatFindResults(results: Array<{ memory: { id: string; content: string; state?: string }; similarity: number; confidence: number }>, query: string): string {
+function formatFindResults(results: Array<{ memory: { id: string; content: string; state?: string; outcome?: string }; similarity: number; confidence: number }>, query: string): string {
   if (results.length === 0) return `No results for "${query}"`;
 
   const lines = results.map((r, i) => {
     const sim = Math.round(r.similarity * 100);
     const conf = Math.round(r.confidence * 100);
-    const stateIcon = r.memory.state === 'violated' ? ' ⚠️' : r.memory.state === 'confirmed' ? ' ✓' : '';
-    return `${i + 1}. [${r.memory.id}] ${r.memory.content}${stateIcon}\n   sim:${sim}% conf:${conf}%`;
+    const icon = getOutcomeIcon(r.memory.state, r.memory.outcome);
+    return `${i + 1}. [${r.memory.id}] ${r.memory.content}${icon}\n   sim:${sim}% conf:${conf}%`;
   });
 
   return `Found ${results.length} for "${query}":\n\n${lines.join('\n\n')}`;
@@ -135,16 +146,25 @@ function formatFindResults(results: Array<{ memory: { id: string; content: strin
 /** Format recall result */
 function formatRecall(memory: MemoryRow, connections: Array<{ target_id: string; strength: number }>): string {
   const m = rowToMemory(memory);
-  const displayType = getDisplayType(m);
-  const stateIcon = m.state === 'violated' ? ' ⚠️ VIOLATED' : m.state === 'confirmed' ? ' ✓ CONFIRMED' : '';
+  const icon = getOutcomeIcon(m.state, m.outcome);
+  const stateLabel = m.state === 'resolved' && m.outcome
+    ? `resolved:${m.outcome}`
+    : m.state;
   const confidence = m.times_tested > 0
     ? `${Math.round(m.confirmations / m.times_tested * 100)}% (${m.confirmations}/${m.times_tested})`
     : 'untested';
 
-  let text = `[${m.id}] ${m.content}\n\n`;
-  text += `Type: ${displayType} | State: ${m.state}${stateIcon} | Confidence: ${confidence}\n`;
+  // Describe by field presence instead of type label
+  const traits: string[] = [];
+  if (m.source) traits.push('sourced');
+  if (m.derived_from && m.derived_from.length > 0) traits.push('derived');
+  if (m.resolves_by) traits.push('time-bound');
+  const traitLabel = traits.length > 0 ? traits.join(', ') : 'standalone';
 
-  if (isObservation(m) && m.source) {
+  let text = `[${m.id}] ${m.content}\n\n`;
+  text += `${traitLabel} | State: ${stateLabel}${icon} | Confidence: ${confidence}\n`;
+
+  if (m.source) {
     text += `Source: ${m.source}\n`;
   }
 
@@ -178,7 +198,7 @@ function formatInsights(view: string, memories: MemoryRow[], total: number, _lim
 
 /** Format pending predictions */
 function formatPending(memories: Array<{ id: string; content: string; resolves_by?: number }>, total: number, _limit: number, offset: number): string {
-  if (memories.length === 0) return 'No pending time-bound predictions';
+  if (memories.length === 0) return 'No pending time-bound memories';
 
   const lines = memories.map(m => {
     const deadline = m.resolves_by ? formatResolvesBy(m.resolves_by) : 'no deadline';
@@ -312,15 +332,14 @@ const createMemoryTools = (config: Config, requestId: string) => createToolRegis
 
 defineTool({
     name: 'observe',
-    description: `Record a memory using the unified model:
+    description: `Store a new memory. Every memory is a perception — what you saw, read, inferred, or predicted.
 
-OBSERVATION: set "source" (market, news, earnings, email, human, tool)
-THOUGHT/PREDICTION: set "derived_from" with source memory IDs
-HYBRID: source + derived_from is allowed
+Set "source" for provenance (what you perceived from), "derived_from" for lineage (what memories informed this).
+Both can be set together. At least one is required.
 
-At least one of "source" or "derived_from" is required.
-Both modes support invalidates_if/confirms_if conditions.
-For predictions: add resolves_by (date string or timestamp) + outcome_condition.`,
+source examples: "market", "sec-10k", "reddit", "polygon-api", "analyst-report", "earnings-call", "human", "agent-research"
+For time-bound claims: add resolves_by (date string or timestamp) + outcome_condition.
+All memories support invalidates_if/confirms_if conditions.`,
     annotations: {
       title: 'Record Memory',
       readOnlyHint: false,
@@ -332,7 +351,10 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       type: 'object',
       properties: {
         content: { type: 'string', description: 'The memory content' },
-        source: { type: 'string', enum: ['market', 'news', 'earnings', 'email', 'human', 'tool'], description: 'Observation source' },
+        source: {
+          type: 'string',
+          description: 'Free-text provenance string (examples: "market", "sec-10k", "reddit", "polygon-api", "analyst-report", "earnings-call", "human", "agent-research")',
+        },
         source_url: { type: 'string', description: 'URL/link where this information came from' },
         derived_from: { type: 'array', items: { type: 'string' }, description: 'Source memory IDs this memory derives from' },
         invalidates_if: { type: 'array', items: { type: 'string' }, description: 'Conditions that would prove this wrong' },
@@ -378,20 +400,24 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         return errorResult(`Could not parse resolves_by: "${rawResolvesBy}". Use a date string (e.g. "2026-03-15") or Unix timestamp.`);
       }
 
+      // Normalize source before validation/persistence
+      let normalizedSource: string | undefined;
+      if (source !== undefined && source !== null) {
+        if (typeof source !== 'string' || !isNonEmptySource(source)) {
+          return errorResult('source must be a non-empty string when provided');
+        }
+        normalizedSource = normalizeSource(source);
+      }
+
       // Validate origin: at least one of source or derived_from required
-      const hasSource = source !== undefined && source !== null;
+      const hasSource = normalizedSource !== undefined;
       const hasDerivedFrom = derived_from !== undefined && derived_from !== null && derived_from.length > 0;
 
       if (!hasSource && !hasDerivedFrom) {
-        return errorResult('Either "source" or "derived_from" is required. Set "source" for observations, "derived_from" for thoughts.');
+        return errorResult('Either "source" or "derived_from" is required. Set "source" for provenance, "derived_from" for lineage, or both.');
       }
 
       // Field-specific validation
-      if (hasSource) {
-        if (!VALID_SOURCES.includes(source as typeof VALID_SOURCES[number])) {
-          return errorResult(`source must be one of: ${VALID_SOURCES.join(', ')}`);
-        }
-      }
       if (hasDerivedFrom) {
         // Validate derived_from existence
         const placeholders = derived_from!.map(() => '?').join(',');
@@ -460,10 +486,10 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       // Determine starting confidence based on mode
       let startingConfidence: number;
       if (hasSource) {
-        // Observation: use source-based confidence
-        startingConfidence = await getStartingConfidenceForSource(ctx.env.DB, source!);
+        // Has provenance: use source-based confidence
+        startingConfidence = await getStartingConfidenceForSource(ctx.env.DB, normalizedSource!);
       } else {
-        // Thought: predictions get lower prior than general thoughts
+        // Derived only: predictions get lower prior than general perceptions
         startingConfidence = timeBound ? TYPE_STARTING_CONFIDENCE.predict : TYPE_STARTING_CONFIDENCE.think;
       }
 
@@ -480,7 +506,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       ).bind(
         id,
         content,
-        hasSource ? source : null,
+        hasSource ? normalizedSource : null,
         source_url || null,
         hasDerivedFrom ? JSON.stringify(derived_from) : null,
         assumes ? JSON.stringify(assumes) : null,
@@ -509,15 +535,14 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       }
 
       // Record version for audit trail
-      const entityType = hasSource ? 'observation' : (timeBound ? 'prediction' : 'thought');
       await recordVersion(ctx.env.DB, {
         entityId: id,
-        entityType,
+        entityType: 'memory',
         changeType: 'created',
         contentSnapshot: {
           id,
           content,
-          source: hasSource ? source : undefined,
+          source: hasSource ? normalizedSource : undefined,
           source_url: source_url || undefined,
           derived_from: hasDerivedFrom ? derived_from : undefined,
           assumes,
@@ -546,12 +571,12 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         (confirms_if && confirms_if.length > 0);
 
       if (hasSource) {
-        // Observation mode
+        // Source-based embeddings (observation path)
         if (hasConditions) {
           await storeObservationWithConditions(ctx.env, ctx.env.AI, config, {
             id,
             content,
-            source: source!,
+            source: normalizedSource!,
             invalidates_if,
             confirms_if,
             requestId,
@@ -561,7 +586,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
           await storeObservationEmbeddings(ctx.env, ctx.env.AI, config, {
             id,
             content,
-            source: source!,
+            source: normalizedSource!,
             requestId,
             embedding,
           });
@@ -598,21 +623,18 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         await ctx.env.DETECTION_QUEUE.send(exposureJob);
       }
 
-      // Format response based on mode
-      if (hasSource && hasDerivedFrom) {
-        return textResult(`✓ Observed [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}\n\nDerived from: ${derived_from!.map(d => `[${d}]`).join(', ')}`);
-      } else if (hasSource) {
-        return textResult(`✓ Observed [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}`);
-      } else {
-        const typeLabel = timeBound ? 'Predicted' : 'Thought';
-        return textResult(`✓ ${typeLabel} [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}\n\nDerived from: ${derived_from!.map(d => `[${d}]`).join(', ')}`);
+      // Unified response format
+      let response = `✓ Stored [${id}]\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}`;
+      if (hasDerivedFrom) {
+        response += `\n\nDerived from: ${derived_from!.map(d => `[${d}]`).join(', ')}`;
       }
+      return textResult(response);
     },
   }),
 
   defineTool({
     name: 'update',
-    description: 'Update a memory (within 1 hour or same session). Can modify content, source, derived_from, and all metadata fields. Arrays (invalidates_if, confirms_if, assumes, tags) are merged with existing values.',
+    description: 'Update a memory\'s content (corrections/refinements) or metadata. For fundamental thesis changes, use resolve(outcome="superseded", replaced_by=...) + observe() instead. Content changes on memories older than 1 hour will reset test counts (the evidence tested the OLD content). Arrays (invalidates_if, confirms_if, assumes, tags) are merged with existing values.',
     annotations: {
       title: 'Update Memory',
       readOnlyHint: false,
@@ -625,7 +647,10 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       properties: {
         memory_id: { type: 'string', description: 'ID of the memory to update' },
         content: { type: 'string', description: 'New content text (replaces existing)' },
-        source: { type: 'string', enum: ['market', 'news', 'earnings', 'email', 'human', 'tool'], description: 'Change observation source' },
+        source: {
+          type: 'string',
+          description: 'Free-text provenance string (examples: "market", "sec-10k", "reddit", "polygon-api", "analyst-report", "earnings-call", "human", "agent-research")',
+        },
         source_url: { type: 'string', description: 'URL/link where this information came from' },
         derived_from: { type: 'array', items: { type: 'string' }, description: 'Replace derived_from IDs' },
         invalidates_if: { type: 'array', items: { type: 'string' }, description: 'Conditions to ADD (not replace)' },
@@ -674,6 +699,14 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         return errorResult('memory_id is required');
       }
 
+      let normalizedNewSource: string | undefined;
+      if (newSource !== undefined) {
+        if (typeof newSource !== 'string' || !isNonEmptySource(newSource)) {
+          return errorResult('source must be a non-empty string when provided');
+        }
+        normalizedNewSource = normalizeSource(newSource);
+      }
+
       // Parse resolves_by if provided
       const resolves_by = rawResolvesBy2 !== undefined ? parseResolvesBy(rawResolvesBy2) : undefined;
       if (rawResolvesBy2 !== undefined && resolves_by === null) {
@@ -689,27 +722,76 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         return errorResult(`Memory not found: ${memory_id}`);
       }
 
-      // Check time window: same session OR created within 1 hour
-      // Exception: metadata-only updates (tags, obsidian_sources) bypass the time window
-      const isMetadataOnly = !newContent && newSource === undefined && newDerivedFrom === undefined
-        && !invalidates_if && !confirms_if && !assumes
-        && rawResolvesBy2 === undefined && outcome_condition === undefined
-        && (!!tags || !!obsidian_sources);
-
-      const ONE_HOUR_MS = 60 * 60 * 1000;
       const now = Date.now();
-      const isSameSession = ctx.sessionId && row.session_id === ctx.sessionId;
-      const isWithinTimeWindow = (now - row.created_at) < ONE_HOUR_MS;
+      const ONE_HOUR_MS = 60 * 60 * 1000;
+      const isOldMemory = (now - row.created_at) >= ONE_HOUR_MS;
 
-      if (!isMetadataOnly && !isSameSession && !isWithinTimeWindow) {
-        return errorResult(`Memory [${memory_id}] is too old to update (created ${Math.round((now - row.created_at) / 1000 / 60)} minutes ago). Only memories created within 1 hour or in the same session can be updated. Metadata-only updates (tags, obsidian_sources) are exempt.`);
+      // LLM guard: when content is being changed, check if it's a correction vs thesis change
+      if (newContent && newContent !== row.content) {
+        // Generate embeddings for both old and new content to check similarity
+        const [oldEmbedding, newEmbedding] = await Promise.all([
+          generateEmbedding(ctx.env.AI, row.content, config, requestId),
+          generateEmbedding(ctx.env.AI, newContent, config, requestId),
+        ]);
+
+        // Cosine similarity between old and new content
+        let dotProduct = 0;
+        let normA = 0;
+        let normB = 0;
+        for (let i = 0; i < oldEmbedding.length; i++) {
+          dotProduct += oldEmbedding[i] * newEmbedding[i];
+          normA += oldEmbedding[i] * oldEmbedding[i];
+          normB += newEmbedding[i] * newEmbedding[i];
+        }
+        const similarity = dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+
+        // If similarity is very low, this is likely a thesis change, not a correction
+        if (similarity < 0.7) {
+          // Use LLM judge as tiebreaker for borderline cases
+          const guardPrompt = `Compare these two versions of a memory. Is the new version a CORRECTION (rephrasing, fixing errors, adding nuance to the same claim) or a THESIS CHANGE (fundamentally different claim)?
+
+OLD: "${row.content}"
+NEW: "${newContent}"
+
+Respond with exactly one word: CORRECTION or THESIS_CHANGE`;
+
+          let isThesisChange = true; // Default to blocking if LLM fails
+          try {
+            let guardResponse: string;
+            if (ctx.env.LLM_JUDGE_URL) {
+              guardResponse = await callExternalLLM(
+                ctx.env.LLM_JUDGE_URL,
+                guardPrompt,
+                { apiKey: ctx.env.LLM_JUDGE_API_KEY, model: ctx.env.LLM_JUDGE_MODEL, requestId }
+              );
+            } else {
+              const aiResponse = await ctx.env.AI.run(
+                '@cf/meta/llama-3.1-8b-instruct' as Parameters<typeof ctx.env.AI.run>[0],
+                { messages: [{ role: 'user', content: guardPrompt }] } as { messages: Array<{ role: string; content: string }> }
+              ) as { response?: string };
+              guardResponse = aiResponse.response || '';
+            }
+            isThesisChange = guardResponse.toUpperCase().includes('THESIS_CHANGE');
+          } catch {
+            // LLM failed — fall back to embedding similarity only
+            isThesisChange = similarity < 0.5;
+          }
+
+          if (isThesisChange) {
+            return errorResult(
+              `This looks like a fundamental change in claim (similarity: ${Math.round(similarity * 100)}%). ` +
+              `Use resolve(memory_id="${memory_id}", outcome="superseded", replaced_by="<new_id>") + observe() ` +
+              `to create a supersede chain instead. update() is for corrections and refinements only.`
+            );
+          }
+        }
       }
 
       // Determine current memory type
       const hasDerivedFrom = row.derived_from !== null;
 
       // After update, determine the effective type
-      const effectiveSource = newSource !== undefined ? newSource : row.source;
+      const effectiveSource = normalizedNewSource !== undefined ? normalizedNewSource : row.source;
       const effectiveDerivedFrom = newDerivedFrom !== undefined ? newDerivedFrom : (hasDerivedFrom ? JSON.parse(row.derived_from!) : null);
       const hasEffectiveSource = effectiveSource !== null;
 
@@ -725,11 +807,6 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
           const missing = newDerivedFrom.filter((id) => !foundIds.has(id));
           return errorResult(`Source memories not found: ${missing.join(', ')}`);
         }
-      }
-
-      // Validate new source value
-      if (newSource !== undefined && !VALID_SOURCES.includes(newSource as typeof VALID_SOURCES[number])) {
-        return errorResult(`source must be one of: ${VALID_SOURCES.join(', ')}`);
       }
 
       // Parse existing arrays
@@ -812,6 +889,15 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         memory_id
       ).run();
 
+      // Safety rail: reset test counts when content changes on old memories
+      // The evidence (confirmations, tests, contradictions) tested the OLD content
+      const contentChanged = newContent !== undefined;
+      if (contentChanged && isOldMemory) {
+        await ctx.env.DB.prepare(
+          `UPDATE memories SET confirmations = 0, times_tested = 0, contradictions = 0 WHERE id = ?`
+        ).bind(memory_id).run();
+      }
+
       // Handle derived_from edge changes
       if (newDerivedFrom !== undefined) {
         // Delete old edges and create new ones
@@ -831,7 +917,6 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       }
 
       // Re-embed if content or conditions changed
-      const contentChanged = newContent !== undefined;
       const addedInvalidatesIf = invalidates_if || [];
       const addedConfirmsIf = confirms_if || [];
       const needsReEmbed = contentChanged || addedInvalidatesIf.length > 0 || addedConfirmsIf.length > 0;
@@ -919,7 +1004,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       // Record version for audit trail
       await recordVersion(ctx.env.DB, {
         entityId: memory_id,
-        entityType: hasEffectiveSource ? 'observation' : (timeBound ? 'prediction' : 'thought'),
+        entityType: 'memory',
         changeType: 'updated',
         contentSnapshot: {
           id: memory_id,
@@ -941,7 +1026,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       // Build response showing what changed
       const changes: string[] = [];
       if (contentChanged) changes.push('content updated');
-      if (newSource !== undefined) changes.push(`source → ${newSource}`);
+      if (normalizedNewSource !== undefined) changes.push(`source → ${normalizedNewSource}`);
       if (newDerivedFrom !== undefined) changes.push(`derived_from → [${newDerivedFrom.join(', ')}]`);
       if (addedInvalidatesIf.length > 0) changes.push(`+${addedInvalidatesIf.length} invalidates_if`);
       if (addedConfirmsIf.length > 0) changes.push(`+${addedConfirmsIf.length} confirms_if`);
@@ -951,13 +1036,26 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       if (resolves_by !== undefined) changes.push('resolves_by updated');
       if (outcome_condition !== undefined) changes.push('outcome_condition updated');
 
-      return textResult(`✓ Updated [${memory_id}]\n${changes.join(', ')}`);
+      // Safety warnings
+      const warnings: string[] = [];
+      if (contentChanged && isOldMemory) {
+        warnings.push('Test counts reset (evidence tested old content)');
+      }
+      if (contentChanged && row.centrality > 0) {
+        warnings.push(`This memory has ${row.centrality} dependent(s) that may need review`);
+      }
+
+      let result = `✓ Updated [${memory_id}]\n${changes.join(', ')}`;
+      if (warnings.length > 0) {
+        result += `\n\n⚠️ ${warnings.join('\n⚠️ ')}`;
+      }
+      return textResult(result);
     },
   }),
 
   defineTool({
     name: 'find',
-    description: 'Search memories by meaning. Results ranked by: similarity (semantic match), confidence (survival rate under testing), and centrality (how many thoughts derive from this). Use to find related observations before forming thoughts, or to check if a thought already exists.',
+    description: 'Search memories by meaning. Results ranked by: similarity (semantic match), confidence (survival rate under testing), and centrality (how many memories derive from this). Use to find related memories before storing new ones, or to check if a perception already exists.',
     annotations: {
       title: 'Search Memories',
       readOnlyHint: true,
@@ -967,23 +1065,26 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       type: 'object',
       properties: {
         query: { type: 'string', description: 'Natural language search query' },
-        types: { type: 'array', items: { type: 'string', enum: ['observation', 'thought', 'prediction'] }, description: 'Filter by memory types (observation, thought, prediction)' },
+        has_source: { type: 'boolean', description: 'Filter to memories with external source (provenance)' },
+        has_derived_from: { type: 'boolean', description: 'Filter to memories derived from other memories' },
+        time_bound: { type: 'boolean', description: 'Filter to time-bound memories (have resolves_by deadline)' },
         limit: { type: 'integer', description: 'Max results to return (default: 10)', minimum: 1, maximum: 100 },
         min_similarity: { type: 'number', description: 'Minimum similarity threshold (0-1)' },
       },
       required: ['query'],
     },
     handler: async (args, ctx) => {
-      const { query, types, limit: requestedLimit, min_similarity } = args as {
+      const { query, has_source, has_derived_from, time_bound, limit: requestedLimit, min_similarity } = args as {
         query: string;
-        types?: string[];
+        has_source?: boolean;
+        has_derived_from?: boolean;
+        time_bound?: boolean;
         limit?: number;
         min_similarity?: number;
       };
 
       const limit = requestedLimit || config.search.defaultLimit;
       const minSimilarity = min_similarity || config.search.minSimilarity;
-      const filterTypes = types || null; // null means no filter
 
       // Generate embedding for query
       const queryEmbedding = await generateEmbedding(ctx.env.AI, query, config, requestId);
@@ -1011,10 +1112,15 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
 
         const memory = rowToMemory(row);
 
-        // Type filtering using field presence
-        if (filterTypes) {
-          const displayType = getDisplayType(memory);
-          if (!filterTypes.includes(displayType)) continue;
+        // Field-presence filtering
+        const hasFilters = has_source !== undefined || has_derived_from !== undefined || time_bound !== undefined;
+        if (hasFilters) {
+          if (has_source === true && memory.source == null) continue;
+          if (has_source === false && memory.source != null) continue;
+          if (has_derived_from === true && (!memory.derived_from || memory.derived_from.length === 0)) continue;
+          if (has_derived_from === false && memory.derived_from && memory.derived_from.length > 0) continue;
+          if (time_bound === true && memory.resolves_by == null) continue;
+          if (time_bound === false && memory.resolves_by != null) continue;
         }
 
         const scoredMemory = createScoredMemory(memory, match.similarity, config);
@@ -1089,7 +1195,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
 
   defineTool({
     name: 'stats',
-    description: 'Get memory statistics (counts by type, robustness distribution, etc.).',
+    description: 'Get memory statistics (counts by field presence, edge count, etc.).',
     annotations: {
       title: 'Memory Statistics',
       readOnlyHint: true,
@@ -1124,22 +1230,22 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       const total = obs + thoughts + predictions;
       const edges = edgeCount?.count || 0;
 
-      return textResult(`📊 Memory Stats\nObservations: ${obs}\nThoughts: ${thoughts}\nPredictions: ${predictions}\nTotal: ${total}\nConnections: ${edges}`);
+      return textResult(`📊 Memory Stats\nTotal: ${total} (${obs} sourced, ${thoughts} derived, ${predictions} time-bound)\nConnections: ${edges}`);
     },
   }),
 
   defineTool({
     name: 'pending',
-    description: 'List time-bound predictions past their resolves_by deadline awaiting resolution. These need human review to mark as confirmed or violated.',
+    description: 'List time-bound memories past their resolves_by deadline awaiting resolution. These need review to mark as confirmed or violated.',
     annotations: {
-      title: 'Pending Predictions',
+      title: 'Pending Time-Bound Memories',
       readOnlyHint: true,
       openWorldHint: false,
     },
     inputSchema: {
       type: 'object',
       properties: {
-        overdue: { type: 'boolean', description: 'Only show overdue predictions (default: false shows all pending)' },
+        overdue: { type: 'boolean', description: 'Only show overdue time-bound memories (default: false shows all pending)' },
         limit: { type: 'integer', description: 'Max results (default: 20)' },
         offset: { type: 'integer', description: 'Skip first N results for pagination (default: 0)' },
       },
@@ -1180,7 +1286,7 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
 
   defineTool({
     name: 'insights',
-    description: 'Analyze knowledge graph health. Views: hubs (most-connected memories), orphans (unconnected - no derivation links), untested (low times_tested - dangerous if confident), failing (have violations from contradicting observations), recent (latest memories).',
+    description: 'Analyze knowledge graph health. Views: hubs (most-connected memories), orphans (unconnected - no derivation links), untested (low times_tested - dangerous if confident), failing (have violations from contradicting memories), recent (latest memories).',
     annotations: {
       title: 'Graph Insights',
       readOnlyHint: true,
@@ -1439,9 +1545,9 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
 
   defineTool({
     name: 'roots',
-    description: 'Trace a thought back to its root observations. Walks the derivation chain to find the original facts this belief is based on. Use to audit reasoning - every thought should trace back to reality.',
+    description: 'Trace a memory back to its root perceptions. Walks the derivation chain to find the original source memories this belief is based on. Use to audit reasoning - every derived memory should trace back to direct perceptions.',
     annotations: {
-      title: 'Trace Root Observations',
+      title: 'Trace Roots',
       readOnlyHint: true,
       openWorldHint: false,
     },
@@ -1470,9 +1576,9 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
 
       const memory = rowToMemory(row);
 
-      // If already an observation, return itself
-      if (isObservation(memory)) {
-        return textResult(`[${memory_id}] is already an observation (ground truth)\n\n${memory.content}`);
+      // If memory has no derivation chain, it's already a root
+      if (!memory.derived_from || memory.derived_from.length === 0) {
+        return textResult(`[${memory_id}] is already a root (no derived_from)\n\n${memory.content}`);
       }
 
       // Trace to roots
@@ -1489,16 +1595,16 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         ).bind(memId).all<{ source_id: string }>();
 
         if (!derivedFrom.results || derivedFrom.results.length === 0) {
-          // Check if this is an observation (root) - has source field set
-          const obsRow = await ctx.env.DB.prepare(
-            `SELECT * FROM memories WHERE id = ? AND source IS NOT NULL AND retracted = 0`
+          // No derivation edges — this is a root
+          const rootRow = await ctx.env.DB.prepare(
+            `SELECT * FROM memories WHERE id = ? AND retracted = 0`
           ).bind(memId).first<MemoryRow>();
 
-          if (obsRow && !roots.some(r => r.id === memId)) {
+          if (rootRow && !roots.some(r => r.id === memId)) {
             roots.push({
               id: memId,
-              content: obsRow.content,
-              type: 'observation',
+              content: rootRow.content,
+              type: getDisplayType(rowToMemory(rootRow)),
             });
             if (depth > maxDepth) maxDepth = depth;
           }
@@ -1506,38 +1612,20 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         }
 
         for (const parent of derivedFrom.results) {
-          const parentRow = await ctx.env.DB.prepare(
-            `SELECT * FROM memories WHERE id = ? AND retracted = 0`
-          ).bind(parent.source_id).first<MemoryRow>();
-
-          if (!parentRow) continue;
-
-          // Check if parent is an observation (has source field)
-          if (parentRow.source !== null) {
-            if (!roots.some(r => r.id === parent.source_id)) {
-              roots.push({
-                id: parent.source_id,
-                content: parentRow.content,
-                type: 'observation',
-              });
-              if (depth + 1 > maxDepth) maxDepth = depth + 1;
-            }
-          } else {
-            await traceToRoots(parent.source_id, depth + 1);
-          }
+          await traceToRoots(parent.source_id, depth + 1);
         }
       }
 
       await traceToRoots(memory_id, 0);
 
       if (roots.length === 0) {
-        return textResult(`[${memory_id}] has no traceable roots (orphan thought)`);
+        return textResult(`[${memory_id}] has no traceable roots (orphan memory)`);
       }
 
-      const rootLines = roots.map(r => `[${r.id}] ${r.content}`);
+      const rootLines = roots.map(r => `[${r.id}] (${r.type}) ${r.content}`);
       let text = `=== ROOTS of [${memory_id}] (depth: ${maxDepth}) ===\n\n`;
       text += `Source: ${memory.content.substring(0, 100)}...\n\n`;
-      text += `Grounded in ${roots.length} observation(s):\n\n`;
+      text += `Grounded in ${roots.length} root(s):\n\n`;
       text += rootLines.join('\n');
 
       return textResult(text);
@@ -2195,9 +2283,9 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
 
   defineTool({
     name: 'resolve',
-    description: 'Resolve a thought or prediction as correct, incorrect, or voided. Sets state to "resolved" with the given outcome, cleans up condition vectors, triggers cascade propagation to related memories, and records an audit trail. Only works on thoughts/predictions (not observations). Use when a prediction deadline has passed, or when you have enough evidence to judge a thought.',
+    description: 'Resolve any memory as correct, incorrect, superseded, or voided. Use when information is proven wrong (incorrect), outdated by newer data (superseded), confirmed accurate (correct), or no longer relevant (voided). Sets state to "resolved" with the given outcome, cleans up condition vectors, triggers cascade propagation to related memories, and records an audit trail. For superseded: pass replaced_by with the ID of the newer memory to create a supersedes edge. Pass force=true to re-resolve an already-resolved memory.',
     annotations: {
-      title: 'Resolve Thought/Prediction',
+      title: 'Resolve Memory',
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
@@ -2209,35 +2297,51 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         memory_id: { type: 'string', description: 'ID of the memory to resolve' },
         outcome: {
           type: 'string',
-          enum: ['correct', 'incorrect', 'voided'],
-          description: 'Resolution outcome: correct (confirmed true), incorrect (proven wrong), voided (no longer relevant/testable)',
+          enum: ['correct', 'incorrect', 'voided', 'superseded'],
+          description: 'Resolution outcome: correct (confirmed true), incorrect (proven wrong), superseded (was accurate but outdated now), voided (no longer relevant/testable)',
         },
         reason: { type: 'string', description: 'Explanation for why this outcome was chosen (audit trail)' },
+        replaced_by: { type: 'string', description: 'ID of the newer memory that replaces this one (creates a supersedes edge). Recommended when outcome is "superseded".' },
+        force: { type: 'boolean', description: 'Allow re-resolution of already-resolved memories (default: false)' },
       },
       required: ['memory_id', 'outcome', 'reason'],
     },
     handler: async (args, ctx) => {
-      const { memory_id, outcome, reason } = args as {
+      const { memory_id, outcome, reason, replaced_by, force = false } = args as {
         memory_id: string;
-        outcome: 'correct' | 'incorrect' | 'voided';
+        outcome: 'correct' | 'incorrect' | 'voided' | 'superseded';
         reason: string;
+        replaced_by?: string;
+        force?: boolean;
       };
 
       if (!memory_id) return errorResult('memory_id is required');
       if (!outcome) return errorResult('outcome is required');
       if (!reason) return errorResult('reason is required');
 
+      // Validate replaced_by if provided
+      if (replaced_by) {
+        if (replaced_by === memory_id) {
+          return errorResult('replaced_by cannot be the same as memory_id');
+        }
+        const replacementRow = await ctx.env.DB.prepare(
+          'SELECT id, retracted FROM memories WHERE id = ?'
+        ).bind(replaced_by).first<{ id: string; retracted: number }>();
+        if (!replacementRow) return errorResult(`Replacement memory not found: ${replaced_by}`);
+        if (replacementRow.retracted) return errorResult(`Replacement memory is retracted: ${replaced_by}`);
+      }
+
       // Fetch memory
       const row = await ctx.env.DB.prepare(
-        'SELECT id, content, state, outcome, source, retracted FROM memories WHERE id = ?'
-      ).bind(memory_id).first<{ id: string; content: string; state: string; outcome: string | null; source: string | null; retracted: number }>();
+        'SELECT id, content, state, outcome, source, retracted, resolves_by, derived_from FROM memories WHERE id = ?'
+      ).bind(memory_id).first<{ id: string; content: string; state: string; outcome: string | null; source: string | null; retracted: number; resolves_by: number | null; derived_from: string | null }>();
 
       if (!row) return errorResult(`Memory not found: ${memory_id}`);
       if (row.retracted) return errorResult(`Memory is retracted: ${memory_id}`);
-      if (row.source !== null) return errorResult('Cannot resolve an observation. Observations are facts — use retract instead.');
-      if (row.state === 'resolved') return errorResult(`Memory is already resolved (outcome: ${row.outcome}). Use admin tools to override.`);
+      if (row.state === 'resolved' && !force) return errorResult(`Memory is already resolved (outcome: ${row.outcome}). Pass force=true to re-resolve.`);
 
       const oldState = row.state;
+      const oldOutcome = row.outcome;
       const now = Date.now();
 
       // Update state
@@ -2245,19 +2349,33 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
         `UPDATE memories SET state = 'resolved', outcome = ?, resolved_at = ?, updated_at = ? WHERE id = ?`
       ).bind(outcome, now, now, memory_id).run();
 
+      // Create supersedes edge if replaced_by provided
+      let supersededText = '';
+      if (replaced_by) {
+        const edgeId = generateId();
+        await ctx.env.DB.prepare(
+          `INSERT INTO edges (id, source_id, target_id, edge_type, strength, created_at)
+           VALUES (?, ?, ?, 'supersedes', 1.0, ?)`
+        ).bind(edgeId, memory_id, replaced_by, now).run();
+        supersededText = `\nSuperseded by: [${replaced_by}]`;
+      }
+
       // Clean up condition vectors so resolved memory doesn't match future exposure checks
       await deleteConditionVectors(ctx.env, memory_id).catch(() => {});
 
       // Record version for audit trail
       await recordVersion(ctx.env.DB, {
         entityId: memory_id,
-        entityType: 'thought',
+        entityType: 'memory',
         changeType: 'resolved',
         contentSnapshot: {
           old_state: oldState,
+          old_outcome: oldOutcome,
           new_state: 'resolved',
           outcome,
           reason,
+          replaced_by: replaced_by || undefined,
+          force,
         },
         changeReason: reason,
         sessionId: ctx.sessionId,
@@ -2265,9 +2383,12 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
       });
 
       // Trigger cascade propagation
+      // Map superseded → incorrect for cascade (same shock effect)
       let cascadeText = '';
       try {
-        const cascadeOutcome = outcome === 'correct' ? 'correct' : outcome === 'incorrect' ? 'incorrect' : 'void';
+        const cascadeOutcome = outcome === 'correct' ? 'correct'
+          : (outcome === 'incorrect' || outcome === 'superseded') ? 'incorrect'
+          : 'void';
         const cascadeResult = await propagateResolution(ctx.env, memory_id, cascadeOutcome, ctx.sessionId);
         if (cascadeResult.effects.length > 0) {
           cascadeText = `\nCascade: ${cascadeResult.effects.length} related memories flagged for review`;
@@ -2278,8 +2399,9 @@ For predictions: add resolves_by (date string or timestamp) + outcome_condition.
 
       let text = `Resolved [${memory_id}] as ${outcome}\n`;
       text += `  ${row.content.slice(0, 120)}${row.content.length > 120 ? '...' : ''}\n`;
-      text += `  Previous state: ${oldState}\n`;
+      text += `  Previous state: ${oldState}${oldOutcome ? ` (was: ${oldOutcome})` : ''}\n`;
       text += `  Reason: ${reason}`;
+      text += supersededText;
       text += cascadeText;
 
       return textResult(text);

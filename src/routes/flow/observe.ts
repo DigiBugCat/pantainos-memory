@@ -37,6 +37,7 @@ import { logField, logOperation, logError } from '../../lib/shared/logging/index
 import type { Env } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
 import { generateId } from '../../lib/id.js';
+import { normalizeSource, isNonEmptySource } from '../../lib/source.js';
 import { storeObservationEmbeddings, storeObservationWithConditions, storeThoughtEmbeddings } from '../../services/embedding-tables.js';
 import { recordVersion } from '../../services/history-service.js';
 import { checkExposures, checkExposuresForNewThought, incrementCentrality } from '../../services/exposure-checker.js';
@@ -52,9 +53,6 @@ type Variables = {
 };
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
-
-/** Valid observation sources */
-const VALID_SOURCES = ['market', 'news', 'earnings', 'email', 'human', 'tool'] as const;
 
 /** Response type */
 interface ObserveResponse {
@@ -87,8 +85,17 @@ app.post('/', async (c) => {
     return c.json({ success: false, error: 'content is required' }, 400);
   }
 
+  // Normalize source before validation/persistence
+  let normalizedSource: string | undefined;
+  if (body.source !== undefined && body.source !== null) {
+    if (typeof body.source !== 'string' || !isNonEmptySource(body.source)) {
+      return c.json({ success: false, error: 'source must be a non-empty string when provided' }, 400);
+    }
+    normalizedSource = normalizeSource(body.source);
+  }
+
   // Validate origin: at least one of source or derived_from required
-  const hasSource = body.source !== undefined && body.source !== null;
+  const hasSource = normalizedSource !== undefined;
   const hasDerivedFrom = body.derived_from !== undefined && body.derived_from !== null && body.derived_from.length > 0;
 
   if (!hasSource && !hasDerivedFrom) {
@@ -99,14 +106,6 @@ app.post('/', async (c) => {
   }
 
   // Field-specific validation
-  if (hasSource) {
-    if (!VALID_SOURCES.includes(body.source as typeof VALID_SOURCES[number])) {
-      return c.json(
-        { success: false, error: `source must be one of: ${VALID_SOURCES.join(', ')}` },
-        400
-      );
-    }
-  }
   if (hasDerivedFrom) {
     // Validate derived_from existence
     const placeholders = body.derived_from!.map(() => '?').join(',');
@@ -139,7 +138,7 @@ app.post('/', async (c) => {
   // Determine starting confidence
   let startingConfidence: number;
   if (hasSource) {
-    startingConfidence = await getStartingConfidenceForSource(c.env.DB, body.source!);
+    startingConfidence = await getStartingConfidenceForSource(c.env.DB, normalizedSource!);
   } else {
     startingConfidence = timeBound ? TYPE_STARTING_CONFIDENCE.predict : TYPE_STARTING_CONFIDENCE.think;
   }
@@ -157,7 +156,7 @@ app.post('/', async (c) => {
   ).bind(
     id,
     body.content,
-    hasSource ? body.source : null,
+    hasSource ? normalizedSource : null,
     body.source_url || null,
     hasDerivedFrom ? JSON.stringify(body.derived_from) : null,
     body.assumes ? JSON.stringify(body.assumes) : null,
@@ -185,15 +184,14 @@ app.post('/', async (c) => {
   }
 
   // Record version for audit trail
-  const entityType = hasSource ? 'observation' : (timeBound ? 'prediction' : 'thought');
   await recordVersion(c.env.DB, {
     entityId: id,
-    entityType,
+    entityType: 'memory',
     changeType: 'created',
     contentSnapshot: {
       id,
       content: body.content,
-      source: hasSource ? body.source : undefined,
+      source: hasSource ? normalizedSource : undefined,
       source_url: body.source_url || undefined,
       derived_from: hasDerivedFrom ? body.derived_from : undefined,
       assumes: body.assumes,
@@ -230,7 +228,7 @@ app.post('/', async (c) => {
       const result = await storeObservationWithConditions(c.env, c.env.AI, config, {
         id,
         content: body.content,
-        source: body.source!,
+        source: normalizedSource!,
         invalidates_if: body.invalidates_if,
         confirms_if: body.confirms_if,
         requestId,
@@ -240,7 +238,7 @@ app.post('/', async (c) => {
       const result = await storeObservationEmbeddings(c.env, c.env.AI, config, {
         id,
         content: body.content,
-        source: body.source!,
+        source: normalizedSource!,
         requestId,
       });
       embedding = result.embedding;
@@ -260,8 +258,8 @@ app.post('/', async (c) => {
   }
 
   logField(c, 'memory_id', id);
-  logField(c, 'type', entityType);
-  if (hasSource) logField(c, 'source', body.source);
+  logField(c, 'type', 'memory');
+  if (hasSource) logField(c, 'source', normalizedSource);
   if (hasDerivedFrom) logField(c, 'derived_from', body.derived_from);
 
   // Sync mode: run exposure check inline and return results

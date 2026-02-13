@@ -92,11 +92,13 @@ app.post('/', async (c) => {
 
     if (!row) continue;
 
-    // Filter by type using field presence
-    const displayType = getDisplayType(row);
-    if (displayType === 'observation' && !allowObservations) continue;
-    if (displayType === 'thought' && !allowThoughts) continue;
-    if (displayType === 'prediction' && !allowPredictions) continue;
+    // Filter by field presence (legacy type filters)
+    const hasSource = row.source != null;
+    const hasResolveBy = row.resolves_by != null;
+    const hasDerived = row.derived_from != null;
+    if (hasSource && !allowObservations) continue;
+    if (!hasSource && hasDerived && !hasResolveBy && !allowThoughts) continue;
+    if (hasResolveBy && !allowPredictions) continue;
 
     const memory = rowToMemory(row);
     const scoredMemory = createScoredMemory(memory, match.similarity, config, maxTimesTested);

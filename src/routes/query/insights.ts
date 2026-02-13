@@ -28,7 +28,7 @@ type Variables = {
 export type InsightView = 'hubs' | 'orphans' | 'recent' | 'pending_exposure' | 'untested';
 
 /** Display type for memory entities */
-type DisplayType = 'observation' | 'thought' | 'prediction';
+type DisplayType = 'memory';
 
 export interface InsightEntity {
   id: string;

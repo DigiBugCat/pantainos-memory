@@ -502,44 +502,58 @@ async function updateExposureCheckStatus(
   `).bind(...values).run();
 }
 
-/** Process exposure check for a single job */
+/** Process exposure check for a single job — bidirectional for all memories */
 async function processExposureCheck(
   env: Env,
   job: ExposureCheckJob,
   log: ReturnType<typeof createStandaloneLogger>
 ): Promise<void> {
   const memoryId = job.memory_id;
-  const isObservation = job.is_observation ?? true;
   const content = job.content;
 
-  log.info('processing_exposure_check', { memory_id: memoryId, is_observation: isObservation });
+  log.info('processing_exposure_check', { memory_id: memoryId, bidirectional: true });
 
   // Mark as processing
   await updateExposureCheckStatus(env.DB, memoryId, 'processing');
 
-  let results;
+  // Run BOTH check directions for ALL memories (no is_observation branching)
+  // Direction 1: Check if this memory's content violates existing thoughts' conditions
+  const obsResults = await checkExposures(env, memoryId, content, job.embedding);
 
-  if (isObservation) {
-    // For observations: check against existing thoughts
-    results = await checkExposures(env, memoryId, content, job.embedding);
-  } else {
-    // For thoughts: check against existing observations
-    const timeBound = job.time_bound ?? false;
-    results = await checkExposuresForNewThought(
-      env,
-      memoryId,
-      content,
-      job.invalidates_if || [],
-      job.confirms_if || [],
-      timeBound
-    );
-  }
+  // Direction 2: Check if this memory's own conditions are violated by existing content
+  const timeBound = job.time_bound ?? false;
+  const thoughtResults = await checkExposuresForNewThought(
+    env,
+    memoryId,
+    content,
+    job.invalidates_if || [],
+    job.confirms_if || [],
+    timeBound
+  );
+
+  // Merge results, deduplicating by memory_id
+  const seenViolations = new Set<string>();
+  const allViolations = [...obsResults.violations, ...thoughtResults.violations].filter(v => {
+    if (seenViolations.has(v.memory_id)) return false;
+    seenViolations.add(v.memory_id);
+    return true;
+  });
+
+  const seenConfirmations = new Set<string>();
+  const allConfirmations = [...obsResults.confirmations, ...thoughtResults.confirmations].filter(c => {
+    if (seenConfirmations.has(c.memory_id)) return false;
+    seenConfirmations.add(c.memory_id);
+    return true;
+  });
+
+  // Auto-confirmations only come from checkExposures (obs direction)
+  const allAutoConfirmed = obsResults.autoConfirmed;
 
   // Queue significant events
-  const hasSignificantEvents = results.violations.length > 0 || results.autoConfirmed.length > 0;
+  const hasSignificantEvents = allViolations.length > 0 || allAutoConfirmed.length > 0;
 
   if (hasSignificantEvents) {
-    for (const v of results.violations) {
+    for (const v of allViolations) {
       // Post-shock zone health check (non-blocking best-effort)
       let zoneHealth: ZoneHealthReport | undefined;
       try {
@@ -555,20 +569,20 @@ async function processExposureCheck(
         session_id: job.session_id,
         event_type: 'violation',
         memory_id: v.memory_id,
-        violated_by: isObservation ? memoryId : v.memory_id,
+        violated_by: memoryId,
         damage_level: v.damage_level,
         context: {
           condition: v.condition,
           confidence: v.confidence,
           condition_type: v.condition_type,
-          check_direction: isObservation ? 'obs_to_thought' : 'thought_to_obs',
+          check_direction: 'bidirectional',
           triggering_memory: memoryId,
           zone_health: zoneHealth,
         },
       });
     }
 
-    for (const c of results.autoConfirmed) {
+    for (const c of allAutoConfirmed) {
       await queueSignificantEvent(env, {
         session_id: job.session_id,
         event_type: 'prediction_confirmed',
@@ -586,10 +600,11 @@ async function processExposureCheck(
 
   log.info('exposure_check_complete', {
     memory_id: memoryId,
-    is_observation: isObservation,
-    violations: results.violations.length,
-    confirmations: results.confirmations.length,
-    auto_confirmed: results.autoConfirmed.length,
+    violations: allViolations.length,
+    confirmations: allConfirmations.length,
+    auto_confirmed: allAutoConfirmed.length,
+    obs_direction_violations: obsResults.violations.length,
+    thought_direction_violations: thoughtResults.violations.length,
   });
 }
 

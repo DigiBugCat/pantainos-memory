@@ -12,7 +12,7 @@ import { getDisplayType } from '../lib/shared/types/index.js';
 const app = new Hono<{ Bindings: Env }>();
 
 /** Display type for memory entities */
-type DisplayType = 'observation' | 'thought' | 'prediction';
+type DisplayType = 'memory';
 
 interface TagWithCount {
   name: string;

@@ -240,7 +240,7 @@ export async function queryAccessEvents(
 export interface SessionMemoryAccess {
   memoryId: string;
   content: string;
-  displayType: 'observation' | 'thought' | 'prediction';
+  displayType: string;
   accessTypes: string[];
   queryTexts: string[];
   lastAccessed: number;
@@ -321,14 +321,7 @@ export async function querySessionMemories(
   }>();
 
   return (rows.results ?? []).map(row => {
-    let displayType: 'observation' | 'thought' | 'prediction';
-    if (row.source !== null) {
-      displayType = 'observation';
-    } else if (row.resolves_by !== null) {
-      displayType = 'prediction';
-    } else {
-      displayType = 'thought';
-    }
+    const displayType = 'memory';
 
     return {
       memoryId: row.memory_id,

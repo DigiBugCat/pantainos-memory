@@ -18,6 +18,7 @@ import { getDisplayType } from '../lib/shared/types/index.js';
 
 // Service imports for direct calls
 import { generateId } from '../lib/id.js';
+import { normalizeSource, isNonEmptySource } from '../lib/source.js';
 import { generateEmbedding, searchSimilar } from '../lib/embeddings.js';
 import { storeObservationEmbeddings, storeObservationWithConditions, storeThoughtEmbeddings } from '../services/embedding-tables.js';
 import { incrementCentrality } from '../services/exposure-checker.js';
@@ -36,9 +37,6 @@ type Variables = {
 };
 
 const internalRouter = new Hono<{ Bindings: Env; Variables: Variables }>();
-
-// Valid observation sources
-const VALID_SOURCES = ['market', 'news', 'earnings', 'email', 'human', 'tool'] as const;
 
 // =============================================================================
 // Helper Functions
@@ -100,8 +98,17 @@ internalRouter.post('/observe', async (c) => {
     return errorResponse(c, 'content is required');
   }
 
+  // Normalize source before validation/persistence
+  let normalizedSource: string | undefined;
+  if (source !== undefined && source !== null) {
+    if (typeof source !== 'string' || !isNonEmptySource(source)) {
+      return errorResponse(c, 'source must be a non-empty string when provided');
+    }
+    normalizedSource = normalizeSource(source);
+  }
+
   // Validate origin: at least one of source or derived_from
-  const hasSource = source !== undefined && source !== null;
+  const hasSource = normalizedSource !== undefined;
   const hasDerivedFrom = derived_from !== undefined && derived_from !== null && derived_from.length > 0;
 
   if (!hasSource && !hasDerivedFrom) {
@@ -109,12 +116,6 @@ internalRouter.post('/observe', async (c) => {
   }
 
   // Field-specific validation
-  if (hasSource) {
-    if (!VALID_SOURCES.includes(source as typeof VALID_SOURCES[number])) {
-      return errorResponse(c, `source must be one of: ${VALID_SOURCES.join(', ')}`);
-    }
-  }
-
   if (hasDerivedFrom) {
     const placeholders = derived_from!.map(() => '?').join(',');
     const sources = await c.env.DB.prepare(
@@ -142,7 +143,7 @@ internalRouter.post('/observe', async (c) => {
   // Determine starting confidence
   let startingConfidence: number;
   if (hasSource) {
-    startingConfidence = await getStartingConfidenceForSource(c.env.DB, source!);
+    startingConfidence = await getStartingConfidenceForSource(c.env.DB, normalizedSource!);
   } else {
     startingConfidence = timeBound ? TYPE_STARTING_CONFIDENCE.predict : TYPE_STARTING_CONFIDENCE.think;
   }
@@ -160,7 +161,7 @@ internalRouter.post('/observe', async (c) => {
   ).bind(
     id,
     content,
-    hasSource ? source : null,
+    hasSource ? normalizedSource : null,
     hasDerivedFrom ? JSON.stringify(derived_from) : null,
     assumes ? JSON.stringify(assumes) : null,
     invalidates_if ? JSON.stringify(invalidates_if) : null,
@@ -187,15 +188,14 @@ internalRouter.post('/observe', async (c) => {
   }
 
   // Record version for audit trail
-  const entityType = hasSource ? 'observation' : (timeBound ? 'prediction' : 'thought');
   await recordVersion(c.env.DB, {
     entityId: id,
-    entityType,
+    entityType: 'memory',
     changeType: 'created',
     contentSnapshot: {
       id,
       content,
-      source: hasSource ? source : undefined,
+      source: hasSource ? normalizedSource : undefined,
       derived_from: hasDerivedFrom ? derived_from : undefined,
       assumes,
       invalidates_if,
@@ -221,7 +221,7 @@ internalRouter.post('/observe', async (c) => {
       const result = await storeObservationWithConditions(c.env, c.env.AI, config, {
         id,
         content,
-        source: source!,
+        source: normalizedSource!,
         invalidates_if,
         confirms_if,
         requestId,
@@ -231,7 +231,7 @@ internalRouter.post('/observe', async (c) => {
       const result = await storeObservationEmbeddings(c.env, c.env.AI, config, {
         id,
         content,
-        source: source!,
+        source: normalizedSource!,
         requestId,
       });
       embedding = result.embedding;
