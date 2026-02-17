@@ -432,8 +432,6 @@ export async function checkExposures(
   };
 
   // Skip exposure checking for resolution observations to prevent feedback loops.
-  // When the resolver agent resolves a memory, it may create observations whose
-  // content matches invalidation conditions of other memories, causing circular violations.
   if (await isResolutionObservation(env.DB, observationId)) {
     getLog().info('skipping_resolution_observation', {
       observation_id: observationId,
@@ -441,205 +439,187 @@ export async function checkExposures(
     return result;
   }
 
-  // Track which memories we've already processed to avoid duplicates
-  const processedMemories = new Set<string>();
-
   getLog().info('exposure_check_start', {
     observation_id: observationId,
     observation_preview: observationContent.slice(0, 100),
     thresholds,
   });
 
-  // 1. Search INVALIDATES_VECTORS for conditions this observation might match
-  const invalidatesSearchStart = Date.now();
-  const invalidatesCandidates = await searchInvalidatesConditions(
-    env,
-    embedding,
-    thresholds.maxCandidates,
-    thresholds.minSimilarity
-  );
+  // Search both vector indexes concurrently — no reason to wait for one before the other
+  const [invalidatesCandidates, confirmsCandidates] = await Promise.all([
+    searchInvalidatesConditions(env, embedding, thresholds.maxCandidates, thresholds.minSimilarity),
+    searchConfirmsConditions(env, embedding, thresholds.maxCandidates, thresholds.minSimilarity),
+  ]);
 
-  getLog().info('invalidates_search_complete', {
-    candidates_found: invalidatesCandidates.length,
-    duration_ms: Date.now() - invalidatesSearchStart,
+  getLog().info('vector_search_complete', {
+    invalidates_candidates: invalidatesCandidates.length,
+    confirms_candidates: confirmsCandidates.length,
   });
 
-  getLog().info('invalidates_candidates', {
-    count: invalidatesCandidates.length,
-    candidates: invalidatesCandidates.map(c => ({
-      condition: c.condition_text,
-      similarity: c.similarity,
-      memory_id: c.memory_id,
-    })),
-  });
+  // Deduplicate candidates by memory_id (invalidates takes priority)
+  const seenMemoryIds = new Set<string>();
 
-  // 2. Process invalidation candidates
-  for (const candidate of invalidatesCandidates) {
-    if (processedMemories.has(candidate.memory_id)) continue;
+  // ── Async pipeline: each candidate flows independently through fetch → filter → LLM → record ──
 
-    // Get full memory details
-    const memory = await getMemoryById(env.DB, candidate.memory_id);
-    if (!memory) continue;
+  // Process invalidation candidates — all flow concurrently
+  const invalidationPipelines = invalidatesCandidates
+    .filter(candidate => {
+      if (seenMemoryIds.has(candidate.memory_id)) return false;
+      seenMemoryIds.add(candidate.memory_id);
+      return true;
+    })
+    .map(candidate => (async () => {
+      // Each candidate independently: fetch + filter concurrently → LLM judge → record
+      const [memory, hasPending] = await Promise.all([
+        getMemoryById(env.DB, candidate.memory_id),
+        hasPendingResolutionEvent(env.DB, candidate.memory_id),
+      ]);
+      if (!memory || memory.state !== 'active' || hasPending) return null;
 
-    // Skip memories that are no longer active (already violated/resolved/confirmed)
-    if (memory.state !== 'active') {
-      getLog().debug('skipping_non_active_memory', {
-        memory_id: candidate.memory_id,
-        state: memory.state,
-        condition: candidate.condition_text,
-      });
-      continue;
-    }
+      const llmStart = Date.now();
+      const match = await checkConditionMatch(
+        env, config, observationContent,
+        candidate.condition_text, 'invalidates_if', memory.content
+      );
 
-    // Skip memories that have a pending resolution event (being processed by resolver)
-    if (await hasPendingResolutionEvent(env.DB, candidate.memory_id)) {
-      getLog().debug('skipping_pending_resolution', {
+      getLog().info('llm_judge_result', {
         memory_id: candidate.memory_id,
         condition: candidate.condition_text,
-      });
-      continue;
-    }
-
-    // LLM-judge this specific condition
-    const llmStart = Date.now();
-    const match = await checkConditionMatch(
-      env,
-      config,
-      observationContent,
-      candidate.condition_text,
-      'invalidates_if',
-      memory.content
-    );
-
-    getLog().info('llm_judge_result', {
-      memory_id: candidate.memory_id,
-      condition: candidate.condition_text,
-      matches: match.matches,
-      confidence: match.confidence,
-      reasoning: match.reasoning,
-      threshold: thresholds.violationConfidence,
-      duration_ms: Date.now() - llmStart,
-    });
-
-    if (match.matches && match.confidence >= thresholds.violationConfidence) {
-      const damageLevel = getDamageLevel(memory.centrality);
-      result.violations.push({
-        memory_id: candidate.memory_id,
-        condition: candidate.condition_text,
+        matches: match.matches,
         confidence: match.confidence,
-        damage_level: damageLevel,
-        condition_type: 'invalidates_if',
+        reasoning: match.reasoning,
+        threshold: thresholds.violationConfidence,
+        duration_ms: Date.now() - llmStart,
       });
 
-      await recordViolation(env, candidate.memory_id, {
-        condition: candidate.condition_text,
-        timestamp: Date.now(),
-        obs_id: observationId,
-        damage_level: damageLevel,
-        source_type: 'direct',
-      });
+      if (match.matches && match.confidence >= thresholds.violationConfidence) {
+        const damageLevel = getDamageLevel(memory.centrality);
 
-      await createEdge(env.DB, observationId, candidate.memory_id, 'violated_by');
+        // Record violation + create edge flow concurrently, then cascade
+        await Promise.all([
+          recordViolation(env, candidate.memory_id, {
+            condition: candidate.condition_text,
+            timestamp: Date.now(),
+            obs_id: observationId,
+            damage_level: damageLevel,
+            source_type: 'direct',
+          }),
+          createEdge(env.DB, observationId, candidate.memory_id, 'violated_by'),
+        ]);
 
-      // Propagate cascade for all violations
-      // - Core damage: resolved as incorrect → cascade 'incorrect' (damage_confidence)
-      // - Non-core damage: not resolved, just violated → cascade 'void' (review)
-      try {
-        const cascadeOutcome = damageLevel === 'core' ? 'incorrect' : 'void';
-        await propagateResolution(env, candidate.memory_id, cascadeOutcome);
-      } catch (cascadeError) {
-        getLog().warn('cascade_failed', {
+        // Cascade depends on violation being recorded
+        try {
+          const cascadeOutcome = damageLevel === 'core' ? 'incorrect' : 'void';
+          await propagateResolution(env, candidate.memory_id, cascadeOutcome);
+        } catch (cascadeError) {
+          getLog().warn('cascade_failed', {
+            memory_id: candidate.memory_id,
+            error: cascadeError instanceof Error ? cascadeError.message : String(cascadeError),
+          });
+        }
+
+        return {
+          type: 'violation' as const,
           memory_id: candidate.memory_id,
-          error: cascadeError instanceof Error ? cascadeError.message : String(cascadeError),
-        });
+          condition: candidate.condition_text,
+          confidence: match.confidence,
+          damage_level: damageLevel,
+        };
+      } else if (match.relevantButNotViolation) {
+        await Promise.all([
+          recordConfirmation(env.DB, candidate.memory_id),
+          createEdge(env.DB, observationId, candidate.memory_id, 'confirmed_by'),
+        ]);
+
+        return {
+          type: 'confirmation' as const,
+          memory_id: candidate.memory_id,
+          similarity: candidate.similarity,
+        };
       }
 
-      processedMemories.add(candidate.memory_id);
-    } else if (match.relevantButNotViolation) {
-      // Related but not a violation = confirmation
-      result.confirmations.push({
-        memory_id: candidate.memory_id,
-        similarity: candidate.similarity,
-      });
-      await recordConfirmation(env.DB, candidate.memory_id);
-      await createEdge(env.DB, observationId, candidate.memory_id, 'confirmed_by');
-      processedMemories.add(candidate.memory_id);
-    }
-  }
+      return null;
+    })());
 
-  // 3. Search CONFIRMS_VECTORS for conditions this observation might support
-  const confirmsSearchStart = Date.now();
-  const confirmsCandidates = await searchConfirmsConditions(
-    env,
-    embedding,
-    thresholds.maxCandidates,
-    thresholds.minSimilarity
-  );
+  // Process confirmation candidates — all flow concurrently (exclude already-seen memory_ids)
+  const confirmationPipelines = confirmsCandidates
+    .filter(candidate => {
+      if (seenMemoryIds.has(candidate.memory_id)) return false;
+      seenMemoryIds.add(candidate.memory_id);
+      return true;
+    })
+    .map(candidate => (async () => {
+      const [memory, hasPending] = await Promise.all([
+        getMemoryById(env.DB, candidate.memory_id),
+        hasPendingResolutionEvent(env.DB, candidate.memory_id),
+      ]);
+      if (!memory || memory.resolves_by == null || memory.state !== 'active' || hasPending) return null;
 
-  getLog().info('confirms_search_complete', {
-    candidates_found: confirmsCandidates.length,
-    duration_ms: Date.now() - confirmsSearchStart,
-  });
+      const match = await checkConditionMatch(
+        env, config, observationContent,
+        candidate.condition_text, 'confirms_if', memory.content
+      );
 
-  getLog().debug('confirms_candidates', { count: confirmsCandidates.length });
+      if (match.matches && match.confidence >= thresholds.confirmConfidence) {
+        await autoConfirmThought(env, candidate.memory_id, observationId);
 
-  // 4. Process confirmation candidates (predictions only)
-  for (const candidate of confirmsCandidates) {
-    if (processedMemories.has(candidate.memory_id)) continue;
+        try {
+          await propagateResolution(env, candidate.memory_id, 'correct');
+        } catch (cascadeError) {
+          getLog().warn('cascade_failed', {
+            memory_id: candidate.memory_id,
+            error: cascadeError instanceof Error ? cascadeError.message : String(cascadeError),
+          });
+        }
 
-    // Get full memory details
-    const memory = await getMemoryById(env.DB, candidate.memory_id);
-    // Only process predictions (have resolves_by set)
-    if (!memory || memory.resolves_by == null) continue;
-
-    // Skip predictions that are no longer active (already resolved/confirmed)
-    if (memory.state !== 'active') {
-      getLog().debug('skipping_non_active_prediction', {
-        memory_id: candidate.memory_id,
-        state: memory.state,
-      });
-      continue;
-    }
-
-    // Skip predictions that have a pending resolution event
-    if (await hasPendingResolutionEvent(env.DB, candidate.memory_id)) {
-      getLog().debug('skipping_pending_resolution_prediction', {
-        memory_id: candidate.memory_id,
-      });
-      continue;
-    }
-
-    // LLM-judge this specific condition
-    const match = await checkConditionMatch(
-      env,
-      config,
-      observationContent,
-      candidate.condition_text,
-      'confirms_if',
-      memory.content
-    );
-
-    if (match.matches && match.confidence >= thresholds.confirmConfidence) {
-      result.autoConfirmed.push({
-        memory_id: candidate.memory_id,
-        condition: candidate.condition_text,
-        confidence: match.confidence,
-      });
-
-      await autoConfirmThought(env, candidate.memory_id, observationId);
-
-      // Propagate resolution to related memories (mark for review, don't auto-modify)
-      try {
-        await propagateResolution(env, candidate.memory_id, 'correct');
-      } catch (cascadeError) {
-        // Log but don't fail the main operation
-        getLog().warn('cascade_failed', {
+        return {
+          type: 'autoConfirmed' as const,
           memory_id: candidate.memory_id,
-          error: cascadeError instanceof Error ? cascadeError.message : String(cascadeError),
-        });
+          condition: candidate.condition_text,
+          confidence: match.confidence,
+        };
       }
 
-      processedMemories.add(candidate.memory_id);
+      return null;
+    })());
+
+  // All pipelines flow concurrently — collect results only at the end
+  const allResults = await Promise.allSettled([...invalidationPipelines, ...confirmationPipelines]);
+
+  for (const settled of allResults) {
+    if (settled.status === 'rejected') {
+      getLog().warn('candidate_pipeline_failed', {
+        error: settled.reason instanceof Error ? settled.reason.message : String(settled.reason),
+      });
+      continue;
+    }
+
+    const outcome = settled.value;
+    if (!outcome) continue;
+
+    switch (outcome.type) {
+      case 'violation':
+        result.violations.push({
+          memory_id: outcome.memory_id,
+          condition: outcome.condition,
+          confidence: outcome.confidence,
+          damage_level: outcome.damage_level,
+          condition_type: 'invalidates_if',
+        });
+        break;
+      case 'confirmation':
+        result.confirmations.push({
+          memory_id: outcome.memory_id,
+          similarity: outcome.similarity,
+        });
+        break;
+      case 'autoConfirmed':
+        result.autoConfirmed.push({
+          memory_id: outcome.memory_id,
+          condition: outcome.condition,
+          confidence: outcome.confidence,
+        });
+        break;
     }
   }
 
@@ -709,24 +689,39 @@ export async function checkExposuresForNewThought(
   const memory = await getMemoryById(env.DB, memoryId);
   if (!memory) return result;
 
-  // Track processed observations
-  const processedObs = new Set<string>();
+  // ── Each condition flows independently: embed → search → LLM judge candidates ──
+  // Pipelines return DATA only — side-effects (D1 writes) are applied after collection
+  // to avoid read-modify-write races on the same memoryId's violations JSON.
 
-  // 1. For each invalidates_if condition, search for matching observations
-  for (const condition of invalidatesIf) {
-    // Generate embedding for this condition
-    const conditionEmbedding = await generateEmbedding(
-      env.AI,
-      condition,
-      config
-    );
+  type ViolationOutcome = {
+    type: 'violation';
+    condition: string;
+    confidence: number;
+    damage_level: ReturnType<typeof getDamageLevel>;
+    violation: Violation;
+    obsId: string;
+  };
+  type ConfirmationOutcome = {
+    type: 'confirmation';
+    similarity: number;
+    obsId: string;
+  };
+  type AutoConfirmedOutcome = {
+    type: 'autoConfirmed';
+    condition: string;
+    confidence: number;
+    obsId: string;
+  };
+  type PipelineOutcome = ViolationOutcome | ConfirmationOutcome | AutoConfirmedOutcome | null;
 
-    // Search MEMORY_VECTORS for observations that might match this condition
+  // All invalidates_if conditions flow concurrently
+  const invalidationPipelines = invalidatesIf.map(condition => (async (): Promise<PipelineOutcome> => {
+    // Step 1: Generate embedding for this condition
+    const conditionEmbedding = await generateEmbedding(env.AI, condition, config);
+
+    // Step 2: Search for matching observations (flows immediately after embedding)
     const obsCandidates = await searchObservationsForViolation(
-      env,
-      conditionEmbedding,
-      thresholds.maxCandidates,
-      thresholds.minSimilarity
+      env, conditionEmbedding, thresholds.maxCandidates, thresholds.minSimilarity
     );
 
     getLog().debug('obs_candidates_for_condition', {
@@ -734,113 +729,158 @@ export async function checkExposuresForNewThought(
       count: obsCandidates.length,
     });
 
-    // LLM-judge each observation against this condition
+    // Step 3: First match wins per condition
     for (const obsCandidate of obsCandidates) {
-      if (processedObs.has(obsCandidate.id)) continue;
-
-      // Get observation content
       const obs = await getMemoryById(env.DB, obsCandidate.id);
       if (!obs) continue;
-
-      // Skip resolution observations to prevent feedback loops
-      if (hasResolutionTag(obs.tags)) {
-        processedObs.add(obsCandidate.id);
-        continue;
-      }
+      if (hasResolutionTag(obs.tags)) continue;
 
       const match = await checkConditionMatch(
-        env,
-        config,
-        obs.content,
-        condition,
-        'invalidates_if',
-        memoryContent
+        env, config, obs.content, condition, 'invalidates_if', memoryContent
       );
 
       if (match.matches && match.confidence >= thresholds.violationConfidence) {
         const damageLevel = getDamageLevel(memory.centrality);
-        result.violations.push({
-          memory_id: memoryId,
+
+        // Return data — don't write to D1 (avoids race on violations JSON)
+        return {
+          type: 'violation',
           condition,
           confidence: match.confidence,
           damage_level: damageLevel,
+          violation: {
+            condition,
+            timestamp: Date.now(),
+            obs_id: obsCandidate.id,
+            damage_level: damageLevel,
+            source_type: 'direct',
+          },
+          obsId: obsCandidate.id,
+        };
+      } else if (match.relevantButNotViolation) {
+        return {
+          type: 'confirmation',
+          similarity: obsCandidate.similarity,
+          obsId: obsCandidate.id,
+        };
+      }
+    }
+
+    return null;
+  })());
+
+  // All confirms_if conditions flow concurrently (only for time-bound thoughts)
+  const confirmationPipelines = (timeBound && confirmsIf.length > 0)
+    ? confirmsIf.map(condition => (async (): Promise<PipelineOutcome> => {
+        const conditionEmbedding = await generateEmbedding(env.AI, condition, config);
+
+        const obsCandidates = await searchObservationsForViolation(
+          env, conditionEmbedding, thresholds.maxCandidates, thresholds.minSimilarity
+        );
+
+        for (const obsCandidate of obsCandidates) {
+          const obs = await getMemoryById(env.DB, obsCandidate.id);
+          if (!obs) continue;
+          if (hasResolutionTag(obs.tags)) continue;
+
+          const match = await checkConditionMatch(
+            env, config, obs.content, condition, 'confirms_if', memoryContent
+          );
+
+          if (match.matches && match.confidence >= thresholds.confirmConfidence) {
+            // Return data — don't call autoConfirmThought (avoids duplicate calls)
+            return {
+              type: 'autoConfirmed',
+              condition,
+              confidence: match.confidence,
+              obsId: obsCandidate.id,
+            };
+          }
+        }
+
+        return null;
+      })())
+    : [];
+
+  // All condition pipelines flow concurrently — collect results (data only, no D1 writes yet)
+  const allResults = await Promise.allSettled([...invalidationPipelines, ...confirmationPipelines]);
+
+  // ── Apply side-effects sequentially after collection ──
+  // This avoids read-modify-write races on the same memoryId's violations JSON,
+  // and ensures autoConfirmThought is called at most once.
+
+  const violationsToRecord: Violation[] = [];
+  const edgesToCreate: { sourceId: string; targetId: string; edgeType: 'violated_by' | 'confirmed_by' | 'derived_from' }[] = [];
+  let firstAutoConfirmObsId: string | null = null;
+
+  for (const settled of allResults) {
+    if (settled.status === 'rejected') {
+      getLog().warn('thought_candidate_pipeline_failed', {
+        memory_id: memoryId,
+        error: settled.reason instanceof Error ? settled.reason.message : String(settled.reason),
+      });
+      continue;
+    }
+
+    const outcome = settled.value;
+    if (!outcome) continue;
+
+    switch (outcome.type) {
+      case 'violation':
+        violationsToRecord.push(outcome.violation);
+        edgesToCreate.push({ sourceId: outcome.obsId, targetId: memoryId, edgeType: 'violated_by' });
+        result.violations.push({
+          memory_id: memoryId,
+          condition: outcome.condition,
+          confidence: outcome.confidence,
+          damage_level: outcome.damage_level,
           condition_type: 'invalidates_if',
         });
-
-        await recordViolation(env, memoryId, {
-          condition,
-          timestamp: Date.now(),
-          obs_id: obsCandidate.id,
-          damage_level: damageLevel,
-          source_type: 'direct',
-        });
-
-        await createEdge(env.DB, obsCandidate.id, memoryId, 'violated_by');
-        processedObs.add(obsCandidate.id);
-        break; // One violation per condition
-      } else if (match.relevantButNotViolation) {
+        break;
+      case 'confirmation':
+        edgesToCreate.push({ sourceId: outcome.obsId, targetId: memoryId, edgeType: 'confirmed_by' });
         result.confirmations.push({
           memory_id: memoryId,
-          similarity: obsCandidate.similarity,
+          similarity: outcome.similarity,
         });
-        await recordConfirmation(env.DB, memoryId);
-        await createEdge(env.DB, obsCandidate.id, memoryId, 'confirmed_by');
-        processedObs.add(obsCandidate.id);
         break;
-      }
+      case 'autoConfirmed':
+        // Only auto-confirm once (first match wins)
+        if (!firstAutoConfirmObsId) {
+          firstAutoConfirmObsId = outcome.obsId;
+        }
+        result.autoConfirmed.push({
+          memory_id: memoryId,
+          condition: outcome.condition,
+          confidence: outcome.confidence,
+        });
+        break;
     }
   }
 
-  // 2. For time-bound thoughts with confirms_if, check if existing observations confirm them
-  if (timeBound && confirmsIf.length > 0) {
-    for (const condition of confirmsIf) {
-      const conditionEmbedding = await generateEmbedding(
-        env.AI,
-        condition,
-        config
-      );
+  // Apply D1 writes — no races since we're sequential and each targets different concerns
 
-      const obsCandidates = await searchObservationsForViolation(
-        env,
-        conditionEmbedding,
-        thresholds.maxCandidates,
-        thresholds.minSimilarity
-      );
+  // Batch-record all violations in a single read-modify-write (no lost updates)
+  if (violationsToRecord.length > 0) {
+    await recordViolations(env, memoryId, violationsToRecord);
+  }
 
-      for (const obsCandidate of obsCandidates) {
-        if (processedObs.has(obsCandidate.id)) continue;
+  // Record confirmations (atomic counter increments — safe even if multiple)
+  const confirmationCount = result.confirmations.length;
+  if (confirmationCount > 0) {
+    await recordConfirmation(env.DB, memoryId);
+  }
 
-        const obs = await getMemoryById(env.DB, obsCandidate.id);
-        if (!obs) continue;
+  // Create all edges concurrently (each targets different row, no race)
+  if (edgesToCreate.length > 0) {
+    await Promise.all(edgesToCreate.map(e =>
+      createEdge(env.DB, e.sourceId, e.targetId, e.edgeType)
+    ));
+  }
 
-        // Skip resolution observations to prevent feedback loops
-        if (hasResolutionTag(obs.tags)) {
-          processedObs.add(obsCandidate.id);
-          continue;
-        }
-
-        const match = await checkConditionMatch(
-          env,
-          config,
-          obs.content,
-          condition,
-          'confirms_if',
-          memoryContent
-        );
-
-        if (match.matches && match.confidence >= thresholds.confirmConfidence) {
-          result.autoConfirmed.push({
-            memory_id: memoryId,
-            condition,
-            confidence: match.confidence,
-          });
-
-          await autoConfirmThought(env, memoryId, obsCandidate.id);
-          processedObs.add(obsCandidate.id);
-          break;
-        }
-      }
-    }
+  // Auto-confirm once if any confirms_if condition matched
+  if (firstAutoConfirmObsId) {
+    await autoConfirmThought(env, memoryId, firstAutoConfirmObsId);
   }
 
   return result;
@@ -1143,6 +1183,102 @@ async function recordViolation(
           balanced: zoneHealth.balanced,
           duration_ms: Date.now() - zoneHealthStart,
         });
+        if (!zoneHealth.balanced || zoneHealth.quality_pct < 50) {
+          await insertPeripheralViolationNotification(env, memoryId, shock, zoneHealth);
+        }
+      } catch (zoneErr) {
+        getLog().warn('peripheral_zone_health_failed', {
+          memory_id: memoryId,
+          error: zoneErr instanceof Error ? zoneErr.message : String(zoneErr),
+        });
+      }
+    }
+  } catch (err) {
+    getLog().warn('shock_propagation_failed', {
+      memory_id: memoryId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * Batch-record multiple violations for a single memory in one read-modify-write.
+ * Used by checkExposuresForNewThought where all concurrent pipelines target the same memoryId.
+ * Avoids the lost-update race that would occur if each pipeline called recordViolation independently.
+ */
+async function recordViolations(
+  env: Env,
+  memoryId: string,
+  newViolations: Violation[]
+): Promise<void> {
+  const row = await env.DB
+    .prepare('SELECT violations FROM memories WHERE id = ?')
+    .bind(memoryId)
+    .first<{ violations: string }>();
+
+  if (!row) return;
+
+  const existing: Violation[] = JSON.parse(row.violations || '[]');
+
+  // Dedup against existing violations
+  const toAdd = newViolations.filter(v =>
+    !v.obs_id || !existing.some(e => e.obs_id === v.obs_id)
+  );
+  if (toAdd.length === 0) return;
+
+  const allViolations = [...existing, ...toAdd];
+  const hasCore = toAdd.some(v => v.damage_level === 'core');
+  const now = Date.now();
+
+  if (hasCore) {
+    await env.DB
+      .prepare(
+        `UPDATE memories
+         SET violations = ?, times_tested = times_tested + ?, contradictions = contradictions + ?,
+             state = 'resolved', outcome = 'incorrect', resolved_at = ?, updated_at = ?
+         WHERE id = ?`
+      )
+      .bind(JSON.stringify(allViolations), toAdd.length, toAdd.length, now, now, memoryId)
+      .run();
+  } else {
+    await env.DB
+      .prepare(
+        `UPDATE memories
+         SET violations = ?, times_tested = times_tested + ?, contradictions = contradictions + ?,
+             state = 'violated', updated_at = ?
+         WHERE id = ?`
+      )
+      .bind(JSON.stringify(allViolations), toAdd.length, toAdd.length, now, memoryId)
+      .run();
+  }
+
+  // Clean up condition vectors so this memory can't be re-matched
+  await deleteConditionVectors(env, memoryId).catch(err => {
+    getLog().warn('condition_vector_cleanup_failed', {
+      memory_id: memoryId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+
+  // Decay outgoing support edges — use worst damage level
+  const worstDamage = hasCore ? 'core' : 'peripheral';
+  const damageFactor = worstDamage === 'core' ? 0.5 : 0.25;
+  await env.DB
+    .prepare(
+      `UPDATE edges SET strength = strength * (1.0 - ?)
+       WHERE source_id = ? AND edge_type IN ('derived_from', 'confirmed_by')`
+    )
+    .bind(damageFactor, memoryId)
+    .run();
+
+  // Shock propagation using worst damage level
+  try {
+    const shock = await applyShock(env, memoryId, worstDamage);
+    if (worstDamage === 'core') {
+      await insertCoreViolationNotification(env, memoryId, shock);
+    } else {
+      try {
+        const zoneHealth = await buildZoneHealth(env.DB, memoryId, { maxDepth: 2, maxSize: 20 });
         if (!zoneHealth.balanced || zoneHealth.quality_pct < 50) {
           await insertPeripheralViolationNotification(env, memoryId, shock, zoneHealth);
         }

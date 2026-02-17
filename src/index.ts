@@ -516,20 +516,19 @@ async function processExposureCheck(
   // Mark as processing
   await updateExposureCheckStatus(env.DB, memoryId, 'processing');
 
-  // Run BOTH check directions for ALL memories (no is_observation branching)
-  // Direction 1: Check if this memory's content violates existing thoughts' conditions
-  const obsResults = await checkExposures(env, memoryId, content, job.embedding);
-
-  // Direction 2: Check if this memory's own conditions are violated by existing content
+  // Run BOTH check directions concurrently — they search different vector indexes
   const timeBound = job.time_bound ?? false;
-  const thoughtResults = await checkExposuresForNewThought(
-    env,
-    memoryId,
-    content,
-    job.invalidates_if || [],
-    job.confirms_if || [],
-    timeBound
-  );
+  const [obsResults, thoughtResults] = await Promise.all([
+    // Direction 1: Check if this memory's content violates existing thoughts' conditions
+    checkExposures(env, memoryId, content, job.embedding),
+    // Direction 2: Check if this memory's own conditions are violated by existing content
+    checkExposuresForNewThought(
+      env, memoryId, content,
+      job.invalidates_if || [],
+      job.confirms_if || [],
+      timeBound
+    ),
+  ]);
 
   // Merge results, deduplicating by memory_id
   const seenViolations = new Set<string>();
@@ -553,37 +552,41 @@ async function processExposureCheck(
   const hasSignificantEvents = allViolations.length > 0 || allAutoConfirmed.length > 0;
 
   if (hasSignificantEvents) {
-    for (const v of allViolations) {
-      // Post-shock zone health check (non-blocking best-effort)
-      let zoneHealth: ZoneHealthReport | undefined;
-      try {
-        zoneHealth = await buildZoneHealth(env.DB, v.memory_id, { maxDepth: 2, maxSize: 20 });
-      } catch (err) {
-        log.warn('zone_health_check_failed', {
-          memory_id: v.memory_id,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
+    // Each violation and confirmation flows through zone health + event queueing concurrently
+    const eventTasks: Promise<void>[] = [];
 
-      await queueSignificantEvent(env, {
-        session_id: job.session_id,
-        event_type: 'violation',
-        memory_id: v.memory_id,
-        violated_by: memoryId,
-        damage_level: v.damage_level,
-        context: {
-          condition: v.condition,
-          confidence: v.confidence,
-          condition_type: v.condition_type,
-          check_direction: 'bidirectional',
-          triggering_memory: memoryId,
-          zone_health: zoneHealth,
-        },
-      });
+    for (const v of allViolations) {
+      eventTasks.push((async () => {
+        let zoneHealth: ZoneHealthReport | undefined;
+        try {
+          zoneHealth = await buildZoneHealth(env.DB, v.memory_id, { maxDepth: 2, maxSize: 20 });
+        } catch (err) {
+          log.warn('zone_health_check_failed', {
+            memory_id: v.memory_id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+
+        await queueSignificantEvent(env, {
+          session_id: job.session_id,
+          event_type: 'violation',
+          memory_id: v.memory_id,
+          violated_by: memoryId,
+          damage_level: v.damage_level,
+          context: {
+            condition: v.condition,
+            confidence: v.confidence,
+            condition_type: v.condition_type,
+            check_direction: 'bidirectional',
+            triggering_memory: memoryId,
+            zone_health: zoneHealth,
+          },
+        });
+      })());
     }
 
     for (const c of allAutoConfirmed) {
-      await queueSignificantEvent(env, {
+      eventTasks.push(queueSignificantEvent(env, {
         session_id: job.session_id,
         event_type: 'prediction_confirmed',
         memory_id: c.memory_id,
@@ -591,8 +594,10 @@ async function processExposureCheck(
           condition: c.condition,
           confidence: c.confidence,
         },
-      });
+      }));
     }
+
+    await Promise.all(eventTasks);
   }
 
   // Mark as completed

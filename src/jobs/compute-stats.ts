@@ -10,6 +10,7 @@
  */
 
 import { createStandaloneLogger } from '../lib/shared/logging/index.js';
+import { SOURCE_STARTING_CONFIDENCE } from '../services/confidence.js';
 import type { Env } from '../types/index.js';
 
 // ============================================
@@ -187,9 +188,6 @@ export async function getStartingConfidenceForSource(
   db: D1Database,
   source: string
 ): Promise<number> {
-  // Import defaults here to avoid circular dependency
-  const { SOURCE_STARTING_CONFIDENCE } = await import('../services/confidence.js');
-
   // Try learned value first
   const learned = await getLearnedConfidence(db, source);
   if (learned !== null) {

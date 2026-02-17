@@ -72,6 +72,54 @@ export interface EmbeddingStoreResult {
 }
 
 // ============================================
+// Batch Embedding Generation
+// ============================================
+
+/** Result of generating all embeddings for a memory in parallel */
+export interface AllEmbeddings {
+  content: number[];
+  invalidates: number[][];
+  confirms: number[][];
+}
+
+/**
+ * Generate all embeddings needed for a memory in a single parallel batch.
+ * Content + all condition embeddings are generated concurrently via Promise.all.
+ */
+export async function generateAllEmbeddings(
+  ai: Ai,
+  config: Config,
+  params: {
+    content: string;
+    invalidates_if?: string[];
+    confirms_if?: string[];
+    requestId?: string;
+  }
+): Promise<AllEmbeddings> {
+  const tasks: Promise<number[]>[] = [
+    generateEmbedding(ai, params.content, config, params.requestId),
+  ];
+
+  const invalidatesCount = params.invalidates_if?.length ?? 0;
+  const confirmsCount = params.confirms_if?.length ?? 0;
+
+  for (const condition of params.invalidates_if ?? []) {
+    tasks.push(generateEmbedding(ai, condition, config, params.requestId));
+  }
+  for (const condition of params.confirms_if ?? []) {
+    tasks.push(generateEmbedding(ai, condition, config, params.requestId));
+  }
+
+  const results = await Promise.all(tasks);
+
+  return {
+    content: results[0],
+    invalidates: results.slice(1, 1 + invalidatesCount),
+    confirms: results.slice(1 + invalidatesCount, 1 + invalidatesCount + confirmsCount),
+  };
+}
+
+// ============================================
 // Store Operations
 // ============================================
 

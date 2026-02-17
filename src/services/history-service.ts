@@ -33,24 +33,20 @@ export async function recordVersion(
   const now = Date.now();
   const id = `ver-${nanoid(12)}`;
 
-  // Get next version number
-  const lastVersion = await db.prepare(
-    `SELECT MAX(version_number) as max_version FROM entity_versions WHERE entity_id = ?`
-  ).bind(entityId).first<{ max_version: number | null }>();
-
-  const versionNumber = (lastVersion?.max_version ?? 0) + 1;
-
+  // Single query: compute next version number inline via subquery
   await db.prepare(
     `INSERT INTO entity_versions (
       id, entity_id, entity_type, version_number,
       content_snapshot, change_type, change_reason, changed_fields,
       session_id, request_id, user_agent, ip_hash, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ) VALUES (?, ?, ?,
+      (SELECT COALESCE(MAX(version_number), 0) + 1 FROM entity_versions WHERE entity_id = ?),
+      ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     id,
     entityId,
     entityType,
-    versionNumber,
+    entityId,
     JSON.stringify(contentSnapshot),
     changeType,
     changeReason ?? null,
