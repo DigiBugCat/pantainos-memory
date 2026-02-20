@@ -131,14 +131,15 @@ function getOutcomeIcon(state?: string, outcome?: string): string {
 }
 
 /** Format search results */
-function formatFindResults(results: Array<{ memory: { id: string; content: string; state?: string; outcome?: string }; similarity: number; confidence: number }>, query: string): string {
+function formatFindResults(results: Array<{ memory: { id: string; content: string; state?: string; outcome?: string }; similarity: number; confidence: number; surprise?: number }>, query: string): string {
   if (results.length === 0) return `No results for "${query}"`;
 
   const lines = results.map((r, i) => {
     const sim = Math.round(r.similarity * 100);
     const conf = Math.round(r.confidence * 100);
     const icon = getOutcomeIcon(r.memory.state, r.memory.outcome);
-    return `${i + 1}. [${r.memory.id}] ${r.memory.content}${icon}\n   sim:${sim}% conf:${conf}%`;
+    const surp = r.surprise != null ? ` surp:${Math.round(r.surprise * 100)}%` : '';
+    return `${i + 1}. [${r.memory.id}] ${r.memory.content}${icon}\n   sim:${sim}% conf:${conf}%${surp}`;
   });
 
   return `Found ${results.length} for "${query}":\n\n${lines.join('\n\n')}`;
@@ -1070,7 +1071,7 @@ Respond with exactly one word: CORRECTION or THESIS_CHANGE`;
 
   defineTool({
     name: 'find',
-    description: 'Search memories by meaning. Results ranked by: similarity (semantic match), confidence (survival rate under testing), and centrality (how many memories derive from this). Use to find related memories before storing new ones, or to check if a perception already exists.',
+    description: 'Search memories by meaning. Results ranked by: similarity (semantic match), confidence (survival rate under testing), surprise (prediction error — how novel this was when observed), and centrality (how many memories derive from this). Use to find related memories before storing new ones, or to check if a perception already exists.',
     annotations: {
       title: 'Search Memories',
       readOnlyHint: true,
@@ -1164,6 +1165,7 @@ Respond with exactly one word: CORRECTION or THESIS_CHANGE`;
         memory: { id: r.memory.id, content: r.memory.content, state: r.memory.state },
         similarity: r.similarity,
         confidence: r.confidence,
+        surprise: r.surprise,
       })), query));
     },
   }),
