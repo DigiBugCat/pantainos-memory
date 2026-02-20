@@ -35,6 +35,19 @@ interface NeighborConfidenceRow {
 /** Default max_times_tested if not available */
 const DEFAULT_MAX_TIMES_TESTED = 10;
 
+/** Structural integration context — derived from memory row fields.
+ * When provided, surprise decays as a memory becomes more connected. */
+export interface StructuralContext {
+  /** Count of incoming derived_from edges (pre-computed on memory row) */
+  centrality: number;
+  /** Number of times this memory has been tested against observations */
+  times_tested: number;
+}
+
+/** Controls how aggressively structural integration decays surprise.
+ * At k=0.1, a memory with depth=10 has its surprise halved. */
+const STRUCTURAL_DECAY_K = 0.1;
+
 /**
  * Compute effective confidence for a neighbor (inline, avoids importing full Memory type).
  * Mirrors getEffectiveConfidence from confidence.ts but works on raw rows.
@@ -67,6 +80,7 @@ export async function computeSurprise(
   env: Env,
   memoryId: string,
   embedding: number[],
+  structural?: StructuralContext,
 ): Promise<number> {
   // Query top-6 (self might be in results since it was just upserted)
   const results = await env.MEMORY_VECTORS.query(embedding, {
@@ -118,12 +132,21 @@ export async function computeSurprise(
   }
 
   const weightedAvgSimilarity = totalWeight > 0 ? weightedSum / totalWeight : 0;
-  const surprise = 1 - weightedAvgSimilarity;
+  const rawSurprise = 1 - weightedAvgSimilarity;
+
+  // Apply structural integration decay: connected memories are less surprising
+  let surprise = rawSurprise;
+  if (structural) {
+    const depth = structural.centrality + structural.times_tested;
+    surprise = rawSurprise * (1 / (1 + STRUCTURAL_DECAY_K * depth));
+  }
 
   getLog().debug('surprise_computed', {
     memory_id: memoryId,
     neighbor_count: topN.length,
     weighted_avg_similarity: weightedAvgSimilarity,
+    raw_surprise: rawSurprise,
+    structural_depth: structural ? structural.centrality + structural.times_tested : 0,
     surprise,
   });
 
@@ -135,6 +158,7 @@ export interface SurprisingMemory {
   memory: Memory;
   surprise: number;
   stale: boolean; // true if stored surprise differed from recomputed
+  structural_depth: number; // centrality + times_tested at revalidation time
 }
 
 /**
@@ -204,7 +228,10 @@ export async function findMostSurprising(
           return null;
         }
 
-        const fresh = await computeSurprise(env, row.id, embedding);
+        const fresh = await computeSurprise(env, row.id, embedding, {
+          centrality: row.centrality,
+          times_tested: row.times_tested,
+        });
         const storedSurprise = row.surprise ?? 0;
         const stale = Math.abs(fresh - storedSurprise) > 0.05;
 
@@ -232,6 +259,7 @@ export async function findMostSurprising(
           memory,
           surprise: result.surprise,
           stale: result.stale,
+          structural_depth: result.row.centrality + result.row.times_tested,
         });
       }
     }

@@ -2427,7 +2427,7 @@ Respond with exactly one word: CORRECTION or THESIS_CHANGE`;
 
   defineTool({
     name: 'surprising',
-    description: 'Find the most surprising memories — those that deviated most from what the knowledge graph predicted. Surprise scores are revalidated against the current graph state before returning, so results reflect genuine current novelty.',
+    description: 'Find the most surprising memories — those that deviated most from what the knowledge graph predicted. Surprise decays as memories gain connections (edges, confirmations, tests). Scores are revalidated against current graph state. High surprise + low depth = genuine outlier. High surprise + high depth = graph has a blind spot.',
     annotations: {
       title: 'Most Surprising Memories',
       readOnlyHint: true,
@@ -2452,7 +2452,8 @@ Respond with exactly one word: CORRECTION or THESIS_CHANGE`;
         const m = r.memory;
         const type = getDisplayType(m);
         const staleTag = r.stale ? ' (refreshed)' : '';
-        return `${i + 1}. [${m.id}] surprise=${r.surprise.toFixed(3)}${staleTag} (${type})\n   ${m.content.slice(0, 150)}${m.content.length > 150 ? '...' : ''}`;
+        const depthTag = r.structural_depth > 0 ? ` depth=${r.structural_depth}` : '';
+        return `${i + 1}. [${m.id}] surprise=${r.surprise.toFixed(3)}${staleTag}${depthTag} (${type})\n   ${m.content.slice(0, 150)}${m.content.length > 150 ? '...' : ''}`;
       });
 
       return textResult(`🔮 Most Surprising Memories (${results.length} results)\n\n${lines.join('\n\n')}`);
