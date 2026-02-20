@@ -87,7 +87,6 @@ export async function insertCoreViolationNotification(env: Env, memoryId: string
   const content = mem?.content ?? '(unknown)';
 
   const msg = `CORE VIOLATION: [${memoryId}] shock propagated to ${shock.affected_count} memories (max drop ${formatPct(shock.max_confidence_drop)}).`;
-  const pushMsg = `[${memoryId}] ${content}\n\nShock propagated to ${shock.affected_count} memories (max drop ${formatPct(shock.max_confidence_drop)}).`;
   const now = Date.now();
   await env.DB.prepare(
     `INSERT INTO notifications (id, type, memory_id, content, context, created_at)
@@ -100,9 +99,18 @@ export async function insertCoreViolationNotification(env: Env, memoryId: string
     now
   ).run();
 
-  // Push notification via Pushover (non-blocking, best-effort)
+  // Push notification via Pushover (non-blocking, best-effort, LLM-formatted)
   if (env.PUSHOVER_USER_KEY && env.PUSHOVER_APP_TOKEN) {
-    sendPushoverNotification(env, pushMsg).catch(err => {
+    formatPushoverMessage(env, content, {
+      memoryId,
+      damageLevel: 'core',
+      affectedCount: shock.affected_count,
+      maxConfidenceDrop: shock.max_confidence_drop,
+    }).then(({ subject, message }) =>
+      sendPushoverNotification(env, message, {
+        title: `Violation: ${subject}`,
+      })
+    ).catch(err => {
       getLog().warn('pushover_failed', {
         memory_id: memoryId,
         error: err instanceof Error ? err.message : String(err),
@@ -141,13 +149,20 @@ async function insertPeripheralViolationNotification(
     now
   ).run();
 
-  // Pushover only for unbalanced zones (low priority, won't bypass quiet hours)
+  // Pushover only for unbalanced zones (low priority, won't bypass quiet hours, LLM-formatted)
   if (!zoneHealth.balanced && env.PUSHOVER_USER_KEY && env.PUSHOVER_APP_TOKEN) {
-    const pushMsg = `[${memoryId}] ${content}\n\nZone UNBALANCED (quality ${zoneHealth.quality_pct}%). Shock affected ${shock.affected_count} memories.`;
-    sendPushoverNotification(env, pushMsg, {
-      title: 'Memory: Zone Destabilized',
-      priority: -1,
-    }).catch(err => {
+    formatPushoverMessage(env, content, {
+      memoryId,
+      damageLevel: 'peripheral',
+      affectedCount: shock.affected_count,
+      maxConfidenceDrop: shock.max_confidence_drop,
+      zoneHealth,
+    }).then(({ subject, message }) =>
+      sendPushoverNotification(env, message, {
+        title: `Zone Unstable: ${subject}`,
+        priority: -1,
+      })
+    ).catch(err => {
       getLog().warn('pushover_failed', {
         memory_id: memoryId,
         error: err instanceof Error ? err.message : String(err),
@@ -183,6 +198,96 @@ async function sendPushoverNotification(
   }
 }
 
+/**
+ * Extract a human-readable subject (ticker, name, or topic) from memory content.
+ * Returns the first match or a generic fallback.
+ */
+function extractSubject(content: string): string {
+  // Match common ticker patterns: "PWR", "$AAPL", "NVDA Q4", etc.
+  const tickerMatch = content.match(/\b([A-Z]{2,5})\b(?:\s+\(([^)]+)\))?/);
+  if (tickerMatch) {
+    return tickerMatch[2] ? `${tickerMatch[1]} (${tickerMatch[2]})` : tickerMatch[1];
+  }
+  // Fallback: first 30 chars of content
+  return content.slice(0, 30).replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Use LLM to format a concise, mobile-readable Pushover notification.
+ * Falls back to truncated raw content on LLM failure.
+ */
+async function formatPushoverMessage(
+  env: Env,
+  content: string,
+  context: {
+    memoryId: string;
+    damageLevel: 'core' | 'peripheral';
+    affectedCount: number;
+    maxConfidenceDrop: number;
+    zoneHealth?: { balanced: boolean; quality_pct: number; zone_size: number };
+  }
+): Promise<{ subject: string; message: string }> {
+  const subject = extractSubject(content);
+
+  const fallback = (): { subject: string; message: string } => {
+    const verb = context.damageLevel === 'core' ? 'Violated' : 'Zone destabilized';
+    const msg = `${verb}. ${context.affectedCount} memories affected, max confidence drop ${formatPct(context.maxConfidenceDrop)}.`;
+    return { subject, message: msg };
+  };
+
+  if (!env.LLM_JUDGE_URL) {
+    return fallback();
+  }
+
+  const zoneInfo = context.zoneHealth
+    ? `\n- Zone: ${context.zoneHealth.balanced ? 'balanced' : 'UNBALANCED'}, quality ${context.zoneHealth.quality_pct}%, ${context.zoneHealth.zone_size} members`
+    : '';
+
+  // Truncate content to avoid feeding the LLM a massive prompt
+  const truncated = content.length > 500 ? content.slice(0, 500) + '...' : content;
+
+  const prompt = `You are formatting a push notification for a mobile phone. Summarize this knowledge graph violation alert.
+
+MEMORY CONTENT:
+"${truncated}"
+
+VIOLATION DETAILS:
+- Severity: ${context.damageLevel}
+- Memories affected: ${context.affectedCount}
+- Max confidence drop: ${formatPct(context.maxConfidenceDrop)}${zoneInfo}
+
+RULES:
+1. Max 200 characters total — this must fit on a phone lock screen
+2. One or two short sentences only
+3. Lead with the topic/ticker, then state what happened
+4. Do NOT include memory IDs, hashes, or technical identifiers
+5. Plain text only — no markdown, no emojis, no bullet points
+6. Be specific: mention the ticker/subject and the key finding
+
+EXAMPLE OUTPUT:
+"PWR earnings thesis violated — stock hit ATH despite bearish assessment. 2 linked memories lost confidence."
+
+Respond with ONLY the notification text.`;
+
+  try {
+    const text = await withRetry(
+      () => callExternalLLM(env.LLM_JUDGE_URL!, prompt, {
+        apiKey: env.LLM_JUDGE_API_KEY,
+        model: env.LLM_JUDGE_MODEL,
+      }),
+      { retries: 1, delay: 100 }
+    );
+    // Enforce length limit and strip any quotes the LLM might add
+    const cleaned = text.trim().replace(/^["']|["']$/g, '').slice(0, 280);
+    return { subject, message: cleaned };
+  } catch (err) {
+    getLog().warn('pushover_format_llm_failed', {
+      memory_id: context.memoryId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return fallback();
+  }
+}
 
 /** JSON schema for condition check response */
 const CONDITION_CHECK_SCHEMA = {
