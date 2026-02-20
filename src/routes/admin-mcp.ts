@@ -25,6 +25,7 @@ import {
   parseConditionResponse,
 } from '../services/exposure-checker.js';
 import type { Violation } from '../lib/shared/types/index.js';
+import { computeSurprise } from '../services/surprise.js';
 // Available for future admin tools:
 // import { computeSystemStats, getSystemStatsSummary } from '../jobs/compute-stats.js';
 
@@ -1090,6 +1091,128 @@ const createAdminTools = () => createToolRegistry<Env>([
       text += `Errors: ${errors}\n`;
       if (dryRun) {
         text += `\nThis was a DRY RUN. Set dry_run: false to apply changes.`;
+      }
+
+      return textResult(text);
+    },
+  }),
+
+  // ----------------------------------------
+  // backfill_surprise - Fan-out surprise calculation
+  // ----------------------------------------
+  defineTool({
+    name: 'backfill_surprise',
+    description: 'Backfill surprise scores for all existing memories that have NULL surprise. Fans out N parallel workers, each processing a slice of memories. Safe to re-run — skips memories that already have a surprise score.',
+    annotations: {
+      title: 'Backfill Surprise Scores',
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: false,
+    },
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        parallelism: {
+          type: 'number',
+          description: 'Number of parallel workers (default: 10, max: 20)',
+        },
+        batch_size: {
+          type: 'number',
+          description: 'Total memories to process this run (default: 200, max: 1500)',
+        },
+        dry_run: {
+          type: 'boolean',
+          description: 'Preview count without processing (default: false)',
+        },
+      },
+    },
+    handler: async (args: Record<string, unknown>, ctx: ToolContext<Env>) => {
+      const parallelism = Math.min((args.parallelism as number) || 10, 20);
+      const batchSize = Math.min((args.batch_size as number) || 200, 1500);
+      const dryRun = args.dry_run === true;
+
+      // Count remaining
+      const countResult = await ctx.env.DB.prepare(
+        `SELECT COUNT(*) as total FROM memories WHERE retracted = 0 AND surprise IS NULL`
+      ).first<{ total: number }>();
+      const remaining = countResult?.total || 0;
+
+      if (remaining === 0) {
+        return textResult('All memories already have surprise scores. Nothing to backfill.');
+      }
+
+      const toProcess = Math.min(batchSize, remaining);
+
+      if (dryRun) {
+        return textResult(`[DRY RUN] ${remaining} memories need surprise backfill.\nWould process ${toProcess} in ${parallelism} parallel workers (${Math.ceil(toProcess / parallelism)} each).`);
+      }
+
+      // Fetch IDs to process
+      const rows = await ctx.env.DB.prepare(
+        `SELECT id FROM memories WHERE retracted = 0 AND surprise IS NULL ORDER BY created_at ASC LIMIT ?`
+      ).bind(toProcess).all<{ id: string }>();
+
+      const ids = (rows.results || []).map(r => r.id);
+      if (ids.length === 0) {
+        return textResult('No memories to backfill.');
+      }
+
+      // Split into N slices
+      const slices: string[][] = Array.from({ length: parallelism }, () => []);
+      for (let i = 0; i < ids.length; i++) {
+        slices[i % parallelism].push(ids[i]);
+      }
+
+      // Worker function: processes a slice sequentially
+      async function processSlice(sliceIds: string[]): Promise<{ computed: number; failed: number }> {
+        let computed = 0;
+        let failed = 0;
+
+        for (const id of sliceIds) {
+          try {
+            // Get embedding from Vectorize
+            const vectors = await ctx.env.MEMORY_VECTORS.getByIds([id]);
+            if (!vectors || vectors.length === 0 || !vectors[0].values?.length) {
+              failed++;
+              continue;
+            }
+
+            const embedding: number[] = Array.isArray(vectors[0].values)
+              ? vectors[0].values
+              : [...vectors[0].values] as number[];
+
+            const surprise = await computeSurprise(ctx.env, id, embedding);
+
+            await ctx.env.DB.prepare(
+              'UPDATE memories SET surprise = ?, updated_at = ? WHERE id = ?'
+            ).bind(surprise, Date.now(), id).run();
+
+            computed++;
+          } catch {
+            failed++;
+          }
+        }
+
+        return { computed, failed };
+      }
+
+      // Fan out N workers in parallel
+      const results = await Promise.all(
+        slices.filter(s => s.length > 0).map(processSlice)
+      );
+
+      const totalComputed = results.reduce((sum, r) => sum + r.computed, 0);
+      const totalFailed = results.reduce((sum, r) => sum + r.failed, 0);
+      const stillRemaining = remaining - totalComputed;
+
+      let text = `=== SURPRISE BACKFILL COMPLETE ===\n\n`;
+      text += `Computed: ${totalComputed}\n`;
+      text += `Failed: ${totalFailed}\n`;
+      text += `Remaining: ${stillRemaining}\n`;
+      text += `Workers: ${slices.filter(s => s.length > 0).length} (parallelism: ${parallelism})\n`;
+
+      if (stillRemaining > 0) {
+        text += `\nRun again to process the next batch.`;
       }
 
       return textResult(text);
