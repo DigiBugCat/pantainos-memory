@@ -1163,6 +1163,13 @@ const createAdminTools = () => createToolRegistry<Env>([
         slices[i % parallelism].push(ids[i]);
       }
 
+      // Track failure reasons
+      const failureReasons: Record<string, string[]> = {
+        no_vector: [],
+        empty_values: [],
+        compute_error: [],
+      };
+
       // Worker function: processes a slice sequentially
       async function processSlice(sliceIds: string[]): Promise<{ computed: number; failed: number }> {
         let computed = 0;
@@ -1172,8 +1179,14 @@ const createAdminTools = () => createToolRegistry<Env>([
           try {
             // Get embedding from Vectorize
             const vectors = await ctx.env.MEMORY_VECTORS.getByIds([id]);
-            if (!vectors || vectors.length === 0 || !vectors[0].values?.length) {
+            if (!vectors || vectors.length === 0) {
               failed++;
+              if (failureReasons.no_vector.length < 5) failureReasons.no_vector.push(id);
+              continue;
+            }
+            if (!vectors[0].values?.length) {
+              failed++;
+              if (failureReasons.empty_values.length < 5) failureReasons.empty_values.push(id);
               continue;
             }
 
@@ -1188,8 +1201,11 @@ const createAdminTools = () => createToolRegistry<Env>([
             ).bind(surprise, Date.now(), id).run();
 
             computed++;
-          } catch {
+          } catch (err) {
             failed++;
+            if (failureReasons.compute_error.length < 5) {
+              failureReasons.compute_error.push(`${id}: ${err instanceof Error ? err.message : String(err)}`);
+            }
           }
         }
 
@@ -1210,6 +1226,20 @@ const createAdminTools = () => createToolRegistry<Env>([
       text += `Failed: ${totalFailed}\n`;
       text += `Remaining: ${stillRemaining}\n`;
       text += `Workers: ${slices.filter(s => s.length > 0).length} (parallelism: ${parallelism})\n`;
+
+      if (totalFailed > 0) {
+        text += `\n--- Failure Breakdown ---\n`;
+        if (failureReasons.no_vector.length > 0) {
+          text += `No vector in Vectorize (${failureReasons.no_vector.length} samples): ${failureReasons.no_vector.join(', ')}\n`;
+        }
+        if (failureReasons.empty_values.length > 0) {
+          text += `Empty embedding values (${failureReasons.empty_values.length} samples): ${failureReasons.empty_values.join(', ')}\n`;
+        }
+        if (failureReasons.compute_error.length > 0) {
+          text += `Compute errors (${failureReasons.compute_error.length} samples):\n`;
+          for (const e of failureReasons.compute_error) text += `  ${e}\n`;
+        }
+      }
 
       if (stillRemaining > 0) {
         text += `\nRun again to process the next batch.`;
