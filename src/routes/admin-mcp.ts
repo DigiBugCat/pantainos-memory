@@ -1285,7 +1285,8 @@ adminMcpRouter.post('/', async (c) => {
   );
 
   if (response === null) {
-    return c.body(null, 204);
+    // Notification - return 202 (not 204) for rmcp/Codex client compatibility
+    return c.body(null, 202);
   }
 
   return c.json(response);

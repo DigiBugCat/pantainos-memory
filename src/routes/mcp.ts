@@ -49,7 +49,22 @@ import {
   checkSignedBalance,
   type SafetyRow,
 } from '../lib/zones.js';
-import { queryInChunks, queryContradictionGate } from '../lib/sql-utils.js';
+import {
+  queryInChunks,
+  queryContradictionGate,
+  fetchMemoriesByIds,
+  fetchEdgesBySourceIds,
+  fetchEdgesByTargetIds,
+} from '../lib/sql-utils.js';
+import { findMemories } from '../usecases/find-memories.js';
+import { recallMemory } from '../usecases/recall-memory.js';
+import { getStatsSummary } from '../usecases/stats-summary.js';
+import {
+  normalizeAndValidateSource,
+  validateDerivedFromIds,
+  validateOrigin,
+  validateTimeBound,
+} from '../usecases/observe-memory.js';
 
 type Env = BaseEnv & LoggingEnv;
 
@@ -422,41 +437,33 @@ All memories support invalidates_if/confirms_if conditions.`,
       }
 
       // Normalize source before validation/persistence
-      let normalizedSource: string | undefined;
-      if (source !== undefined && source !== null) {
-        if (typeof source !== 'string' || !isNonEmptySource(source)) {
-          return errorResult('source must be a non-empty string when provided');
-        }
-        normalizedSource = normalizeSource(source);
+      const sourceValidation = normalizeAndValidateSource(source);
+      if (sourceValidation.error) {
+        return errorResult(sourceValidation.error);
       }
+      const normalizedSource = sourceValidation.normalizedSource;
 
       // Validate origin: at least one of source or derived_from required
+      const originError = validateOrigin(normalizedSource, derived_from);
       const hasSource = normalizedSource !== undefined;
       const hasDerivedFrom = derived_from !== undefined && derived_from !== null && derived_from.length > 0;
-
-      if (!hasSource && !hasDerivedFrom) {
+      if (originError) {
         return errorResult('Either "source" or "derived_from" is required. Set "source" for provenance, "derived_from" for lineage, or both.');
       }
 
       // Field-specific validation
       if (hasDerivedFrom) {
-        // Validate derived_from existence
-        const placeholders = derived_from!.map(() => '?').join(',');
-        const sources = await ctx.env.DB.prepare(
-          `SELECT id FROM memories WHERE id IN (${placeholders}) AND retracted = 0`
-        ).bind(...derived_from!).all<{ id: string }>();
-
-        if (!sources.results || sources.results.length !== derived_from!.length) {
-          const foundIds = new Set(sources.results?.map((r) => r.id) || []);
-          const missing = derived_from!.filter((id) => !foundIds.has(id));
-          return errorResult(`Source memories not found: ${missing.join(', ')}`);
+        const derivedFromError = await validateDerivedFromIds(ctx.env.DB, derived_from);
+        if (derivedFromError) {
+          return errorResult(derivedFromError);
         }
       }
 
       // Time-bound validation
       const timeBound = resolves_by !== null && resolves_by !== undefined;
-      if (timeBound && !outcome_condition) {
-        return errorResult('outcome_condition is required when resolves_by is set');
+      const timeBoundError = validateTimeBound(resolves_by ?? undefined, outcome_condition);
+      if (timeBoundError) {
+        return errorResult(timeBoundError);
       }
 
       // Generate embedding first for duplicate check
@@ -1101,50 +1108,24 @@ Respond with exactly one word: CORRECTION or THESIS_CHANGE`;
 
       const limit = requestedLimit || config.search.defaultLimit;
       const minSimilarity = min_similarity || config.search.minSimilarity;
-
-      // Generate embedding for query
-      const queryEmbedding = await generateEmbedding(ctx.env.AI, query, config, requestId);
-
-      // Search Vectorize
-      const searchResults = await searchSimilar(
-        ctx.env,
-        queryEmbedding,
-        limit * 2,
+      const results = await findMemories(ctx.env, config, {
+        query,
+        limit,
         minSimilarity,
-        requestId
-      );
-
-      // Fetch memory details and filter
-      const results: ScoredMemory[] = [];
-
-      for (const match of searchResults) {
-        if (results.length >= limit) break;
-
-        const row = await ctx.env.DB.prepare(
-          `SELECT * FROM memories WHERE id = ? AND retracted = 0`
-        ).bind(match.id).first<MemoryRow>();
-
-        if (!row) continue;
-
-        const memory = rowToMemory(row);
-
-        // Field-presence filtering
-        const hasFilters = has_source !== undefined || has_derived_from !== undefined || time_bound !== undefined;
-        if (hasFilters) {
-          if (has_source === true && memory.source == null) continue;
-          if (has_source === false && memory.source != null) continue;
-          if (has_derived_from === true && (!memory.derived_from || memory.derived_from.length === 0)) continue;
-          if (has_derived_from === false && memory.derived_from && memory.derived_from.length > 0) continue;
-          if (time_bound === true && memory.resolves_by == null) continue;
-          if (time_bound === false && memory.resolves_by != null) continue;
-        }
-
-        const scoredMemory = createScoredMemory(memory, match.similarity, config);
-        results.push(scoredMemory);
-      }
-
-      // Sort by score descending
-      results.sort((a, b) => b.score - a.score);
+        requestId,
+        candidateMultiplier: 2,
+        filter: (_row, memory) => {
+          const hasFilters = has_source !== undefined || has_derived_from !== undefined || time_bound !== undefined;
+          if (!hasFilters) return true;
+          if (has_source === true && memory.source == null) return false;
+          if (has_source === false && memory.source != null) return false;
+          if (has_derived_from === true && (!memory.derived_from || memory.derived_from.length === 0)) return false;
+          if (has_derived_from === false && memory.derived_from && memory.derived_from.length > 0) return false;
+          if (time_bound === true && memory.resolves_by == null) return false;
+          if (time_bound === false && memory.resolves_by != null) return false;
+          return true;
+        },
+      });
 
       // Record access events
       if (results.length > 0) {
@@ -1193,20 +1174,17 @@ Respond with exactly one word: CORRECTION or THESIS_CHANGE`;
         return errorResult('memory_id is required');
       }
 
-      const row = await ctx.env.DB.prepare(
-        `SELECT * FROM memories WHERE id = ?`
-      ).bind(resolvedId).first<MemoryRow>();
-
-      if (!row) {
+      const recalled = await recallMemory(ctx.env.DB, resolvedId);
+      if (!recalled) {
         return errorResult(`Memory not found: ${resolvedId}`);
       }
+      const row = recalled.row;
 
-      // Get connected memories
-      const edges = await ctx.env.DB.prepare(
-        `SELECT target_id, strength FROM edges WHERE source_id = ?`
-      ).bind(resolvedId).all<{ target_id: string; strength: number }>();
+      const edges = recalled.edges
+        .filter((edge) => edge.source_id === resolvedId)
+        .map((edge) => ({ target_id: edge.target_id, strength: edge.strength }));
 
-      return textResult(formatRecall(row, edges.results || []));
+      return textResult(formatRecall(row, edges));
     },
   }),
 
@@ -1223,29 +1201,12 @@ Respond with exactly one word: CORRECTION or THESIS_CHANGE`;
       properties: {},
     },
     handler: async (_args, ctx) => {
-      // Count memories by type using field presence
-      const obsCount = await ctx.env.DB.prepare(
-        `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND source IS NOT NULL`
-      ).first<{ count: number }>();
-
-      const thoughtCount = await ctx.env.DB.prepare(
-        `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND source IS NULL AND derived_from IS NOT NULL AND resolves_by IS NULL`
-      ).first<{ count: number }>();
-
-      const predictionCount = await ctx.env.DB.prepare(
-        `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND source IS NULL AND resolves_by IS NOT NULL`
-      ).first<{ count: number }>();
-
-      // Count edges
-      const edgeCount = await ctx.env.DB.prepare(
-        'SELECT COUNT(*) as count FROM edges'
-      ).first<{ count: number }>();
-
-      const obs = obsCount?.count || 0;
-      const thoughts = thoughtCount?.count || 0;
-      const predictions = predictionCount?.count || 0;
-      const total = obs + thoughts + predictions;
-      const edges = edgeCount?.count || 0;
+      const summary = await getStatsSummary(ctx.env.DB);
+      const obs = summary.memories.observation;
+      const thoughts = summary.memories.thought;
+      const predictions = summary.memories.prediction;
+      const total = summary.memories.total;
+      const edges = summary.edges;
 
       return textResult(`📊 Memory Stats\nTotal: ${total} (${obs} sourced, ${thoughts} derived, ${predictions} time-bound)\nConnections: ${edges}`);
     },
@@ -1445,7 +1406,8 @@ Respond with exactly one word: CORRECTION or THESIS_CHANGE`;
 
       const nodes: Map<string, GraphNode> = new Map();
       const edges: GraphEdge[] = [];
-      const visited = new Set<string>();
+      const visited = new Set<string>([memory_id]);
+      const edgeSeen = new Set<string>();
 
       // Get root memory
       const rootRow = await ctx.env.DB.prepare(
@@ -1464,85 +1426,71 @@ Respond with exactly one word: CORRECTION or THESIS_CHANGE`;
         depth: 0,
       });
 
-      // Traverse function
-      async function traverse(
-        memoryId: string,
-        currentDepth: number,
-        dir: string
-      ): Promise<void> {
-        if (currentDepth >= maxDepth || visited.has(`${memoryId}-${dir}`)) return;
-        visited.add(`${memoryId}-${dir}`);
+      let frontier = [memory_id];
+      let depth = 0;
 
-        // Traverse up (what this memory is derived from)
-        if (dir === 'up' || dir === 'both') {
-          const derivedFrom = await ctx.env.DB.prepare(
-            `SELECT * FROM edges WHERE target_id = ?`
-          ).bind(memoryId).all<EdgeRow>();
+      while (frontier.length > 0 && depth < maxDepth) {
+        const [incoming, outgoing] = await Promise.all([
+          (direction === 'up' || direction === 'both')
+            ? fetchEdgesByTargetIds<EdgeRow>(ctx.env.DB, frontier)
+            : Promise.resolve([] as EdgeRow[]),
+          (direction === 'down' || direction === 'both')
+            ? fetchEdgesBySourceIds<EdgeRow>(ctx.env.DB, frontier)
+            : Promise.resolve([] as EdgeRow[]),
+        ]);
 
-          for (const row of derivedFrom.results || []) {
-            if (!nodes.has(row.source_id)) {
-              const sourceRow = await ctx.env.DB.prepare(
-                `SELECT * FROM memories WHERE id = ? AND retracted = 0`
-              ).bind(row.source_id).first<MemoryRow>();
+        const nextIds: string[] = [];
 
-              if (sourceRow) {
-                const sourceMemory = rowToMemory(sourceRow);
-                nodes.set(row.source_id, {
-                  id: row.source_id,
-                  type: getDisplayType(sourceMemory),
-                  content: sourceMemory.content,
-                  depth: currentDepth + 1,
-                });
-              }
-            }
-
+        for (const row of incoming) {
+          const edgeKey = `${row.source_id}:${row.target_id}:${row.edge_type}`;
+          if (!edgeSeen.has(edgeKey)) {
+            edgeSeen.add(edgeKey);
             edges.push({
               source: row.source_id,
-              target: memoryId,
-              type: row.edge_type,
-              strength: row.strength,
-            });
-
-            await traverse(row.source_id, currentDepth + 1, 'up');
-          }
-        }
-
-        // Traverse down (what derives from this memory)
-        if (dir === 'down' || dir === 'both') {
-          const derivesTo = await ctx.env.DB.prepare(
-            `SELECT * FROM edges WHERE source_id = ?`
-          ).bind(memoryId).all<EdgeRow>();
-
-          for (const row of derivesTo.results || []) {
-            if (!nodes.has(row.target_id)) {
-              const targetRow = await ctx.env.DB.prepare(
-                `SELECT * FROM memories WHERE id = ? AND retracted = 0`
-              ).bind(row.target_id).first<MemoryRow>();
-
-              if (targetRow) {
-                const targetMemory = rowToMemory(targetRow);
-                nodes.set(row.target_id, {
-                  id: row.target_id,
-                  type: getDisplayType(targetMemory),
-                  content: targetMemory.content,
-                  depth: currentDepth + 1,
-                });
-              }
-            }
-
-            edges.push({
-              source: memoryId,
               target: row.target_id,
               type: row.edge_type,
               strength: row.strength,
             });
+          }
+          if (!visited.has(row.source_id)) nextIds.push(row.source_id);
+        }
 
-            await traverse(row.target_id, currentDepth + 1, 'down');
+        for (const row of outgoing) {
+          const edgeKey = `${row.source_id}:${row.target_id}:${row.edge_type}`;
+          if (!edgeSeen.has(edgeKey)) {
+            edgeSeen.add(edgeKey);
+            edges.push({
+              source: row.source_id,
+              target: row.target_id,
+              type: row.edge_type,
+              strength: row.strength,
+            });
+          }
+          if (!visited.has(row.target_id)) nextIds.push(row.target_id);
+        }
+
+        const uniqueNextIds = [...new Set(nextIds)];
+        if (uniqueNextIds.length === 0) break;
+
+        const nextRows = await fetchMemoriesByIds<MemoryRow>(ctx.env.DB, uniqueNextIds, {
+          includeRetracted: false,
+        });
+        for (const row of nextRows) {
+          if (!nodes.has(row.id)) {
+            const nextMemory = rowToMemory(row);
+            nodes.set(row.id, {
+              id: row.id,
+              type: getDisplayType(nextMemory),
+              content: nextMemory.content,
+              depth: depth + 1,
+            });
           }
         }
-      }
 
-      await traverse(memory_id, 0, direction);
+        for (const nextId of uniqueNextIds) visited.add(nextId);
+        frontier = uniqueNextIds;
+        depth += 1;
+      }
 
       const nodeList = Array.from(nodes.values());
       if (nodeList.length === 0) {
@@ -1598,46 +1546,54 @@ Respond with exactly one word: CORRECTION or THESIS_CHANGE`;
         return textResult(`[${memory_id}] is already a root (no derived_from)\n\n${memory.content}`);
       }
 
-      // Trace to roots
-      const visited = new Set<string>();
-      const roots: Array<{ id: string; content: string; type: string }> = [];
-      let maxDepth = 0;
+      const visited = new Set<string>([memory_id]);
+      const nodeDepth = new Map<string, number>([[memory_id, 0]]);
+      const rootIds = new Set<string>();
+      let frontier = [memory_id];
 
-      async function traceToRoots(memId: string, depth: number): Promise<void> {
-        if (visited.has(memId)) return;
-        visited.add(memId);
+      while (frontier.length > 0) {
+        const derivedFrom = await fetchEdgesByTargetIds<EdgeRow>(ctx.env.DB, frontier, ['derived_from']);
+        const parentMap = new Map<string, string[]>();
 
-        const derivedFrom = await ctx.env.DB.prepare(
-          `SELECT source_id FROM edges WHERE target_id = ? AND edge_type = 'derived_from'`
-        ).bind(memId).all<{ source_id: string }>();
+        for (const edge of derivedFrom) {
+          const parents = parentMap.get(edge.target_id) || [];
+          parents.push(edge.source_id);
+          parentMap.set(edge.target_id, parents);
+        }
 
-        if (!derivedFrom.results || derivedFrom.results.length === 0) {
-          // No derivation edges — this is a root
-          const rootRow = await ctx.env.DB.prepare(
-            `SELECT * FROM memories WHERE id = ? AND retracted = 0`
-          ).bind(memId).first<MemoryRow>();
-
-          if (rootRow && !roots.some(r => r.id === memId)) {
-            roots.push({
-              id: memId,
-              content: rootRow.content,
-              type: getDisplayType(rowToMemory(rootRow)),
-            });
-            if (depth > maxDepth) maxDepth = depth;
+        const nextFrontier: string[] = [];
+        for (const childId of frontier) {
+          const parents = parentMap.get(childId) || [];
+          if (parents.length === 0) {
+            rootIds.add(childId);
+            continue;
           }
-          return;
+
+          const childDepth = nodeDepth.get(childId) || 0;
+          for (const parentId of parents) {
+            if (visited.has(parentId)) continue;
+            visited.add(parentId);
+            nodeDepth.set(parentId, childDepth + 1);
+            nextFrontier.push(parentId);
+          }
         }
 
-        for (const parent of derivedFrom.results) {
-          await traceToRoots(parent.source_id, depth + 1);
-        }
+        frontier = nextFrontier;
       }
 
-      await traceToRoots(memory_id, 0);
-
-      if (roots.length === 0) {
+      if (rootIds.size === 0) {
         return textResult(`[${memory_id}] has no traceable roots (orphan memory)`);
       }
+
+      const rootRows = await fetchMemoriesByIds<MemoryRow>(ctx.env.DB, [...rootIds], {
+        includeRetracted: false,
+      });
+      const roots = rootRows.map((rootRow) => ({
+        id: rootRow.id,
+        content: rootRow.content,
+        type: getDisplayType(rowToMemory(rootRow)),
+      }));
+      const maxDepth = roots.reduce((acc, rootNode) => Math.max(acc, nodeDepth.get(rootNode.id) || 0), 0);
 
       const rootLines = roots.map(r => `[${r.id}] (${r.type}) ${r.content}`);
       let text = `=== ROOTS of [${memory_id}] (depth: ${maxDepth}) ===\n\n`;
@@ -2573,8 +2529,8 @@ mcpRouter.post('/', async (c) => {
   );
 
   if (response === null) {
-    // Notification - no response needed
-    return c.body(null, 204);
+    // Notification - return 202 (not 204) for rmcp/Codex client compatibility
+    return c.body(null, 202);
   }
 
   if (parsed.request.method === 'tools/call') {
