@@ -25,7 +25,7 @@ const getLog = createLazyLogger('ClassificationChallenge', 'classification-init'
 type DisplayType = 'memory';
 
 /** Fields that might be missing from a memory */
-export type MissingFieldType = 'invalidates_if' | 'confirms_if' | 'derived_from' | 'source' | 'resolves_by';
+export type MissingFieldType = 'invalidates_if' | 'confirms_if' | 'derived_from' | 'source' | 'resolves_by' | 'atomicity';
 
 /** A missing field suggestion */
 export interface MissingField {
@@ -76,7 +76,7 @@ const COMPLETENESS_SCHEMA = {
       items: {
         type: 'object',
         properties: {
-          field: { type: 'string', enum: ['invalidates_if', 'confirms_if', 'derived_from', 'source', 'resolves_by'] },
+          field: { type: 'string', enum: ['invalidates_if', 'confirms_if', 'derived_from', 'source', 'resolves_by', 'atomicity'] },
           reason: { type: 'string' },
         },
         required: ['field', 'reason'],
@@ -435,9 +435,11 @@ function buildCompletenessPrompt(
     has_invalidates_if?: boolean;
     has_confirms_if?: boolean;
     has_resolves_by?: boolean;
-  }
+  },
+  opts?: { atomic_override?: boolean }
 ): string {
   const hasSource = currentFields.has_source === true;
+  const checkAtomicity = !opts?.atomic_override;
 
   return `Analyze whether this memory is complete and well-formed.
 
@@ -452,6 +454,7 @@ Field definitions:
 - invalidates_if: Conditions that would prove this memory wrong (makes claims falsifiable)
 - confirms_if: Conditions that would strengthen confidence in this memory
 - resolves_by: Deadline for time-bound predictions (Unix timestamp)
+- atomicity: Each memory must capture ONE atomic insight — a single claim, fact, or prediction
 ${hasSource ? `
 IMPORTANT — Sourced perception leniency rules:
 Sourced perceptions record WHAT WAS SAID or WHAT HAPPENED. They are not the author's own claims.
@@ -460,12 +463,20 @@ Sourced perceptions record WHAT WAS SAID or WHAT HAPPENED. They are not the auth
 - invalidates_if and confirms_if are NICE TO HAVE on sourced perceptions, never required. Only flag them if truly obvious and simple (1 condition max).
 - confirms_if is NEVER required for sourced perceptions.
 - A sourced perception with source + content is COMPLETE. Err heavily toward marking sourced perceptions as complete.
+${checkAtomicity ? '- Atomicity still applies to sourced perceptions: a single continuous quote is OK, but bundling multiple separate facts/quotes from different parts of a source is NOT atomic.' : ''}
 ` : ''}
 Check for these completeness issues:
 1. ${hasSource ? 'SKIP for sourced perceptions unless the memory itself (not quoted speakers) makes a novel prediction' : 'Falsifiable claims without invalidates_if conditions - any claim that could be proven wrong should ideally have kill conditions'}
 2. Apparent inferences without derived_from - if this seems like a conclusion based on other information, it should trace its reasoning
 3. ${hasSource ? 'SKIP for sourced perceptions — quoted time-bound claims belong to the speaker' : 'Time-bound predictions without resolves_by/outcome_condition - predictions with implicit deadlines should make them explicit'}
 4. Claims that reference external information without source attribution
+${checkAtomicity ? `5. ATOMICITY (CRITICAL): Content must capture ONE atomic insight. Flag as "atomicity" violation if:
+   - Content contains numbered lists (1. ... 2. ... 3. ...) with distinct claims
+   - Multiple unrelated facts bundled together ("X happened AND Y happened AND Z happened")
+   - Multiple predictions combined into one note
+   - Different topics or entities mixed without tight logical connection
+   - Content reads like a summary or briefing with many separate takeaways
+   Atomicity PASSES for: a single fact with supporting context, a single quote (even if long), one prediction with its rationale` : ''}
 
 Note: Not every memory needs every field. Simple perceptions may be complete as-is.
 ${hasSource ? 'Sourced perceptions are almost always complete if they have a source. Be very reluctant to flag missing fields.' : 'Focus on genuinely missing fields that would strengthen the memory, not theoretical completeness.'}
@@ -474,7 +485,7 @@ Respond with JSON only:
 {
   "is_complete": boolean,
   "missing_fields": [
-    {"field": "invalidates_if" | "confirms_if" | "derived_from" | "source" | "resolves_by", "reason": "brief explanation"}
+    {"field": "invalidates_if" | "confirms_if" | "derived_from" | "source" | "resolves_by" | "atomicity", "reason": "brief explanation"}
   ],
   "confidence": number between 0 and 1,
   "reasoning": "brief overall assessment"
@@ -544,6 +555,7 @@ export async function checkMemoryCompleteness(
     has_invalidates_if?: boolean;
     has_confirms_if?: boolean;
     has_resolves_by?: boolean;
+    atomic_override?: boolean;
     requestId?: string;
   }
 ): Promise<MemoryCompleteness | null> {
@@ -558,7 +570,7 @@ export async function checkMemoryCompleteness(
     has_invalidates_if: params.has_invalidates_if,
     has_confirms_if: params.has_confirms_if,
     has_resolves_by: params.has_resolves_by,
-  });
+  }, { atomic_override: params.atomic_override });
 
   try {
     let responseText: string;
@@ -669,13 +681,24 @@ export function formatCompletenessOutput(completeness: MemoryCompleteness): stri
     return ''; // No output needed for complete memories
   }
 
-  let output = `\n⚠️ This memory could be strengthened:\n`;
+  const atomicityIssue = completeness.missing_fields.find(f => f.field === 'atomicity');
+  const otherFields = completeness.missing_fields.filter(f => f.field !== 'atomicity');
 
-  for (const field of completeness.missing_fields) {
-    output += `- Consider adding ${field.field} (${field.reason})\n`;
+  let output = '';
+
+  if (atomicityIssue) {
+    output += `\nATOMICITY VIOLATION: This memory contains multiple distinct insights that must be split into separate memories.\n`;
+    output += `${atomicityIssue.reason}\n`;
+    output += `\nSplit into separate observe calls and link them via derived_from. If this is intentionally composite, pass atomic_override: true.\n`;
   }
 
-  output += `\nUse the 'update' tool to add missing fields to this memory.`;
+  if (otherFields.length > 0) {
+    output += `\nThis memory could be strengthened:\n`;
+    for (const field of otherFields) {
+      output += `- Consider adding ${field.field} (${field.reason})\n`;
+    }
+    output += `\nUse the 'update' tool to add missing fields to this memory.`;
+  }
 
   return output;
 }

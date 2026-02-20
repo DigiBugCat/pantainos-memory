@@ -37,9 +37,10 @@ import { rowToMemory } from '../lib/transforms.js';
 import { normalizeSource, isNonEmptySource } from '../lib/source.js';
 import { createScoredMemory } from '../lib/scoring.js';
 import { incrementCentrality } from '../services/exposure-checker.js';
-import { checkMemoryCompleteness } from '../services/classification-challenge.js';
+import { checkMemoryCompleteness, formatCompletenessOutput } from '../services/classification-challenge.js';
 import { deleteConditionVectors } from '../services/embedding-tables.js';
 import { propagateResolution } from '../services/cascade.js';
+import { findMostSurprising } from '../services/surprise.js';
 import {
   formatZone,
   parseViolationCount,
@@ -334,6 +335,22 @@ defineTool({
     name: 'observe',
     description: `Store a new memory. Every memory is a perception — what you saw, read, inferred, or predicted.
 
+ATOMICITY PRINCIPLE (enforced):
+Each memory MUST capture ONE atomic insight — a single claim, fact, observation, or prediction.
+If your content contains multiple distinct claims, split them into separate observe calls and link via derived_from.
+
+NON-ATOMIC (will be rejected):
+- "Revenue hit $5B AND new CEO announced AND expanding to Europe" → 3 separate memories
+- "1) NVDA up 3% 2) analysts bullish 3) competitors lagging" → 3 separate memories
+- Multiple predictions bundled together → one memory per prediction
+
+ATOMIC (good):
+- "Company X Q4 2025 revenue: $5.2B (beat estimates by 8%)"
+- "NVDA trading at $850, up 3% on 2026-02-17"
+- A single continuous quote from an earnings call (even if long)
+
+Use atomic_override: true ONLY for intentionally composite notes (rare).
+
 Set "source" for provenance (what you perceived from), "derived_from" for lineage (what memories informed this).
 Both can be set together. At least one is required.
 
@@ -364,6 +381,7 @@ All memories support invalidates_if/confirms_if conditions.`,
         outcome_condition: { type: 'string', description: 'Success/failure criteria (required if resolves_by set)' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for categorization' },
         obsidian_sources: { type: 'array', items: { type: 'string' }, description: 'Obsidian vault file paths that reference this memory' },
+        atomic_override: { type: 'boolean', description: 'Bypass atomicity check for intentionally composite notes. Use sparingly.' },
       },
       required: ['content'],
     },
@@ -380,6 +398,7 @@ All memories support invalidates_if/confirms_if conditions.`,
         outcome_condition,
         tags,
         obsidian_sources,
+        atomic_override,
       } = args as {
         content: string;
         source?: string;
@@ -392,6 +411,7 @@ All memories support invalidates_if/confirms_if conditions.`,
         outcome_condition?: string;
         tags?: string[];
         obsidian_sources?: string[];
+        atomic_override?: boolean;
       };
 
       // Parse resolves_by: accepts date strings ("2026-03-15") or Unix timestamps
@@ -470,13 +490,11 @@ All memories support invalidates_if/confirms_if conditions.`,
         has_invalidates_if: Boolean(invalidates_if?.length),
         has_confirms_if: Boolean(confirms_if?.length),
         has_resolves_by: timeBound,
+        atomic_override,
         requestId,
       });
       if (completeness && !completeness.is_complete && completeness.missing_fields.length > 0) {
-        const suggestions = completeness.missing_fields
-          .map(f => `- ${f.field}: ${f.reason}`)
-          .join('\n');
-        return errorResult(`Memory could be strengthened. Add the suggested fields and retry:\n${suggestions}`);
+        return errorResult(formatCompletenessOutput(completeness));
       }
 
       const now = Date.now();
@@ -848,10 +866,7 @@ Respond with exactly one word: CORRECTION or THESIS_CHANGE`;
         requestId,
       });
       if (updateCompleteness && !updateCompleteness.is_complete && updateCompleteness.missing_fields.length > 0) {
-        const suggestions = updateCompleteness.missing_fields
-          .map(f => `- ${f.field}: ${f.reason}`)
-          .join('\n');
-        return errorResult(`Memory still incomplete after update. Add the suggested fields and retry:\n${suggestions}`);
+        return errorResult(formatCompletenessOutput(updateCompleteness));
       }
 
       // Resolve source_url: explicit update wins, otherwise keep existing
@@ -2405,6 +2420,40 @@ Respond with exactly one word: CORRECTION or THESIS_CHANGE`;
       text += cascadeText;
 
       return textResult(text);
+    },
+  }),
+
+  defineTool({
+    name: 'surprising',
+    description: 'Find the most surprising memories — those that deviated most from what the knowledge graph predicted. Surprise scores are revalidated against the current graph state before returning, so results reflect genuine current novelty.',
+    annotations: {
+      title: 'Most Surprising Memories',
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'integer', description: 'Max results (default 10)', minimum: 1, maximum: 50 },
+        min_surprise: { type: 'number', description: 'Minimum surprise threshold 0-1 (default 0.3)', minimum: 0, maximum: 1 },
+      },
+    },
+    handler: async (args, ctx) => {
+      const { limit, min_surprise } = args as { limit?: number; min_surprise?: number };
+      const results = await findMostSurprising(ctx.env, limit ?? 10, min_surprise ?? 0.3);
+
+      if (results.length === 0) {
+        return textResult('No surprising memories found above the threshold.');
+      }
+
+      const lines = results.map((r, i) => {
+        const m = r.memory;
+        const type = getDisplayType(m);
+        const staleTag = r.stale ? ' (refreshed)' : '';
+        return `${i + 1}. [${m.id}] surprise=${r.surprise.toFixed(3)}${staleTag} (${type})\n   ${m.content.slice(0, 150)}${m.content.length > 150 ? '...' : ''}`;
+      });
+
+      return textResult(`🔮 Most Surprising Memories (${results.length} results)\n\n${lines.join('\n\n')}`);
     },
   }),
 

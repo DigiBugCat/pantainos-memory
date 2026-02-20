@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS memories (
   retracted_at INTEGER,
   retraction_reason TEXT,
 
+  -- Predictive coding
+  surprise REAL,               -- Prediction error: how much this deviated from graph's expectation
+
   -- Processing
   exposure_check_status TEXT DEFAULT 'pending'
     CHECK(exposure_check_status IN ('pending', 'processing', 'completed', 'skipped')),

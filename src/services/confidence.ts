@@ -80,6 +80,8 @@ export const SCORING_WEIGHTS = {
   CENTRALITY_WEIGHT: 0.1,
   /** Weight for confidence boost in search scoring */
   CONFIDENCE_BOOST_WEIGHT: 0.5,
+  /** Weight for surprise (prediction error) boost in search scoring */
+  NOVELTY_WEIGHT: 0.15,
   /** Penalty multiplier for incorrect/superseded resolved memories */
   INCORRECT_PENALTY: 0.3,
 } as const;
@@ -241,9 +243,10 @@ export function calculateScore(
   maxTimesTested: number = DEFAULT_MAX_TIMES_TESTED
 ): number {
   const effective = getEffectiveConfidence(memory, maxTimesTested);
+  const surprise = memory.surprise ?? 0;
 
-  // New formula: similarity with confidence boost
-  let score = similarity * (1 + effective * SCORING_WEIGHTS.CONFIDENCE_BOOST_WEIGHT);
+  // Formula: similarity with confidence boost + novelty nudge
+  let score = similarity * (1 + effective * SCORING_WEIGHTS.CONFIDENCE_BOOST_WEIGHT + surprise * SCORING_WEIGHTS.NOVELTY_WEIGHT);
 
   // Penalize resolved-incorrect/superseded memories (still visible but ranked lower)
   if (memory.state === 'resolved' && (memory.outcome === 'incorrect' || memory.outcome === 'superseded')) {

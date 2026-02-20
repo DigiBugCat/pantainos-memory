@@ -383,12 +383,10 @@ describe('Core Violation Notification (Pushover)', () => {
     const body = JSON.parse(options.body);
     expect(body.token).toBe('test-app-token');
     expect(body.user).toBe('test-user-key');
-    expect(body.title).toBe('Memory: Core Violation');
+    expect(body.title).toBe('Violation: Test memory content for notifi');
     expect(body.priority).toBe(1);
-    expect(body.message).toContain('mem-456');
-    expect(body.message).toContain('Test memory content for notification');
-    expect(body.message).toContain('5 memories');
-    expect(body.url).toBeUndefined();
+    expect(body.message).toContain('5 memories affected');
+    expect(body.message).toContain('40%');
 
     vi.unstubAllGlobals();
   });

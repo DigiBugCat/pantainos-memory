@@ -40,6 +40,8 @@ export function rowToMemory(row: MemoryRow): Memory {
     session_id: row.session_id || undefined,
     created_at: row.created_at,
     updated_at: row.updated_at || undefined,
+    // Predictive coding
+    surprise: row.surprise ?? undefined,
     // Exposure check tracking
     exposure_check_status: (row.exposure_check_status as ExposureCheckStatus) || 'pending',
     exposure_check_completed_at: row.exposure_check_completed_at || undefined,
@@ -80,6 +82,8 @@ export function memoryToRow(memory: Memory): Partial<MemoryRow> {
     session_id: memory.session_id,
     created_at: memory.created_at,
     updated_at: memory.updated_at,
+    // Predictive coding
+    surprise: memory.surprise ?? null,
     // Exposure check tracking
     exposure_check_status: memory.exposure_check_status,
     exposure_check_completed_at: memory.exposure_check_completed_at,

@@ -38,9 +38,10 @@ export function calculateScore(
   maxTimesTested: number = DEFAULT_MAX_TIMES_TESTED
 ): number {
   const effective = getEffectiveConfidence(memory, maxTimesTested);
+  const surprise = memory.surprise ?? 0;
 
-  // New formula: similarity with confidence boost
-  let score = similarity * (1 + effective * SCORING_WEIGHTS.CONFIDENCE_BOOST_WEIGHT);
+  // Formula: similarity with confidence boost + novelty nudge
+  let score = similarity * (1 + effective * SCORING_WEIGHTS.CONFIDENCE_BOOST_WEIGHT + surprise * SCORING_WEIGHTS.NOVELTY_WEIGHT);
 
   // Penalize resolved-incorrect/superseded memories (still visible but ranked lower)
   if (memory.state === 'resolved' && (memory.outcome === 'incorrect' || memory.outcome === 'superseded')) {
@@ -87,5 +88,6 @@ export function createScoredMemory(
     score,
     confidence,
     robustness,
+    surprise: memory.surprise,
   };
 }

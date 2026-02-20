@@ -41,6 +41,7 @@ import { normalizeSource, isNonEmptySource } from '../../lib/source.js';
 import { generateAllEmbeddings } from '../../services/embedding-tables.js';
 import { recordVersion } from '../../services/history-service.js';
 import { checkExposures, checkExposuresForNewThought } from '../../services/exposure-checker.js';
+import { computeSurprise } from '../../services/surprise.js';
 import { TYPE_STARTING_CONFIDENCE } from '../../services/confidence.js';
 import { getStartingConfidenceForSource } from '../../jobs/compute-stats.js';
 
@@ -61,6 +62,7 @@ interface ObserveResponse {
   time_bound?: boolean;
   exposure_check: 'queued';
   exposure_result?: ExposureCheckResult;
+  surprise?: number;
 }
 
 app.post('/', async (c) => {
@@ -288,28 +290,41 @@ app.post('/', async (c) => {
     `).bind(now, id).run();
 
     try {
-      let exposureResult: ExposureCheckResult;
+      // Run exposure check + surprise in parallel (independent computations)
+      const exposureP = hasSource
+        ? checkExposures(c.env, id, body.content, embeddings.content)
+        : checkExposuresForNewThought(
+            c.env, id, body.content,
+            body.invalidates_if || [],
+            body.confirms_if || [],
+            timeBound
+          );
 
-      if (hasSource) {
-        exposureResult = await checkExposures(c.env, id, body.content, embeddings.content);
-      } else {
-        exposureResult = await checkExposuresForNewThought(
-          c.env, id, body.content,
-          body.invalidates_if || [],
-          body.confirms_if || [],
-          timeBound
-        );
-      }
+      const surpriseP = computeSurprise(c.env, id, embeddings.content).catch(() => null);
+
+      const [exposureResult, surprise] = await Promise.all([exposureP, surpriseP]);
 
       const completedAt = Date.now();
-      await c.env.DB.prepare(`
-        UPDATE memories
-        SET exposure_check_status = 'completed', exposure_check_completed_at = ?, updated_at = ?
-        WHERE id = ?
-      `).bind(completedAt, completedAt, id).run();
+
+      // Store exposure status + surprise in one write
+      if (surprise != null) {
+        await c.env.DB.prepare(`
+          UPDATE memories
+          SET exposure_check_status = 'completed', exposure_check_completed_at = ?,
+              surprise = ?, updated_at = ?
+          WHERE id = ?
+        `).bind(completedAt, surprise, completedAt, id).run();
+      } else {
+        await c.env.DB.prepare(`
+          UPDATE memories
+          SET exposure_check_status = 'completed', exposure_check_completed_at = ?, updated_at = ?
+          WHERE id = ?
+        `).bind(completedAt, completedAt, id).run();
+      }
 
       logField(c, 'violations', exposureResult.violations.length);
       logField(c, 'confirmations', exposureResult.confirmations.length);
+      if (surprise != null) logField(c, 'surprise', surprise);
 
       return c.json({
         success: true,
@@ -317,6 +332,7 @@ app.post('/', async (c) => {
         time_bound: timeBound || undefined,
         exposure_check: 'queued',
         exposure_result: exposureResult,
+        surprise: surprise ?? undefined,
       } satisfies ObserveResponse, 201);
     } catch (error) {
       logError('sync_exposure_check_failed', error instanceof Error ? error : String(error));

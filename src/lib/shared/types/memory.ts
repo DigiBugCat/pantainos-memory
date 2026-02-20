@@ -127,6 +127,10 @@ export interface Memory {
   retracted_at?: number;
   retraction_reason?: string;
 
+  // Predictive coding
+  /** Prediction error: how much this deviated from the graph's expectation (0-1, higher = more novel) */
+  surprise?: number;
+
   // Exposure check tracking
   exposure_check_status: ExposureCheckStatus;
   exposure_check_completed_at?: number;
@@ -165,6 +169,8 @@ export interface MemoryRow {
   retracted: number;
   retracted_at: number | null;
   retraction_reason: string | null;
+  // Predictive coding
+  surprise: number | null;
   // Exposure check tracking
   exposure_check_status: string;
   exposure_check_completed_at: number | null;
@@ -271,6 +277,7 @@ export interface ScoredMemory {
   confidence: number;
   score: number;
   robustness: Robustness;
+  surprise?: number;
 }
 
 // ============================================

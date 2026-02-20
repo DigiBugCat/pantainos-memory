@@ -44,6 +44,7 @@ import {
 } from './services/resolver.js';
 import { computeSystemStats } from './jobs/compute-stats.js';
 import { runFullGraphPropagation } from './services/propagation.js';
+import { computeSurprise } from './services/surprise.js';
 import { buildZoneHealth } from './services/zone-builder.js';
 import type { ZoneHealthReport } from './services/zone-builder.js';
 
@@ -516,9 +517,9 @@ async function processExposureCheck(
   // Mark as processing
   await updateExposureCheckStatus(env.DB, memoryId, 'processing');
 
-  // Run BOTH check directions concurrently — they search different vector indexes
+  // Run BOTH check directions + surprise concurrently — all independent
   const timeBound = job.time_bound ?? false;
-  const [obsResults, thoughtResults] = await Promise.all([
+  const [obsResults, thoughtResults, surprise] = await Promise.all([
     // Direction 1: Check if this memory's content violates existing thoughts' conditions
     checkExposures(env, memoryId, content, job.embedding),
     // Direction 2: Check if this memory's own conditions are violated by existing content
@@ -528,7 +529,24 @@ async function processExposureCheck(
       job.confirms_if || [],
       timeBound
     ),
+    // Predictive coding: compute surprise (prediction error) from neighbor similarity
+    computeSurprise(env, memoryId, job.embedding).catch(err => {
+      log.warn('surprise_computation_failed', {
+        memory_id: memoryId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null as number | null;
+    }),
   ]);
+
+  // Store surprise score (independent D1 write, no conflict with exposure writes)
+  if (surprise != null) {
+    await env.DB.prepare(
+      'UPDATE memories SET surprise = ?, updated_at = ? WHERE id = ?'
+    ).bind(surprise, Date.now(), memoryId).run();
+
+    log.info('surprise_stored', { memory_id: memoryId, surprise });
+  }
 
   // Merge results, deduplicating by memory_id
   const seenViolations = new Set<string>();
