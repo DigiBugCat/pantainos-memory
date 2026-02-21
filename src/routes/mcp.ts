@@ -398,6 +398,7 @@ All memories support invalidates_if/confirms_if conditions.`,
         tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for categorization' },
         obsidian_sources: { type: 'array', items: { type: 'string' }, description: 'Obsidian vault file paths that reference this memory' },
         atomic_override: { type: 'boolean', description: 'Bypass atomicity check for intentionally composite notes. Use sparingly.' },
+        override: { type: 'boolean', description: 'Skip completeness check entirely — commit directly as active (use when re-committing a draft).' },
       },
       required: ['content'],
     },
@@ -415,6 +416,7 @@ All memories support invalidates_if/confirms_if conditions.`,
         tags,
         obsidian_sources,
         atomic_override,
+        override,
       } = args as {
         content: string;
         source?: string;
@@ -428,6 +430,7 @@ All memories support invalidates_if/confirms_if conditions.`,
         tags?: string[];
         obsidian_sources?: string[];
         atomic_override?: boolean;
+        override?: boolean;
       };
 
       // Parse resolves_by: accepts date strings ("2026-03-15") or Unix timestamps
@@ -490,21 +493,26 @@ All memories support invalidates_if/confirms_if conditions.`,
         }
       }
 
-      // Check for memory completeness before creating (feature toggle)
-      const completeness = await checkMemoryCompleteness(ctx.env, ctx.env.AI, config, {
-        content,
-        has_source: hasSource,
-        has_derived_from: hasDerivedFrom,
-        has_invalidates_if: Boolean(invalidates_if?.length),
-        has_confirms_if: Boolean(confirms_if?.length),
-        has_resolves_by: timeBound,
-        atomic_override,
-        requestId,
-      });
-      if (completeness && !completeness.is_complete && completeness.missing_fields.length > 0) {
-        return errorResult(formatCompletenessOutput(completeness));
+      // Completeness check (advisory — creates draft if warnings, unless override)
+      let completenessWarnings: string | undefined;
+      if (!override) {
+        const completeness = await checkMemoryCompleteness(ctx.env, ctx.env.AI, config, {
+          content,
+          has_source: hasSource,
+          has_derived_from: hasDerivedFrom,
+          has_invalidates_if: Boolean(invalidates_if?.length),
+          has_confirms_if: Boolean(confirms_if?.length),
+          has_resolves_by: timeBound,
+          atomic_override,
+          requestId,
+        });
+        if (completeness && !completeness.is_complete && completeness.missing_fields.length > 0) {
+          completenessWarnings = formatCompletenessOutput(completeness);
+        }
       }
 
+      const isDraft = Boolean(completenessWarnings);
+      const initialState = isDraft ? 'draft' : 'active';
       const now = Date.now();
       const id = generateId();
       const sessionId = ctx.sessionId;
@@ -528,7 +536,7 @@ All memories support invalidates_if/confirms_if conditions.`,
           starting_confidence, confirmations, times_tested, contradictions,
           centrality, state, violations,
           retracted, tags, obsidian_sources, session_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'active', '[]', 0, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, '[]', 0, ?, ?, ?, ?)`
       ).bind(
         id,
         content,
@@ -541,6 +549,7 @@ All memories support invalidates_if/confirms_if conditions.`,
         outcome_condition || null,
         resolves_by || null,
         startingConfidence,
+        initialState,
         tags ? JSON.stringify(tags) : null,
         obsidian_sources ? JSON.stringify(obsidian_sources) : null,
         sessionId || null,
@@ -583,7 +592,7 @@ All memories support invalidates_if/confirms_if conditions.`,
           times_tested: 0,
           contradictions: 0,
           centrality: 0,
-          state: 'active',
+          state: initialState,
           violations: [],
           retracted: false,
           time_bound: timeBound,
@@ -591,6 +600,14 @@ All memories support invalidates_if/confirms_if conditions.`,
         sessionId,
         requestId,
       });
+
+      // Draft: D1 only, no vectorize or exposure check
+      if (isDraft) {
+        let response = `📋 Draft [${id}] — saved but NOT committed\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}`;
+        response += `\n\n${completenessWarnings}`;
+        response += `\n\nTo commit: re-call observe with the same content and override: true`;
+        return textResult(response);
+      }
 
       // Store embeddings based on mode
       const hasConditions = (invalidates_if && invalidates_if.length > 0) ||

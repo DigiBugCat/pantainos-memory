@@ -328,6 +328,8 @@ export interface MemoryRequest {
   obsidian_sources?: string[];
   /** Bypass atomicity check for intentionally composite notes */
   atomic_override?: boolean;
+  /** Skip completeness check entirely — commit directly as active */
+  override?: boolean;
 }
 
 /** Manual confirmation of a memory */

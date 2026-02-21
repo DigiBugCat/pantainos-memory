@@ -10,12 +10,13 @@
  * Memory type is determined by field presence, not a type column.
  * At least one of "source" OR "derived_from" is required.
  *
- * Flow (FAST - exposure checking queued for async processing):
+ * Flow:
  * 1. Validate request
- * 2. Store in D1 (memories table)
- * 3. Generate embedding (Workers AI) and store in vector tables
- * 4. Queue bi-directional exposure check job
- * 5. Return response immediately
+ * 2. Duplicate detection (blocks on match)
+ * 3. Completeness check (advisory — saves as draft if warnings, unless override: true)
+ * 4. Store in D1 (memories table)
+ * 5. If active: generate embeddings, upsert to vectorize, queue exposure check
+ * 6. If draft: D1 only, return ID + warnings (call with override: true to commit)
  *
  * Query params:
  * - sync=true: Run exposure check synchronously and return results in response
@@ -65,10 +66,15 @@ const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 interface ObserveResponse {
   success: true;
   id: string;
+  status: 'active' | 'draft';
   time_bound?: boolean;
-  exposure_check: 'queued';
+  exposure_check?: 'queued';
   exposure_result?: ExposureCheckResult;
   surprise?: number;
+  warnings?: {
+    missing_fields: Array<{ field: string; reason: string }>;
+    reasoning: string;
+  };
 }
 
 app.post('/', async (c) => {
@@ -123,11 +129,11 @@ app.post('/', async (c) => {
   }
   const timeBound = body.resolves_by !== undefined;
 
-  // ── Pre-creation guards (duplicate detection + completeness) ──
+  // ── Pre-creation guards ──
   // Generate content embedding early for duplicate check
   const contentEmbedding = await generateEmbedding(c.env.AI, body.content, config, requestId);
 
-  // Duplicate detection (two-phase: vector similarity → optional LLM)
+  // Duplicate detection (two-phase: vector similarity → optional LLM) — always blocks
   const dupCheck = await checkDuplicate(c.env, contentEmbedding, requestId);
   if (dupCheck.id && dupCheck.similarity >= config.dedupThreshold) {
     const existing = await c.env.DB.prepare(
@@ -157,35 +163,140 @@ app.post('/', async (c) => {
     }
   }
 
-  // Completeness check (atomicity + missing fields)
-  const completeness = await checkMemoryCompleteness(c.env, c.env.AI, config, {
-    content: body.content,
-    has_source: hasSource,
-    has_derived_from: hasDerivedFrom,
-    has_invalidates_if: Boolean(body.invalidates_if?.length),
-    has_confirms_if: Boolean(body.confirms_if?.length),
-    has_resolves_by: timeBound,
-    atomic_override: body.atomic_override,
-    requestId,
-  });
-  if (completeness && !completeness.is_complete && completeness.missing_fields.length > 0) {
-    return c.json({
-      success: false,
-      error: 'Memory incomplete',
-      missing_fields: completeness.missing_fields,
-      confidence: completeness.confidence,
-      reasoning: completeness.reasoning,
-    }, 422);
+  // Completeness check (advisory — creates draft if warnings, unless override)
+  let completenessWarnings: ObserveResponse['warnings'];
+  if (!body.override) {
+    const completeness = await checkMemoryCompleteness(c.env, c.env.AI, config, {
+      content: body.content,
+      has_source: hasSource,
+      has_derived_from: hasDerivedFrom,
+      has_invalidates_if: Boolean(body.invalidates_if?.length),
+      has_confirms_if: Boolean(body.confirms_if?.length),
+      has_resolves_by: timeBound,
+      atomic_override: body.atomic_override,
+      requestId,
+    });
+    if (completeness && !completeness.is_complete && completeness.missing_fields.length > 0) {
+      completenessWarnings = {
+        missing_fields: completeness.missing_fields,
+        reasoning: completeness.reasoning,
+      };
+    }
   }
 
+  const isDraft = Boolean(completenessWarnings);
+  const initialState = isDraft ? 'draft' : 'active';
   const now = Date.now();
   const id = generateId();
 
   const hasConditions = (body.invalidates_if && body.invalidates_if.length > 0) ||
     (body.confirms_if && body.confirms_if.length > 0);
 
-  // ── Everything that CAN start immediately DOES start immediately ──
-  // Nothing waits for anything it doesn't directly need.
+  // ── D1 insert (always runs — draft or active) ──
+  const startingConfidence = hasSource
+    ? await getStartingConfidenceForSource(c.env.DB, normalizedSource!)
+    : (timeBound ? TYPE_STARTING_CONFIDENCE.predict : TYPE_STARTING_CONFIDENCE.think);
+
+  const obsidianSources = body.obsidian_sources;
+  await c.env.DB.prepare(
+    `INSERT INTO memories (
+      id, content, source, source_url, derived_from,
+      assumes, invalidates_if, confirms_if,
+      outcome_condition, resolves_by,
+      starting_confidence, confirmations, times_tested, contradictions,
+      centrality, state, violations,
+      retracted, tags, obsidian_sources, session_id, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, '[]', 0, ?, ?, ?, ?)`
+  ).bind(
+    id,
+    body.content,
+    hasSource ? normalizedSource : null,
+    body.source_url || null,
+    hasDerivedFrom ? JSON.stringify(body.derived_from) : null,
+    body.assumes ? JSON.stringify(body.assumes) : null,
+    body.invalidates_if ? JSON.stringify(body.invalidates_if) : null,
+    body.confirms_if ? JSON.stringify(body.confirms_if) : null,
+    body.outcome_condition || null,
+    body.resolves_by || null,
+    startingConfidence,
+    initialState,
+    body.tags ? JSON.stringify(body.tags) : null,
+    obsidianSources ? JSON.stringify(obsidianSources) : null,
+    sessionId || null,
+    now
+  ).run();
+
+  // Edges + version recording (always, regardless of draft/active)
+  const postInsertTasks: Promise<unknown>[] = [];
+
+  if (hasDerivedFrom) {
+    const edgeStmts = body.derived_from!.map(sourceId =>
+      c.env.DB.prepare(
+        `INSERT INTO edges (id, source_id, target_id, edge_type, strength, created_at)
+         VALUES (?, ?, ?, 'derived_from', 1.0, ?)`
+      ).bind(generateId(), sourceId, id, now)
+    );
+    const centralityStmts = body.derived_from!.map(sourceId =>
+      c.env.DB.prepare(
+        `UPDATE memories SET centrality = centrality + 1, updated_at = ? WHERE id = ?`
+      ).bind(now, sourceId)
+    );
+    postInsertTasks.push(c.env.DB.batch([...edgeStmts, ...centralityStmts]));
+  }
+
+  postInsertTasks.push(recordVersion(c.env.DB, {
+    entityId: id,
+    entityType: 'memory',
+    changeType: 'created',
+    contentSnapshot: {
+      id,
+      content: body.content,
+      source: hasSource ? normalizedSource : undefined,
+      source_url: body.source_url || undefined,
+      derived_from: hasDerivedFrom ? body.derived_from : undefined,
+      assumes: body.assumes,
+      invalidates_if: body.invalidates_if,
+      confirms_if: body.confirms_if,
+      outcome_condition: body.outcome_condition,
+      resolves_by: body.resolves_by,
+      tags: body.tags,
+      obsidian_sources: obsidianSources,
+      starting_confidence: startingConfidence,
+      confirmations: 0,
+      times_tested: 0,
+      contradictions: 0,
+      centrality: 0,
+      state: initialState,
+      violations: [],
+      retracted: false,
+      time_bound: timeBound,
+    },
+    sessionId,
+    requestId,
+    userAgent,
+    ipHash,
+  }));
+
+  await Promise.all(postInsertTasks);
+
+  logField(c, 'memory_id', id);
+  logField(c, 'type', 'memory');
+  logField(c, 'state', initialState);
+  if (hasSource) logField(c, 'source', normalizedSource);
+  if (hasDerivedFrom) logField(c, 'derived_from', body.derived_from);
+
+  // ── Draft: D1 only, no vectorize or exposure check ──
+  if (isDraft) {
+    return c.json({
+      success: true,
+      id,
+      status: 'draft',
+      time_bound: timeBound || undefined,
+      warnings: completenessWarnings,
+    } satisfies ObserveResponse, 201);
+  }
+
+  // ── Active: full pipeline (vectorize + exposure check) ──
 
   // Generate condition embeddings (content embedding already computed above for dedup)
   const embeddingsP = (async () => {
@@ -205,98 +316,7 @@ app.post('/', async (c) => {
     };
   })();
 
-  // Starting confidence + D1 insert flow independently from embeddings
-  // Starting confidence feeds into the INSERT, so it must resolve first within this track
-  const d1WriteP = (async () => {
-    const startingConfidence = hasSource
-      ? await getStartingConfidenceForSource(c.env.DB, normalizedSource!)
-      : (timeBound ? TYPE_STARTING_CONFIDENCE.predict : TYPE_STARTING_CONFIDENCE.think);
-
-    // Memory INSERT (edges + version flow from this, but embeddings don't wait)
-    const obsidianSources = body.obsidian_sources;
-    await c.env.DB.prepare(
-      `INSERT INTO memories (
-        id, content, source, source_url, derived_from,
-        assumes, invalidates_if, confirms_if,
-        outcome_condition, resolves_by,
-        starting_confidence, confirmations, times_tested, contradictions,
-        centrality, state, violations,
-        retracted, tags, obsidian_sources, session_id, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'active', '[]', 0, ?, ?, ?, ?)`
-    ).bind(
-      id,
-      body.content,
-      hasSource ? normalizedSource : null,
-      body.source_url || null,
-      hasDerivedFrom ? JSON.stringify(body.derived_from) : null,
-      body.assumes ? JSON.stringify(body.assumes) : null,
-      body.invalidates_if ? JSON.stringify(body.invalidates_if) : null,
-      body.confirms_if ? JSON.stringify(body.confirms_if) : null,
-      body.outcome_condition || null,
-      body.resolves_by || null,
-      startingConfidence,
-      body.tags ? JSON.stringify(body.tags) : null,
-      obsidianSources ? JSON.stringify(obsidianSources) : null,
-      sessionId || null,
-      now
-    ).run();
-
-    // After INSERT: edges (batched) and version recording flow independently
-    const postInsertTasks: Promise<unknown>[] = [];
-
-    if (hasDerivedFrom) {
-      const edgeStmts = body.derived_from!.map(sourceId =>
-        c.env.DB.prepare(
-          `INSERT INTO edges (id, source_id, target_id, edge_type, strength, created_at)
-           VALUES (?, ?, ?, 'derived_from', 1.0, ?)`
-        ).bind(generateId(), sourceId, id, now)
-      );
-      const centralityStmts = body.derived_from!.map(sourceId =>
-        c.env.DB.prepare(
-          `UPDATE memories SET centrality = centrality + 1, updated_at = ? WHERE id = ?`
-        ).bind(now, sourceId)
-      );
-      postInsertTasks.push(c.env.DB.batch([...edgeStmts, ...centralityStmts]));
-    }
-
-    postInsertTasks.push(recordVersion(c.env.DB, {
-      entityId: id,
-      entityType: 'memory',
-      changeType: 'created',
-      contentSnapshot: {
-        id,
-        content: body.content,
-        source: hasSource ? normalizedSource : undefined,
-        source_url: body.source_url || undefined,
-        derived_from: hasDerivedFrom ? body.derived_from : undefined,
-        assumes: body.assumes,
-        invalidates_if: body.invalidates_if,
-        confirms_if: body.confirms_if,
-        outcome_condition: body.outcome_condition,
-        resolves_by: body.resolves_by,
-        tags: body.tags,
-        obsidian_sources: obsidianSources,
-        starting_confidence: startingConfidence,
-        confirmations: 0,
-        times_tested: 0,
-        contradictions: 0,
-        centrality: 0,
-        state: 'active',
-        violations: [],
-        retracted: false,
-        time_bound: timeBound,
-      },
-      sessionId,
-      requestId,
-      userAgent,
-      ipHash,
-    }));
-
-    await Promise.all(postInsertTasks);
-    return startingConfidence;
-  })();
-
-  // Vectorize upserts flow as soon as embeddings resolve — don't wait for D1
+  // Vectorize upserts
   const vectorizeP = (async () => {
     const embeddings = await embeddingsP;
 
@@ -330,14 +350,9 @@ app.post('/', async (c) => {
     return embeddings;
   })();
 
-  logField(c, 'memory_id', id);
-  logField(c, 'type', 'memory');
-  if (hasSource) logField(c, 'source', normalizedSource);
-  if (hasDerivedFrom) logField(c, 'derived_from', body.derived_from);
-
   // Sync mode: need everything settled before exposure check
   if (syncMode) {
-    const [embeddings] = await Promise.all([vectorizeP, d1WriteP]);
+    const embeddings = await vectorizeP;
     logOperation(c, 'exposure', 'sync_check', { entity_id: id });
 
     await c.env.DB.prepare(`
@@ -347,7 +362,6 @@ app.post('/', async (c) => {
     `).bind(now, id).run();
 
     try {
-      // Run exposure check + surprise in parallel (independent computations)
       const exposureP = hasSource
         ? checkExposures(c.env, id, body.content, embeddings.content)
         : checkExposuresForNewThought(
@@ -363,7 +377,6 @@ app.post('/', async (c) => {
 
       const completedAt = Date.now();
 
-      // Store exposure status + surprise in one write
       if (surprise != null) {
         await c.env.DB.prepare(`
           UPDATE memories
@@ -386,6 +399,7 @@ app.post('/', async (c) => {
       return c.json({
         success: true,
         id,
+        status: 'active',
         time_bound: timeBound || undefined,
         exposure_check: 'queued',
         exposure_result: exposureResult,
@@ -396,9 +410,8 @@ app.post('/', async (c) => {
     }
   }
 
-  // Async mode: persist first (D1 + vectors), then enqueue exposure.
-  // This guarantees queue workers never see a memory that is not fully stored.
-  const [embeddings] = await Promise.all([vectorizeP, d1WriteP]);
+  // Async mode: persist vectors, then enqueue exposure
+  const embeddings = await vectorizeP;
   const embedding = embeddings.content;
 
   const exposureJob: ExposureCheckJob = {
@@ -428,7 +441,6 @@ app.post('/', async (c) => {
       }
     );
 
-    // Persistence already succeeded; keep status pending so retries/reprocessing remain possible.
     await c.env.DB.prepare(`
       UPDATE memories
       SET exposure_check_status = 'pending', updated_at = ?
@@ -443,6 +455,7 @@ app.post('/', async (c) => {
   return c.json({
     success: true,
     id,
+    status: 'active',
     time_bound: timeBound || undefined,
     exposure_check: 'queued',
   } satisfies ObserveResponse, 201);

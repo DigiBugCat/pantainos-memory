@@ -57,10 +57,14 @@ async def observe(
     tags: Annotated[list[str] | None, Field(description="Optional tags for categorization")] = None,
     obsidian_sources: Annotated[list[str] | None, Field(description="Obsidian vault file paths that reference this memory")] = None,
     atomic_override: Annotated[bool | None, Field(description="Bypass atomicity check for intentionally composite notes")] = None,
+    override: Annotated[bool | None, Field(description="Skip completeness check — commit directly as active (use to force-commit a draft)")] = None,
 ) -> str:
     """Store a new memory. Every memory is a perception — what you saw, read, inferred, or predicted.
 
     At least one of `source` or `derived_from` is required.
+
+    If the completeness check has warnings, the memory is saved as a draft (not indexed, not
+    searchable). Re-call with override=true to commit it as active.
     """
     body = _body(
         content=content, source=source, source_url=source_url,
@@ -68,9 +72,27 @@ async def observe(
         confirms_if=confirms_if, assumes=assumes, resolves_by=resolves_by,
         outcome_condition=outcome_condition, tags=tags,
         obsidian_sources=obsidian_sources, atomic_override=atomic_override,
+        override=override,
     )
     data = await client.post("/observe", body)
-    result = f"Stored [{data.get('id', '?')}]\n{content[:100]}{'...' if len(content) > 100 else ''}"
+    mem_id = data.get("id", "?")
+    status = data.get("status", "active")
+    preview = f"{content[:100]}{'...' if len(content) > 100 else ''}"
+
+    if status == "draft":
+        warnings = data.get("warnings", {})
+        missing = warnings.get("missing_fields", [])
+        reasoning = warnings.get("reasoning", "")
+        result = f"Draft [{mem_id}] — saved but NOT committed\n{preview}\n"
+        if missing:
+            for f in missing:
+                result += f"\n- {f.get('field', '?')}: {f.get('reason', '')}"
+        if reasoning:
+            result += f"\n\n{reasoning}"
+        result += "\n\nTo commit: re-call observe with the same content and override: true"
+    else:
+        result = f"Stored [{mem_id}]\n{preview}"
+
     return await _with_notifications(result)
 
 
