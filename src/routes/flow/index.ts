@@ -23,6 +23,7 @@ import resolveRoute from './resolve.js';
 import refreshStatsRoute from './refresh-stats.js';
 import confirmRoute from './confirm.js';
 import violateRoute from './violate.js';
+import overrideRoute from './override.js';
 import retractRoute from './retract.js';
 
 type Variables = {
@@ -55,5 +56,6 @@ app.route('/refresh-stats', refreshStatsRoute);
 app.route('/confirm', confirmRoute);
 app.route('/violate', violateRoute);
 app.route('/retract', retractRoute);
+app.route('/override', overrideRoute);
 
 export default app;

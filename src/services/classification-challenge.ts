@@ -695,9 +695,9 @@ export function formatCompletenessOutput(completeness: MemoryCompleteness): stri
   let output = '';
 
   if (atomicityIssue) {
-    output += `\nATOMICITY VIOLATION: This memory contains multiple distinct insights that must be split into separate memories.\n`;
+    output += `\nATOMICITY: This memory contains multiple distinct insights — consider splitting into separate memories.\n`;
     output += `${atomicityIssue.reason}\n`;
-    output += `\nSplit into separate observe calls and link them via derived_from. If this is intentionally composite, pass atomic_override: true.\n`;
+    output += `\nSplit into separate observe calls and link them via derived_from, or use the override tool to commit as-is.\n`;
   }
 
   if (otherFields.length > 0) {
@@ -705,7 +705,7 @@ export function formatCompletenessOutput(completeness: MemoryCompleteness): stri
     for (const field of otherFields) {
       output += `- Consider adding ${field.field} (${field.reason})\n`;
     }
-    output += `\nUse the 'update' tool to add missing fields to this memory.`;
+    output += `\nUse update to add missing fields, or use the override tool to commit as-is.`;
   }
 
   return output;

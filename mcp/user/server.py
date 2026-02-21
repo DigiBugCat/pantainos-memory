@@ -57,14 +57,13 @@ async def observe(
     tags: Annotated[list[str] | None, Field(description="Optional tags for categorization")] = None,
     obsidian_sources: Annotated[list[str] | None, Field(description="Obsidian vault file paths that reference this memory")] = None,
     atomic_override: Annotated[bool | None, Field(description="Bypass atomicity check for intentionally composite notes")] = None,
-    override: Annotated[bool | None, Field(description="Skip completeness check — commit directly as active (use to force-commit a draft)")] = None,
 ) -> str:
     """Store a new memory. Every memory is a perception — what you saw, read, inferred, or predicted.
 
     At least one of `source` or `derived_from` is required.
 
     If the completeness check has warnings, the memory is saved as a draft (not indexed, not
-    searchable). Re-call with override=true to commit it as active.
+    searchable). Use the override tool to commit it.
     """
     body = _body(
         content=content, source=source, source_url=source_url,
@@ -72,7 +71,6 @@ async def observe(
         confirms_if=confirms_if, assumes=assumes, resolves_by=resolves_by,
         outcome_condition=outcome_condition, tags=tags,
         obsidian_sources=obsidian_sources, atomic_override=atomic_override,
-        override=override,
     )
     data = await client.post("/observe", body)
     mem_id = data.get("id", "?")
@@ -89,7 +87,7 @@ async def observe(
                 result += f"\n- {f.get('field', '?')}: {f.get('reason', '')}"
         if reasoning:
             result += f"\n\n{reasoning}"
-        result += "\n\nTo commit: re-call observe with the same content and override: true"
+        result += f'\n\nTo commit: call override(memory_id="{mem_id}")'
     else:
         result = f"Stored [{mem_id}]\n{preview}"
 
@@ -153,6 +151,20 @@ async def refresh_stats(
     """
     data = await client.post("/refresh-stats", {"summary_only": summary_only})
     return await _with_notifications(fmt.fmt_stats(data))
+
+
+@mcp.tool(annotations=_rw_idempotent)
+async def override(
+    memory_id: Annotated[str, Field(description="ID of the draft memory to commit")],
+) -> str:
+    """Commit a draft memory to active. Runs the full pipeline (vectorize + exposure check).
+
+    Use this after observe saves a memory as draft due to completeness warnings.
+    """
+    data = await client.post("/override", {"memory_id": memory_id})
+    if data.get("success"):
+        return await _with_notifications(f"Committed [{memory_id}] — now active and indexed")
+    return await _with_notifications(f"Failed: {data.get('error', 'unknown error')}")
 
 
 # ─── Read Tools ────────────────────────────────────────────────────────────────

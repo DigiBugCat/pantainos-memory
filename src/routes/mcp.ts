@@ -351,21 +351,20 @@ defineTool({
     name: 'observe',
     description: `Store a new memory. Every memory is a perception — what you saw, read, inferred, or predicted.
 
-ATOMICITY PRINCIPLE (enforced):
-Each memory MUST capture ONE atomic insight — a single claim, fact, observation, or prediction.
-If your content contains multiple distinct claims, split them into separate observe calls and link via derived_from.
+ATOMICITY PRINCIPLE:
+Each memory should capture ONE atomic insight — a single claim, fact, observation, or prediction.
+If your content contains multiple distinct claims, consider splitting into separate observe calls and linking via derived_from.
+Non-atomic content will be saved as a draft. Use the override tool to commit.
 
-NON-ATOMIC (will be rejected):
+NON-ATOMIC (saved as draft):
 - "Revenue hit $5B AND new CEO announced AND expanding to Europe" → 3 separate memories
 - "1) NVDA up 3% 2) analysts bullish 3) competitors lagging" → 3 separate memories
 - Multiple predictions bundled together → one memory per prediction
 
-ATOMIC (good):
+ATOMIC (committed immediately):
 - "Company X Q4 2025 revenue: $5.2B (beat estimates by 8%)"
 - "NVDA trading at $850, up 3% on 2026-02-17"
 - A single continuous quote from an earnings call (even if long)
-
-Use atomic_override: true ONLY for intentionally composite notes (rare).
 
 Set "source" for provenance (what you perceived from), "derived_from" for lineage (what memories informed this).
 Both can be set together. At least one is required.
@@ -398,7 +397,6 @@ All memories support invalidates_if/confirms_if conditions.`,
         tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for categorization' },
         obsidian_sources: { type: 'array', items: { type: 'string' }, description: 'Obsidian vault file paths that reference this memory' },
         atomic_override: { type: 'boolean', description: 'Bypass atomicity check for intentionally composite notes. Use sparingly.' },
-        override: { type: 'boolean', description: 'Skip completeness check entirely — commit directly as active (use when re-committing a draft).' },
       },
       required: ['content'],
     },
@@ -416,7 +414,6 @@ All memories support invalidates_if/confirms_if conditions.`,
         tags,
         obsidian_sources,
         atomic_override,
-        override,
       } = args as {
         content: string;
         source?: string;
@@ -430,7 +427,6 @@ All memories support invalidates_if/confirms_if conditions.`,
         tags?: string[];
         obsidian_sources?: string[];
         atomic_override?: boolean;
-        override?: boolean;
       };
 
       // Parse resolves_by: accepts date strings ("2026-03-15") or Unix timestamps
@@ -493,22 +489,20 @@ All memories support invalidates_if/confirms_if conditions.`,
         }
       }
 
-      // Completeness check (advisory — creates draft if warnings, unless override)
+      // Completeness check (advisory — saves as draft if warnings)
       let completenessWarnings: string | undefined;
-      if (!override) {
-        const completeness = await checkMemoryCompleteness(ctx.env, ctx.env.AI, config, {
-          content,
-          has_source: hasSource,
-          has_derived_from: hasDerivedFrom,
-          has_invalidates_if: Boolean(invalidates_if?.length),
-          has_confirms_if: Boolean(confirms_if?.length),
-          has_resolves_by: timeBound,
-          atomic_override,
-          requestId,
-        });
-        if (completeness && !completeness.is_complete && completeness.missing_fields.length > 0) {
-          completenessWarnings = formatCompletenessOutput(completeness);
-        }
+      const completeness = await checkMemoryCompleteness(ctx.env, ctx.env.AI, config, {
+        content,
+        has_source: hasSource,
+        has_derived_from: hasDerivedFrom,
+        has_invalidates_if: Boolean(invalidates_if?.length),
+        has_confirms_if: Boolean(confirms_if?.length),
+        has_resolves_by: timeBound,
+        atomic_override,
+        requestId,
+      });
+      if (completeness && !completeness.is_complete && completeness.missing_fields.length > 0) {
+        completenessWarnings = formatCompletenessOutput(completeness);
       }
 
       const isDraft = Boolean(completenessWarnings);
@@ -605,7 +599,7 @@ All memories support invalidates_if/confirms_if conditions.`,
       if (isDraft) {
         let response = `📋 Draft [${id}] — saved but NOT committed\n${content.substring(0, 100)}${content.length > 100 ? '...' : ''}`;
         response += `\n\n${completenessWarnings}`;
-        response += `\n\nTo commit: re-call observe with the same content and override: true`;
+        response += `\n\nTo commit: call override(memory_id="${id}")`;
         return textResult(response);
       }
 

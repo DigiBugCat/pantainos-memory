@@ -163,25 +163,23 @@ app.post('/', async (c) => {
     }
   }
 
-  // Completeness check (advisory — creates draft if warnings, unless override)
+  // Completeness check (advisory — saves as draft if warnings)
   let completenessWarnings: ObserveResponse['warnings'];
-  if (!body.override) {
-    const completeness = await checkMemoryCompleteness(c.env, c.env.AI, config, {
-      content: body.content,
-      has_source: hasSource,
-      has_derived_from: hasDerivedFrom,
-      has_invalidates_if: Boolean(body.invalidates_if?.length),
-      has_confirms_if: Boolean(body.confirms_if?.length),
-      has_resolves_by: timeBound,
-      atomic_override: body.atomic_override,
-      requestId,
-    });
-    if (completeness && !completeness.is_complete && completeness.missing_fields.length > 0) {
-      completenessWarnings = {
-        missing_fields: completeness.missing_fields,
-        reasoning: completeness.reasoning,
-      };
-    }
+  const completeness = await checkMemoryCompleteness(c.env, c.env.AI, config, {
+    content: body.content,
+    has_source: hasSource,
+    has_derived_from: hasDerivedFrom,
+    has_invalidates_if: Boolean(body.invalidates_if?.length),
+    has_confirms_if: Boolean(body.confirms_if?.length),
+    has_resolves_by: timeBound,
+    atomic_override: body.atomic_override,
+    requestId,
+  });
+  if (completeness && !completeness.is_complete && completeness.missing_fields.length > 0) {
+    completenessWarnings = {
+      missing_fields: completeness.missing_fields,
+      reasoning: completeness.reasoning,
+    };
   }
 
   const isDraft = Boolean(completenessWarnings);
