@@ -518,16 +518,28 @@ resource "cloudflare_zero_trust_access_application" "api" {
   http_only_cookie_attribute = true
   same_site_cookie_attribute = "lax"
 
-  policies = [{
-    name       = "Allow authorized users"
-    decision   = "allow"
-    precedence = 1
-    include = [{
-      group = {
-        id = cloudflare_zero_trust_access_group.memory_users.id
-      }
-    }]
-  }]
+  policies = [
+    {
+      name       = "Allow service token"
+      decision   = "non_identity"
+      precedence = 1
+      include = [{
+        service_token = {
+          token_id = cloudflare_zero_trust_access_service_token.mcp.id
+        }
+      }]
+    },
+    {
+      name       = "Allow authorized users"
+      decision   = "allow"
+      precedence = 2
+      include = [{
+        group = {
+          id = cloudflare_zero_trust_access_group.memory_users.id
+        }
+      }]
+    },
+  ]
 
   # No depends_on - Access app can be created before worker exists
   # This allows worker to reference the AUD in its bindings
