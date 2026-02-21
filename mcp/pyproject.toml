@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "FastMCP proxy frontends for Pantainos Memory"
 requires-python = ">=3.12"
 dependencies = [
-  "fastmcp>=2.12.0",
+  "fastmcp>=3.0.0",
   "httpx>=0.28.0",
   "pydantic-settings>=2.0.0",
 ]
