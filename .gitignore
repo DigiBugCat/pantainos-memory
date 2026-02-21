@@ -38,3 +38,7 @@ npm-debug.log*
 # TypeScript
 *.tsbuildinfo
 .mcp.json
+
+# FastMCP Python venv
+mcp/.venv/
+mcp/*.egg-info/

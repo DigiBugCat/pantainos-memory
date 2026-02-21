@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pantainos-mcp"
+version = "0.1.0"
+description = "FastMCP proxy frontends for Pantainos Memory"
+requires-python = ">=3.12"
+dependencies = [
+  "fastmcp>=2.12.0",
+  "httpx>=0.28.0",
+  "pydantic-settings>=2.0.0",
+]
+
+[project.scripts]
+pantainos-mcp-user = "user.server:cli"
+pantainos-mcp-admin = "admin.server:cli"
+
+[tool.setuptools]
+py-modules = ["client", "config", "notifications"]
+
+[tool.setuptools.packages.find]
+include = ["user*", "admin*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
