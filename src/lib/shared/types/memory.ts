@@ -324,6 +324,10 @@ export interface MemoryRequest {
   /** What determines success/failure (required if resolves_by set) */
   outcome_condition?: string;
   tags?: string[];
+  /** Obsidian vault file paths that reference this memory */
+  obsidian_sources?: string[];
+  /** Bypass atomicity check for intentionally composite notes */
+  atomic_override?: boolean;
 }
 
 /** Manual confirmation of a memory */

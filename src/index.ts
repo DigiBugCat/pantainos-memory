@@ -25,6 +25,7 @@ import graphRoutes from './routes/graph.js';
 import experimentsRoutes from './experiments/index.js';
 import mcpRoutes from './routes/mcp.js';
 import internalRoutes from './routes/internal.js';
+import adminRoutes from './routes/admin.js';
 
 // Services for inline processing (no workflows)
 import { checkExposures, checkExposuresForNewThought } from './services/exposure-checker.js';
@@ -47,6 +48,7 @@ import { runFullGraphPropagation } from './services/propagation.js';
 import { computeSurprise } from './services/surprise.js';
 import { buildZoneHealth } from './services/zone-builder.js';
 import type { ZoneHealthReport } from './services/zone-builder.js';
+import { getStatsSummary } from './usecases/stats-summary.js';
 
 // Extend Env with LoggingEnv for proper typing
 type Env = BaseEnv & LoggingEnv;
@@ -314,62 +316,13 @@ app.get('/api/config', (c) => {
 
 // Stats endpoint - v4 architecture
 app.get('/api/stats', async (c) => {
-  // Count memories by type using field presence
-  const obsCount = await c.env.DB.prepare(
-    `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND source IS NOT NULL`
-  ).first<{ count: number }>();
-
-  const thoughtCount = await c.env.DB.prepare(
-    `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND source IS NULL AND derived_from IS NOT NULL AND resolves_by IS NULL`
-  ).first<{ count: number }>();
-
-  const predictionCount = await c.env.DB.prepare(
-    `SELECT COUNT(*) as count FROM memories WHERE retracted = 0 AND source IS NULL AND resolves_by IS NOT NULL`
-  ).first<{ count: number }>();
-
-  const counts = {
-    observation: obsCount?.count || 0,
-    thought: thoughtCount?.count || 0,
-    prediction: predictionCount?.count || 0,
-  };
-
-  // Count edges
-  const edgeCount = await c.env.DB.prepare(
-    'SELECT COUNT(*) as count FROM edges'
-  ).first<{ count: number }>();
-
-  // Get robustness stats (times_tested distribution)
-  const robustnessStats = await c.env.DB.prepare(`
-    SELECT
-      CASE
-        WHEN times_tested < 3 THEN 'untested'
-        WHEN times_tested < 10 THEN 'brittle'
-        WHEN CAST(confirmations AS REAL) / CASE WHEN times_tested = 0 THEN 1 ELSE times_tested END >= 0.7 THEN 'robust'
-        ELSE 'tested'
-      END as robustness,
-      COUNT(*) as count
-    FROM memories
-    WHERE retracted = 0
-    GROUP BY robustness
-  `).all<{ robustness: string; count: number }>();
-
-  // Get violation count
-  const violatedCount = await c.env.DB.prepare(
-    `SELECT COUNT(*) as count FROM memories WHERE json_array_length(violations) > 0`
-  ).first<{ count: number }>();
+  const summary = await getStatsSummary(c.env.DB);
 
   return c.json({
-    memories: {
-      observation: counts.observation,
-      thought: counts.thought,
-      prediction: counts.prediction,
-      total: counts.observation + counts.thought + counts.prediction,
-    },
-    edges: edgeCount?.count || 0,
-    robustness: Object.fromEntries(
-      (robustnessStats.results || []).map(r => [r.robustness, r.count])
-    ),
-    violated: violatedCount?.count || 0,
+    memories: summary.memories,
+    edges: summary.edges,
+    robustness: summary.robustness,
+    violated: summary.violated,
   });
 });
 
@@ -426,6 +379,16 @@ app.use('/internal/*', async (c, next) => {
   await next();
 });
 app.route('/internal', internalRoutes);
+
+// Admin routes (service-token auth, same pattern as internal routes)
+app.use('/api/admin/*', async (c, next) => {
+  const serviceTokenId = c.req.header('CF-Access-Client-Id');
+  if (!serviceTokenId) {
+    return c.json({ success: false, error: 'Unauthorized — requires CF Access service token' }, 401);
+  }
+  await next();
+});
+app.route('/api/admin', adminRoutes);
 
 // MCP routes (Model Context Protocol for Claude Code integration)
 // Protected by OAuth token validation or CF Access service token
@@ -795,6 +758,14 @@ async function dispatchSessionEvents(
   );
 
   const succeeded = results.filter((r) => r.status === 'fulfilled').length;
+  const claimedEventCount = events.length;
+  const attemptedDispatchEventCount = dispatches.reduce((sum, d) => sum + d.eventIds.length, 0);
+  const dispatchedEventCount = dispatches
+    .filter((_, idx) => results[idx]?.status === 'fulfilled')
+    .reduce((sum, d) => sum + d.eventIds.length, 0);
+  const releasedEventCount = dispatches
+    .filter((_, idx) => results[idx]?.status === 'rejected')
+    .reduce((sum, d) => sum + d.eventIds.length, 0);
   const failed = results.filter((r) => r.status === 'rejected');
 
   for (const f of failed) {
@@ -812,6 +783,11 @@ async function dispatchSessionEvents(
     dispatches_succeeded: succeeded,
     dispatches_failed: failed.length,
     event_count: events.length,
+    claimed_event_count: claimedEventCount,
+    attempted_dispatch_event_count: attemptedDispatchEventCount,
+    dispatched_event_count: dispatchedEventCount,
+    released_event_count: releasedEventCount,
+    claim_dispatch_mismatch: claimedEventCount !== attemptedDispatchEventCount,
     violations: violations.length,
     confirmations: confirmations.length,
     cascades: cascades.length,

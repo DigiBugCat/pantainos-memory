@@ -37,13 +37,19 @@ import { logField, logOperation, logError } from '../../lib/shared/logging/index
 import type { Env } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
 import { generateId } from '../../lib/id.js';
-import { normalizeSource, isNonEmptySource } from '../../lib/source.js';
-import { generateAllEmbeddings } from '../../services/embedding-tables.js';
+import { generateEmbedding, checkDuplicate, checkDuplicateWithLLM } from '../../lib/embeddings.js';
 import { recordVersion } from '../../services/history-service.js';
 import { checkExposures, checkExposuresForNewThought } from '../../services/exposure-checker.js';
 import { computeSurprise } from '../../services/surprise.js';
 import { TYPE_STARTING_CONFIDENCE } from '../../services/confidence.js';
 import { getStartingConfidenceForSource } from '../../jobs/compute-stats.js';
+import { checkMemoryCompleteness } from '../../services/classification-challenge.js';
+import {
+  normalizeAndValidateSource,
+  validateDerivedFromIds,
+  validateOrigin,
+  validateTimeBound,
+} from '../../usecases/observe-memory.js';
 
 type Variables = {
   config: Config;
@@ -88,50 +94,88 @@ app.post('/', async (c) => {
   }
 
   // Normalize source before validation/persistence
-  let normalizedSource: string | undefined;
-  if (body.source !== undefined && body.source !== null) {
-    if (typeof body.source !== 'string' || !isNonEmptySource(body.source)) {
-      return c.json({ success: false, error: 'source must be a non-empty string when provided' }, 400);
-    }
-    normalizedSource = normalizeSource(body.source);
+  const sourceValidation = normalizeAndValidateSource(body.source);
+  if (sourceValidation.error) {
+    return c.json({ success: false, error: sourceValidation.error }, 400);
   }
+  const normalizedSource = sourceValidation.normalizedSource;
 
   // Validate origin: at least one of source or derived_from required
+  const originError = validateOrigin(normalizedSource, body.derived_from);
+  if (originError) {
+    return c.json({ success: false, error: originError }, 400);
+  }
   const hasSource = normalizedSource !== undefined;
   const hasDerivedFrom = body.derived_from !== undefined && body.derived_from !== null && body.derived_from.length > 0;
 
-  if (!hasSource && !hasDerivedFrom) {
-    return c.json(
-      { success: false, error: 'Either "source" or "derived_from" is required' },
-      400
-    );
-  }
-
   // Field-specific validation
   if (hasDerivedFrom) {
-    // Validate derived_from existence
-    const placeholders = body.derived_from!.map(() => '?').join(',');
-    const sources = await c.env.DB.prepare(
-      `SELECT id FROM memories WHERE id IN (${placeholders}) AND retracted = 0`
-    ).bind(...body.derived_from!).all<{ id: string }>();
-
-    if (!sources.results || sources.results.length !== body.derived_from!.length) {
-      const foundIds = new Set(sources.results?.map((r) => r.id) || []);
-      const missing = body.derived_from!.filter((id) => !foundIds.has(id));
-      return c.json(
-        { success: false, error: `Source memories not found: ${missing.join(', ')}` },
-        404
-      );
+    const derivedFromError = await validateDerivedFromIds(c.env.DB, body.derived_from);
+    if (derivedFromError) {
+      return c.json({ success: false, error: derivedFromError }, 404);
     }
   }
 
   // Time-bound validation
+  const timeBoundError = validateTimeBound(body.resolves_by, body.outcome_condition);
+  if (timeBoundError) {
+    return c.json({ success: false, error: timeBoundError }, 400);
+  }
   const timeBound = body.resolves_by !== undefined;
-  if (timeBound && !body.outcome_condition) {
-    return c.json(
-      { success: false, error: 'outcome_condition is required when resolves_by is set' },
-      400
-    );
+
+  // ── Pre-creation guards (duplicate detection + completeness) ──
+  // Generate content embedding early for duplicate check
+  const contentEmbedding = await generateEmbedding(c.env.AI, body.content, config, requestId);
+
+  // Duplicate detection (two-phase: vector similarity → optional LLM)
+  const dupCheck = await checkDuplicate(c.env, contentEmbedding, requestId);
+  if (dupCheck.id && dupCheck.similarity >= config.dedupThreshold) {
+    const existing = await c.env.DB.prepare(
+      `SELECT content FROM memories WHERE id = ?`
+    ).bind(dupCheck.id).first<{ content: string }>();
+    return c.json({
+      success: false,
+      error: `Duplicate detected (${Math.round(dupCheck.similarity * 100)}% match)`,
+      duplicate_id: dupCheck.id,
+      duplicate_content: existing?.content || null,
+    }, 409);
+  } else if (dupCheck.id && dupCheck.similarity >= config.dedupLowerThreshold) {
+    const existing = await c.env.DB.prepare(
+      `SELECT content FROM memories WHERE id = ?`
+    ).bind(dupCheck.id).first<{ content: string }>();
+    if (existing) {
+      const llmResult = await checkDuplicateWithLLM(c.env.AI, body.content, existing.content, config, requestId, c.env);
+      if (llmResult.isDuplicate && llmResult.confidence >= config.dedupConfidenceThreshold) {
+        return c.json({
+          success: false,
+          error: `Duplicate detected (LLM: ${Math.round(llmResult.confidence * 100)}% confidence)`,
+          duplicate_id: dupCheck.id,
+          duplicate_content: existing.content,
+          reasoning: llmResult.reasoning,
+        }, 409);
+      }
+    }
+  }
+
+  // Completeness check (atomicity + missing fields)
+  const completeness = await checkMemoryCompleteness(c.env, c.env.AI, config, {
+    content: body.content,
+    has_source: hasSource,
+    has_derived_from: hasDerivedFrom,
+    has_invalidates_if: Boolean(body.invalidates_if?.length),
+    has_confirms_if: Boolean(body.confirms_if?.length),
+    has_resolves_by: timeBound,
+    atomic_override: body.atomic_override,
+    requestId,
+  });
+  if (completeness && !completeness.is_complete && completeness.missing_fields.length > 0) {
+    return c.json({
+      success: false,
+      error: 'Memory incomplete',
+      missing_fields: completeness.missing_fields,
+      confidence: completeness.confidence,
+      reasoning: completeness.reasoning,
+    }, 422);
   }
 
   const now = Date.now();
@@ -143,13 +187,23 @@ app.post('/', async (c) => {
   // ── Everything that CAN start immediately DOES start immediately ──
   // Nothing waits for anything it doesn't directly need.
 
-  // Kick off embedding generation immediately — slowest operation, don't block on anything
-  const embeddingsP = generateAllEmbeddings(c.env.AI, config, {
-    content: body.content,
-    invalidates_if: hasConditions ? body.invalidates_if : undefined,
-    confirms_if: hasConditions ? body.confirms_if : undefined,
-    requestId,
-  });
+  // Generate condition embeddings (content embedding already computed above for dedup)
+  const embeddingsP = (async () => {
+    const conditionTasks: Promise<number[]>[] = [];
+    for (const condition of (hasConditions ? body.invalidates_if : undefined) ?? []) {
+      conditionTasks.push(generateEmbedding(c.env.AI, condition, config, requestId));
+    }
+    for (const condition of (hasConditions ? body.confirms_if : undefined) ?? []) {
+      conditionTasks.push(generateEmbedding(c.env.AI, condition, config, requestId));
+    }
+    const condResults = await Promise.all(conditionTasks);
+    const invCount = (hasConditions ? body.invalidates_if?.length : 0) ?? 0;
+    return {
+      content: contentEmbedding,
+      invalidates: condResults.slice(0, invCount),
+      confirms: condResults.slice(invCount),
+    };
+  })();
 
   // Starting confidence + D1 insert flow independently from embeddings
   // Starting confidence feeds into the INSERT, so it must resolve first within this track
@@ -159,6 +213,7 @@ app.post('/', async (c) => {
       : (timeBound ? TYPE_STARTING_CONFIDENCE.predict : TYPE_STARTING_CONFIDENCE.think);
 
     // Memory INSERT (edges + version flow from this, but embeddings don't wait)
+    const obsidianSources = body.obsidian_sources;
     await c.env.DB.prepare(
       `INSERT INTO memories (
         id, content, source, source_url, derived_from,
@@ -166,8 +221,8 @@ app.post('/', async (c) => {
         outcome_condition, resolves_by,
         starting_confidence, confirmations, times_tested, contradictions,
         centrality, state, violations,
-        retracted, tags, session_id, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'active', '[]', 0, ?, ?, ?)`
+        retracted, tags, obsidian_sources, session_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'active', '[]', 0, ?, ?, ?, ?)`
     ).bind(
       id,
       body.content,
@@ -181,6 +236,7 @@ app.post('/', async (c) => {
       body.resolves_by || null,
       startingConfidence,
       body.tags ? JSON.stringify(body.tags) : null,
+      obsidianSources ? JSON.stringify(obsidianSources) : null,
       sessionId || null,
       now
     ).run();
@@ -219,6 +275,7 @@ app.post('/', async (c) => {
         outcome_condition: body.outcome_condition,
         resolves_by: body.resolves_by,
         tags: body.tags,
+        obsidian_sources: obsidianSources,
         starting_confidence: startingConfidence,
         confirmations: 0,
         times_tested: 0,
@@ -339,9 +396,10 @@ app.post('/', async (c) => {
     }
   }
 
-  // Async mode: queue send only needs embeddings — flows as soon as they're ready
-  // D1 writes and vectorize upserts continue in parallel
-  const embedding = (await embeddingsP).content;
+  // Async mode: persist first (D1 + vectors), then enqueue exposure.
+  // This guarantees queue workers never see a memory that is not fully stored.
+  const [embeddings] = await Promise.all([vectorizeP, d1WriteP]);
+  const embedding = embeddings.content;
 
   const exposureJob: ExposureCheckJob = {
     memory_id: id,
@@ -356,12 +414,29 @@ app.post('/', async (c) => {
     time_bound: timeBound,
   };
 
-  // Queue send, D1 writes, and vectorize upserts all settle together
-  await Promise.all([
-    c.env.DETECTION_QUEUE.send(exposureJob),
-    d1WriteP,
-    vectorizeP,
-  ]);
+  try {
+    await c.env.DETECTION_QUEUE.send(exposureJob);
+  } catch (error) {
+    const failedAt = Date.now();
+    logError(
+      'observe_queue_enqueue_failed',
+      error instanceof Error ? error : String(error),
+      {
+        memory_id: id,
+        session_id: sessionId,
+        request_id: requestId,
+      }
+    );
+
+    // Persistence already succeeded; keep status pending so retries/reprocessing remain possible.
+    await c.env.DB.prepare(`
+      UPDATE memories
+      SET exposure_check_status = 'pending', updated_at = ?
+      WHERE id = ?
+    `).bind(failedAt, id).run();
+
+    throw error;
+  }
 
   logOperation(c, 'exposure', 'queued', { entity_id: id });
 

@@ -35,6 +35,10 @@ import graveyardRoute from './graveyard.js';
 import historyRoute from './history.js';
 import accessLogRoute from './access-log.js';
 import statsRoute from './stats.js';
+import zonesRoute from './zones.js';
+import surprisingRoute from './surprising.js';
+import sessionRecapRoute from './session-recap.js';
+import notificationsRoute from './notifications.js';
 
 type Variables = {
   config: Config;
@@ -65,5 +69,11 @@ app.route('/access-log', accessLogRoute);
 
 // Stats route
 app.route('/stats', statsRoute);
+
+// New routes for FastMCP migration
+app.route('/zones', zonesRoute);
+app.route('/surprising', surprisingRoute);
+app.route('/session-recap', sessionRecapRoute);
+app.route('/notifications/pending', notificationsRoute);
 
 export default app;

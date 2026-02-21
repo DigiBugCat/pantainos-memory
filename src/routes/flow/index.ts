@@ -18,6 +18,9 @@ import { bodyLimitPresets, memoryFieldLimits } from '../../lib/shared/middleware
 import type { Env } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
 import observeRoute from './observe.js';
+import updateRoute from './update.js';
+import resolveRoute from './resolve.js';
+import refreshStatsRoute from './refresh-stats.js';
 import confirmRoute from './confirm.js';
 import violateRoute from './violate.js';
 import retractRoute from './retract.js';
@@ -46,6 +49,9 @@ app.use('*', memoryFieldLimits);
 // Mount flow routes
 // /observe handles both observations (source) and thoughts (derived_from)
 app.route('/observe', observeRoute);
+app.route('/update', updateRoute);
+app.route('/resolve', resolveRoute);
+app.route('/refresh-stats', refreshStatsRoute);
 app.route('/confirm', confirmRoute);
 app.route('/violate', violateRoute);
 app.route('/retract', retractRoute);
