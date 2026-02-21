@@ -18,7 +18,7 @@ pantainos-mcp-user = "user.server:cli"
 pantainos-mcp-admin = "admin.server:cli"
 
 [tool.setuptools]
-py-modules = ["client", "config", "notifications"]
+py-modules = ["client", "config", "formatters", "notifications"]
 
 [tool.setuptools.packages.find]
 include = ["user*", "admin*"]
