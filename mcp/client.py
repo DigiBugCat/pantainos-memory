@@ -10,10 +10,16 @@ from config import CF_WORKER_URL, CF_CLIENT_ID, CF_CLIENT_SECRET
 
 
 def _base_headers() -> dict[str, str]:
+    import logging
+    logger = logging.getLogger(__name__)
     headers: dict[str, str] = {}
     if CF_CLIENT_ID and CF_CLIENT_SECRET:
         headers["CF-Access-Client-Id"] = CF_CLIENT_ID
         headers["CF-Access-Client-Secret"] = CF_CLIENT_SECRET
+        logger.info("CF Access headers configured (ID: %s...)", CF_CLIENT_ID[:12])
+    else:
+        logger.warning("CF Access headers NOT configured — CF_CLIENT_ID=%r, CF_CLIENT_SECRET=%s",
+                       CF_CLIENT_ID, "set" if CF_CLIENT_SECRET else "empty")
     return headers
 
 
@@ -31,6 +37,14 @@ def _get_client() -> httpx.AsyncClient:
     return _client
 
 
+def _extra_headers(session_id: str | None = None) -> dict[str, str]:
+    """Build per-request headers (merged with client-level headers by httpx)."""
+    headers: dict[str, str] = {}
+    if session_id:
+        headers["X-Session-Id"] = session_id
+    return headers
+
+
 async def post(
     path: str,
     body: dict[str, Any],
@@ -38,10 +52,9 @@ async def post(
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """POST JSON to CF Worker and return parsed response."""
-    headers: dict[str, str] = {}
-    if session_id:
-        headers["X-Session-Id"] = session_id
-    resp = await _get_client().post(f"/api{path}", json=body, headers=headers)
+    resp = await _get_client().post(
+        f"/api{path}", json=body, headers=_extra_headers(session_id)
+    )
     resp.raise_for_status()
     return resp.json()  # type: ignore[no-any-return]
 
@@ -53,9 +66,8 @@ async def get(
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """GET from CF Worker and return parsed response."""
-    headers: dict[str, str] = {}
-    if session_id:
-        headers["X-Session-Id"] = session_id
-    resp = await _get_client().get(f"/api{path}", params=params, headers=headers)
+    resp = await _get_client().get(
+        f"/api{path}", params=params, headers=_extra_headers(session_id)
+    )
     resp.raise_for_status()
     return resp.json()  # type: ignore[no-any-return]
