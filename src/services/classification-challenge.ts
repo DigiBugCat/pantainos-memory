@@ -645,6 +645,14 @@ export async function checkMemoryCompleteness(
       return null;
     }
 
+    // Strip atomicity violations when atomic_override is set (LLM may still hallucinate them)
+    if (params.atomic_override) {
+      result.missing_fields = result.missing_fields.filter(f => f.field !== 'atomicity');
+      if (result.missing_fields.length === 0) {
+        result.is_complete = true;
+      }
+    }
+
     // Only return if:
     // 1. Memory is incomplete according to LLM
     // 2. Confidence is above threshold
