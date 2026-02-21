@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS memories (
 
   -- State
   violations TEXT DEFAULT '[]',
-  state TEXT DEFAULT 'active' CHECK(state IN ('active', 'confirmed', 'violated', 'resolved')),
+  state TEXT DEFAULT 'active' CHECK(state IN ('active', 'confirmed', 'violated', 'resolved', 'draft')),
   outcome TEXT CHECK(outcome IN ('correct', 'incorrect', 'voided', 'superseded')),
   resolved_at INTEGER,
   retracted INTEGER DEFAULT 0,
@@ -176,6 +176,7 @@ CREATE TABLE IF NOT EXISTS edges (
   )),
   strength REAL DEFAULT 1.0,  -- For strengthen/weaken operations
   created_at INTEGER NOT NULL,
+  updated_at INTEGER,
   FOREIGN KEY (source_id) REFERENCES memories(id) ON DELETE CASCADE,
   FOREIGN KEY (target_id) REFERENCES memories(id) ON DELETE CASCADE
 );
@@ -183,6 +184,9 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
 CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_source_target_type ON edges(source_id, target_id, edge_type);
+CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(target_id, edge_type);
+CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(source_id, edge_type);
 
 
 -- ============================================
@@ -242,6 +246,21 @@ CREATE TABLE IF NOT EXISTS memory_events (
     'thought:evidence_invalidated',
     -- Overdue prediction resolution
     'thought:pending_resolution',
+    -- Legacy event types (kept for DB backward compatibility)
+    'prediction_confirmed',
+    'prediction_resolved',
+    'assumption_confirmed',
+    'assumption_resolved',
+    'prediction:cascade_review',
+    'prediction:cascade_boost',
+    'prediction:cascade_damage',
+    'assumption:cascade_review',
+    'assumption:cascade_boost',
+    'assumption:cascade_damage',
+    'prediction:evidence_validated',
+    'prediction:evidence_invalidated',
+    'assumption:evidence_validated',
+    'assumption:evidence_invalidated',
     -- Deprecated (kept for existing data)
     'thought:cascade_boost',
     'thought:cascade_damage'
@@ -261,6 +280,7 @@ CREATE INDEX IF NOT EXISTS idx_events_session ON memory_events(session_id, creat
 CREATE INDEX IF NOT EXISTS idx_events_pending ON memory_events(dispatched, session_id, created_at)
   WHERE dispatched = 0;
 CREATE INDEX IF NOT EXISTS idx_events_workflow ON memory_events(workflow_id) WHERE workflow_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_events_memory_event_type ON memory_events(memory_id, event_type);
 
 
 -- ============================================
@@ -274,7 +294,8 @@ CREATE TABLE IF NOT EXISTS entity_versions (
   version_number INTEGER NOT NULL,
   content_snapshot TEXT NOT NULL,  -- JSON of full entity at this version
   change_type TEXT NOT NULL CHECK(change_type IN (
-    'created', 'updated', 'violated', 'confirmed', 'retracted'
+    'created', 'updated', 'violated', 'confirmed', 'retracted',
+    'resolved', 'status_changed', 'reclassified_as_observation', 'reclassified_as_thought'
   )),
   change_reason TEXT,
   changed_fields TEXT,      -- JSON array of field names that changed
