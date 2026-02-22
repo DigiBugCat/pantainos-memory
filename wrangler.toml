@@ -1,6 +1,6 @@
 # Pantainos Memory - Zettelkasten Knowledge Graph
 #
-# Authentication: MCP OAuth 2.0 backed by Cloudflare Access
+# Authentication: Cloudflare Access (MCP via external FastMCP proxy)
 #
 # IMPORTANT: Terraform (infra/) is the source of truth for production.
 # This file is used for `pnpm dev` (local) and `--env dev` only.
@@ -48,11 +48,6 @@ binding = "AI"
 binding = "ANALYTICS"
 dataset = "memory_prod"
 
-# OAuth KV (for MCP authentication state)
-[[kv_namespaces]]
-binding = "OAUTH_KV"
-id = "44a53cd6bcbd4aadae45c51d1769b204"
-
 # Detection Queue
 [[queues.producers]]
 queue = "pantainos-memory-detection"
@@ -62,6 +57,13 @@ binding = "DETECTION_QUEUE"
 queue = "pantainos-memory-detection"
 max_batch_size = 10
 max_batch_timeout = 5
+max_retries = 3
+dead_letter_queue = "pantainos-memory-detection-dlq"
+
+# Dead Letter Queue for failed commits
+[[queues.producers]]
+queue = "pantainos-memory-detection-dlq"
+binding = "DETECTION_DLQ"
 
 # Configuration Variables
 [vars]
@@ -74,7 +76,8 @@ RESOLVER_TYPE = "github"
 RESOLVER_GITHUB_REPO = "DigiBugCat/Cassandra-Finance"
 CLASSIFICATION_CHALLENGE_ENABLED = "true"
 LLM_JUDGE_URL = "https://api.openai.com/v1/chat/completions"
-LLM_JUDGE_MODEL = "gpt-5-mini"
+LLM_JUDGE_MODEL = "gpt-5.2"
+EXPOSURE_LLM_MAX_CONCURRENCY = "20"
 
 # ============================================
 # Dev Environment
@@ -95,12 +98,13 @@ RESOLVER_TYPE = "github"
 RESOLVER_GITHUB_REPO = "DigiBugCat/Cassandra-Finance"
 CLASSIFICATION_CHALLENGE_ENABLED = "true"
 LLM_JUDGE_URL = "https://api.openai.com/v1/chat/completions"
-LLM_JUDGE_MODEL = "gpt-5-mini"
+LLM_JUDGE_MODEL = "gpt-5.2"
 # Exposure check thresholds (lower = more sensitive)
 MIN_SIMILARITY = "0.35"
 VIOLATION_CONFIDENCE_THRESHOLD = "0.6"
 CONFIRM_CONFIDENCE_THRESHOLD = "0.7"
 MAX_CANDIDATES = "30"
+EXPOSURE_LLM_MAX_CONCURRENCY = "20"
 
 [[env.dev.d1_databases]]
 binding = "DB"
@@ -128,15 +132,16 @@ binding = "DETECTION_QUEUE"
 queue = "pantainos-memory-dev-detection"
 max_batch_size = 10
 max_batch_timeout = 5
+max_retries = 3
+dead_letter_queue = "pantainos-memory-dev-detection-dlq"
+
+[[env.dev.queues.producers]]
+queue = "pantainos-memory-dev-detection-dlq"
+binding = "DETECTION_DLQ"
 
 [[env.dev.analytics_engine_datasets]]
 binding = "ANALYTICS"
 dataset = "memory_dev"
-
-# OAuth KV (for MCP authentication state)
-[[env.dev.kv_namespaces]]
-binding = "OAUTH_KV"
-id = "8945fd577d87400c8f14dcfbd354aa88"
 
 # Local dev server
 [dev]

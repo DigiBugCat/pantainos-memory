@@ -11,20 +11,10 @@ output "api_url" {
   value       = "https://${local.api_url}"
 }
 
-output "mcp_url" {
-  description = "MCP worker URL (MCP OAuth + CF Access identity)"
-  value       = "https://${local.mcp_url}"
-}
-
 # Resource IDs
 output "d1_database_id" {
   description = "D1 database ID"
   value       = cloudflare_d1_database.memory.id
-}
-
-output "kv_namespace_id" {
-  description = "KV namespace ID"
-  value       = cloudflare_workers_kv_namespace.oauth.id
 }
 
 output "queue_name" {
@@ -38,11 +28,6 @@ output "cf_access_aud_api" {
   value       = cloudflare_zero_trust_access_application.api.aud
 }
 
-output "cf_access_aud_mcp" {
-  description = "CF Access AUD for MCP worker"
-  value       = cloudflare_zero_trust_access_application.mcp.aud
-}
-
 # Vectorize names (for reference)
 output "vectorize_indexes" {
   description = "Vectorize index names"
@@ -53,14 +38,14 @@ output "vectorize_indexes" {
   }
 }
 
-# Service Token for MCP access
+# Service Token for FastMCP proxy access
 output "mcp_service_token_id" {
-  description = "CF Access service token ID for MCP"
+  description = "CF Access service token ID for FastMCP"
   value       = cloudflare_zero_trust_access_service_token.mcp.client_id
 }
 
 output "mcp_service_token_secret" {
-  description = "CF Access service token secret for MCP"
+  description = "CF Access service token secret for FastMCP"
   value       = cloudflare_zero_trust_access_service_token.mcp.client_secret
   sensitive   = true
 }

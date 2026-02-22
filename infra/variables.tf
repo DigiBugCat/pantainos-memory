@@ -36,7 +36,7 @@ variable "llm_judge_url" {
 variable "llm_judge_model" {
   description = "Model name for LLM judge calls"
   type        = string
-  default     = "gpt-5-mini"
+  default     = "gpt-5.2"
 }
 
 variable "llm_judge_api_key" {

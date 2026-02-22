@@ -14,13 +14,9 @@
  * 1. Validate request
  * 2. Duplicate detection (blocks on match)
  * 3. Completeness check (advisory — saves as draft if warnings, unless override: true)
- * 4. Store in D1 (memories table)
- * 5. If active: generate embeddings, upsert to vectorize, queue exposure check
- * 6. If draft: D1 only, return ID + warnings (call with override: true to commit)
- *
- * Query params:
- * - sync=true: Run exposure check synchronously and return results in response
- *   (useful for testing, not recommended for production)
+ * 4. Active path: return 201 immediately, defer writes to waitUntil()
+ * 5. Draft path: blocking D1 write, return ID + warnings
+ * 6. Sync path (?sync=true): blocking full pipeline
  *
  * Three-Table Architecture:
  * - Content embeddings stored in MEMORY_VECTORS
@@ -31,7 +27,6 @@
 import { Hono } from 'hono';
 import type {
   MemoryRequest,
-  ExposureCheckJob,
   ExposureCheckResult,
 } from '../../lib/shared/types/index.js';
 import { logField, logOperation, logError } from '../../lib/shared/logging/index.js';
@@ -39,7 +34,6 @@ import type { Env } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
 import { generateId } from '../../lib/id.js';
 import { generateEmbedding, checkDuplicate, checkDuplicateWithLLM } from '../../lib/embeddings.js';
-import { recordVersion } from '../../services/history-service.js';
 import { checkExposures, checkExposuresForNewThought } from '../../services/exposure-checker.js';
 import { computeSurprise } from '../../services/surprise.js';
 import { TYPE_STARTING_CONFIDENCE } from '../../services/confidence.js';
@@ -50,6 +44,9 @@ import {
   validateDerivedFromIds,
   validateOrigin,
   validateTimeBound,
+  commitMemory,
+  type CommitPayload,
+  type ObserveCommitJob,
 } from '../../usecases/observe-memory.js';
 
 type Variables = {
@@ -78,6 +75,7 @@ interface ObserveResponse {
 }
 
 app.post('/', async (c) => {
+  const t0 = performance.now();
   const config = c.get('config');
   const requestId = c.get('requestId');
   const sessionId = c.get('sessionId');
@@ -131,10 +129,13 @@ app.post('/', async (c) => {
 
   // ── Pre-creation guards ──
   // Generate content embedding early for duplicate check
+  const t1 = performance.now();
   const contentEmbedding = await generateEmbedding(c.env.AI, body.content, config, requestId);
+  const t2 = performance.now();
 
   // Duplicate detection (two-phase: vector similarity → optional LLM) — always blocks
   const dupCheck = await checkDuplicate(c.env, contentEmbedding, requestId);
+  const t3 = performance.now();
   if (dupCheck.id && dupCheck.similarity >= config.dedupThreshold) {
     const existing = await c.env.DB.prepare(
       `SELECT content FROM memories WHERE id = ?`
@@ -163,18 +164,25 @@ app.post('/', async (c) => {
     }
   }
 
-  // Completeness check (advisory — saves as draft if warnings)
+  // Completeness check + confidence lookup in parallel (independent operations)
+  const t4 = performance.now();
+  const [completeness, startingConfidence] = await Promise.all([
+    checkMemoryCompleteness(c.env, c.env.AI, config, {
+      content: body.content,
+      has_source: hasSource,
+      has_derived_from: hasDerivedFrom,
+      has_invalidates_if: Boolean(body.invalidates_if?.length),
+      has_confirms_if: Boolean(body.confirms_if?.length),
+      has_resolves_by: timeBound,
+      atomic_override: body.atomic_override,
+      requestId,
+    }),
+    hasSource
+      ? getStartingConfidenceForSource(c.env.DB, normalizedSource!)
+      : Promise.resolve(timeBound ? TYPE_STARTING_CONFIDENCE.predict : TYPE_STARTING_CONFIDENCE.think),
+  ]);
+
   let completenessWarnings: ObserveResponse['warnings'];
-  const completeness = await checkMemoryCompleteness(c.env, c.env.AI, config, {
-    content: body.content,
-    has_source: hasSource,
-    has_derived_from: hasDerivedFrom,
-    has_invalidates_if: Boolean(body.invalidates_if?.length),
-    has_confirms_if: Boolean(body.confirms_if?.length),
-    has_resolves_by: timeBound,
-    atomic_override: body.atomic_override,
-    requestId,
-  });
   if (completeness && !completeness.is_complete && completeness.missing_fields.length > 0) {
     completenessWarnings = {
       missing_fields: completeness.missing_fields,
@@ -190,92 +198,13 @@ app.post('/', async (c) => {
   const hasConditions = (body.invalidates_if && body.invalidates_if.length > 0) ||
     (body.confirms_if && body.confirms_if.length > 0);
 
-  // ── D1 insert (always runs — draft or active) ──
-  const startingConfidence = hasSource
-    ? await getStartingConfidenceForSource(c.env.DB, normalizedSource!)
-    : (timeBound ? TYPE_STARTING_CONFIDENCE.predict : TYPE_STARTING_CONFIDENCE.think);
-
-  const obsidianSources = body.obsidian_sources;
-  await c.env.DB.prepare(
-    `INSERT INTO memories (
-      id, content, source, source_url, derived_from,
-      assumes, invalidates_if, confirms_if,
-      outcome_condition, resolves_by,
-      starting_confidence, confirmations, times_tested, contradictions,
-      centrality, state, violations,
-      retracted, tags, obsidian_sources, session_id, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, '[]', 0, ?, ?, ?, ?)`
-  ).bind(
-    id,
-    body.content,
-    hasSource ? normalizedSource : null,
-    body.source_url || null,
-    hasDerivedFrom ? JSON.stringify(body.derived_from) : null,
-    body.assumes ? JSON.stringify(body.assumes) : null,
-    body.invalidates_if ? JSON.stringify(body.invalidates_if) : null,
-    body.confirms_if ? JSON.stringify(body.confirms_if) : null,
-    body.outcome_condition || null,
-    body.resolves_by || null,
-    startingConfidence,
-    initialState,
-    body.tags ? JSON.stringify(body.tags) : null,
-    obsidianSources ? JSON.stringify(obsidianSources) : null,
-    sessionId || null,
-    now
-  ).run();
-
-  // Edges + version recording (always, regardless of draft/active)
-  const postInsertTasks: Promise<unknown>[] = [];
-
-  if (hasDerivedFrom) {
-    const edgeStmts = body.derived_from!.map(sourceId =>
-      c.env.DB.prepare(
-        `INSERT INTO edges (id, source_id, target_id, edge_type, strength, created_at)
-         VALUES (?, ?, ?, 'derived_from', 1.0, ?)`
-      ).bind(generateId(), sourceId, id, now)
-    );
-    const centralityStmts = body.derived_from!.map(sourceId =>
-      c.env.DB.prepare(
-        `UPDATE memories SET centrality = centrality + 1, updated_at = ? WHERE id = ?`
-      ).bind(now, sourceId)
-    );
-    postInsertTasks.push(c.env.DB.batch([...edgeStmts, ...centralityStmts]));
-  }
-
-  postInsertTasks.push(recordVersion(c.env.DB, {
-    entityId: id,
-    entityType: 'memory',
-    changeType: 'created',
-    contentSnapshot: {
-      id,
-      content: body.content,
-      source: hasSource ? normalizedSource : undefined,
-      source_url: body.source_url || undefined,
-      derived_from: hasDerivedFrom ? body.derived_from : undefined,
-      assumes: body.assumes,
-      invalidates_if: body.invalidates_if,
-      confirms_if: body.confirms_if,
-      outcome_condition: body.outcome_condition,
-      resolves_by: body.resolves_by,
-      tags: body.tags,
-      obsidian_sources: obsidianSources,
-      starting_confidence: startingConfidence,
-      confirmations: 0,
-      times_tested: 0,
-      contradictions: 0,
-      centrality: 0,
-      state: initialState,
-      violations: [],
-      retracted: false,
-      time_bound: timeBound,
-    },
-    sessionId,
-    requestId,
-    userAgent,
-    ipHash,
-  }));
-
-  await Promise.all(postInsertTasks);
+  // Build commit payload (shared by all paths)
+  const commitPayload: CommitPayload = {
+    id, body, normalizedSource, hasSource, hasDerivedFrom,
+    initialState, timeBound, hasConditions: Boolean(hasConditions),
+    startingConfidence, contentEmbedding,
+    sessionId, requestId, userAgent, ipHash, now, config,
+  };
 
   logField(c, 'memory_id', id);
   logField(c, 'type', 'memory');
@@ -283,8 +212,9 @@ app.post('/', async (c) => {
   if (hasSource) logField(c, 'source', normalizedSource);
   if (hasDerivedFrom) logField(c, 'derived_from', body.derived_from);
 
-  // ── Draft: D1 only, no vectorize or exposure check ──
+  // ── Draft: blocking D1 write (caller needs confirmation + warnings) ──
   if (isDraft) {
+    await commitMemory(c.env, commitPayload);
     return c.json({
       success: true,
       id,
@@ -294,63 +224,10 @@ app.post('/', async (c) => {
     } satisfies ObserveResponse, 201);
   }
 
-  // ── Active: full pipeline (vectorize + exposure check) ──
-
-  // Generate condition embeddings (content embedding already computed above for dedup)
-  const embeddingsP = (async () => {
-    const conditionTasks: Promise<number[]>[] = [];
-    for (const condition of (hasConditions ? body.invalidates_if : undefined) ?? []) {
-      conditionTasks.push(generateEmbedding(c.env.AI, condition, config, requestId));
-    }
-    for (const condition of (hasConditions ? body.confirms_if : undefined) ?? []) {
-      conditionTasks.push(generateEmbedding(c.env.AI, condition, config, requestId));
-    }
-    const condResults = await Promise.all(conditionTasks);
-    const invCount = (hasConditions ? body.invalidates_if?.length : 0) ?? 0;
-    return {
-      content: contentEmbedding,
-      invalidates: condResults.slice(0, invCount),
-      confirms: condResults.slice(invCount),
-    };
-  })();
-
-  // Vectorize upserts
-  const vectorizeP = (async () => {
-    const embeddings = await embeddingsP;
-
-    const contentMetadata = hasSource
-      ? { type: 'obs', source: normalizedSource, has_invalidates_if: Boolean(hasConditions && body.invalidates_if?.length), has_confirms_if: Boolean(hasConditions && body.confirms_if?.length) }
-      : { type: 'thought', has_invalidates_if: Boolean(body.invalidates_if?.length), has_assumes: Boolean(body.assumes?.length), has_confirms_if: Boolean(body.confirms_if?.length), has_outcome: timeBound, resolves_by: body.resolves_by, time_bound: timeBound };
-
-    const upserts: Promise<unknown>[] = [
-      c.env.MEMORY_VECTORS.upsert([{ id, values: embeddings.content, metadata: contentMetadata as any }]),
-    ];
-
-    if (embeddings.invalidates.length > 0 && body.invalidates_if) {
-      const condVectors = body.invalidates_if.map((condition, index) => ({
-        id: `${id}:inv:${index}`,
-        values: embeddings.invalidates[index],
-        metadata: { memory_id: id, condition_index: index, condition_text: condition, time_bound: !hasSource && timeBound } as any,
-      }));
-      upserts.push(c.env.INVALIDATES_VECTORS.upsert(condVectors));
-    }
-
-    if (embeddings.confirms.length > 0 && body.confirms_if) {
-      const condVectors = body.confirms_if.map((condition, index) => ({
-        id: `${id}:conf:${index}`,
-        values: embeddings.confirms[index],
-        metadata: { memory_id: id, condition_index: index, condition_text: condition, time_bound: !hasSource && timeBound } as any,
-      }));
-      upserts.push(c.env.CONFIRMS_VECTORS.upsert(condVectors));
-    }
-
-    await Promise.all(upserts);
-    return embeddings;
-  })();
-
-  // Sync mode: need everything settled before exposure check
+  // ── Sync mode: blocking full pipeline ──
   if (syncMode) {
-    const embeddings = await vectorizeP;
+    await commitMemory(c.env, commitPayload);
+
     logOperation(c, 'exposure', 'sync_check', { entity_id: id });
 
     await c.env.DB.prepare(`
@@ -361,7 +238,7 @@ app.post('/', async (c) => {
 
     try {
       const exposureP = hasSource
-        ? checkExposures(c.env, id, body.content, embeddings.content)
+        ? checkExposures(c.env, id, body.content, contentEmbedding)
         : checkExposuresForNewThought(
             c.env, id, body.content,
             body.invalidates_if || [],
@@ -369,7 +246,7 @@ app.post('/', async (c) => {
             timeBound
           );
 
-      const surpriseP = computeSurprise(c.env, id, embeddings.content).catch(() => null);
+      const surpriseP = computeSurprise(c.env, id, contentEmbedding).catch(() => null);
 
       const [exposureResult, surprise] = await Promise.all([exposureP, surpriseP]);
 
@@ -408,47 +285,31 @@ app.post('/', async (c) => {
     }
   }
 
-  // Async mode: persist vectors, then enqueue exposure
-  const embeddings = await vectorizeP;
-  const embedding = embeddings.content;
+  // ── Active path (common): optimistic return, defer writes to waitUntil ──
+  logOperation(c, 'exposure', 'queued', { entity_id: id });
 
-  const exposureJob: ExposureCheckJob = {
-    memory_id: id,
-    is_observation: hasSource,
-    content: body.content,
-    embedding,
-    session_id: sessionId,
-    request_id: requestId,
-    timestamp: now,
-    invalidates_if: hasConditions ? body.invalidates_if : undefined,
-    confirms_if: hasConditions ? body.confirms_if : undefined,
-    time_bound: timeBound,
-  };
+  const t5 = performance.now();
+  console.log(`[observe response] id=${id} embedding=${(t2-t1).toFixed(0)}ms dedup=${(t3-t2).toFixed(0)}ms completeness=${(t5-t4).toFixed(0)}ms total=${(t5-t0).toFixed(0)}ms`);
+
+  // Defer all writes to background
+  const commitTask = commitMemory(c.env, commitPayload).catch(async (err) => {
+    console.error(`[observe commit failed] id=${id}`, err instanceof Error ? err.message : err);
+    // Enqueue for retry via dead letter path
+    try {
+      const retryJob: ObserveCommitJob = { type: 'observe:commit', ...commitPayload };
+      await c.env.DETECTION_QUEUE.send(retryJob);
+      console.log(`[observe commit queued for retry] id=${id}`);
+    } catch (queueErr) {
+      console.error(`[observe DLQ enqueue failed] id=${id}`, queueErr instanceof Error ? queueErr.message : queueErr);
+    }
+  });
 
   try {
-    await c.env.DETECTION_QUEUE.send(exposureJob);
-  } catch (error) {
-    const failedAt = Date.now();
-    logError(
-      'observe_queue_enqueue_failed',
-      error instanceof Error ? error : String(error),
-      {
-        memory_id: id,
-        session_id: sessionId,
-        request_id: requestId,
-      }
-    );
-
-    await c.env.DB.prepare(`
-      UPDATE memories
-      SET exposure_check_status = 'pending', updated_at = ?
-      WHERE id = ?
-    `).bind(failedAt, id).run();
-
-    throw error;
+    c.executionCtx.waitUntil(commitTask);
+  } catch {
+    // Test environment — no ExecutionContext available
+    commitTask.catch(() => {});
   }
-
-  logOperation(c, 'exposure', 'queued', { entity_id: id });
 
   return c.json({
     success: true,

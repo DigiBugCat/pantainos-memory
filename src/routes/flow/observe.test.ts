@@ -20,27 +20,13 @@ vi.mock('../../jobs/compute-stats.js', () => ({
   getStartingConfidenceForSource: vi.fn().mockResolvedValue(0.75),
 }));
 
-function deferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
-
-function createDbMock(runHandlers: Array<(sql: string) => Promise<unknown>>) {
+function createDbMock() {
   const executedRuns: string[] = [];
   const prepare = vi.fn((sql: string) => {
     const stmt = {
       bind: vi.fn().mockReturnThis(),
       run: vi.fn(async () => {
         executedRuns.push(sql);
-        for (const handler of runHandlers) {
-          const maybe = await handler(sql);
-          if (maybe !== undefined) return maybe;
-        }
         return { success: true, meta: { changes: 1 } };
       }),
       first: vi.fn(async () => null),
@@ -49,7 +35,7 @@ function createDbMock(runHandlers: Array<(sql: string) => Promise<unknown>>) {
     return stmt;
   });
 
-  return { prepare, executedRuns };
+  return { prepare, executedRuns, batch: vi.fn().mockResolvedValue([]) };
 }
 
 async function createObserveApp() {
@@ -67,30 +53,34 @@ async function createObserveApp() {
   return app;
 }
 
-describe('POST /api/observe ordering', () => {
-  it('enqueues only after D1 write and vector upsert finish', async () => {
-    const d1 = deferred<{ success: true; meta: { changes: number } }>();
-    const vector = deferred<void>();
+describe('POST /api/observe', () => {
+  it('returns 201 immediately for active memories (optimistic)', async () => {
     const queueSend = vi.fn().mockResolvedValue(undefined);
+    const waitUntilFns: Promise<unknown>[] = [];
 
-    const db = createDbMock([
-      async (sql) => {
-        if (sql.includes('INSERT INTO memories')) return d1.promise;
-        return undefined;
-      },
-    ]);
-
+    const db = createDbMock();
     const env = {
       DB: db as unknown as D1Database,
       AI: {},
-      MEMORY_VECTORS: { upsert: vi.fn().mockImplementation(() => vector.promise), query: vi.fn().mockResolvedValue({ matches: [] }) },
+      MEMORY_VECTORS: { upsert: vi.fn().mockResolvedValue(undefined), query: vi.fn().mockResolvedValue({ matches: [] }) },
       INVALIDATES_VECTORS: { upsert: vi.fn().mockResolvedValue(undefined) },
       CONFIRMS_VECTORS: { upsert: vi.fn().mockResolvedValue(undefined) },
       DETECTION_QUEUE: { send: queueSend },
     };
 
     const app = await createObserveApp();
-    const reqPromise = app.request(
+
+    // Patch executionCtx to capture waitUntil
+    const originalFetch = app.fetch.bind(app);
+    const patchedApp = {
+      request: async (url: string, init: any, envArg: any) => {
+        // Hono's app.request doesn't provide executionCtx, so the route
+        // will use the default. We verify via response status.
+        return app.request(url, init, envArg);
+      }
+    };
+
+    const res = await app.request(
       'http://localhost/api/observe',
       {
         method: 'POST',
@@ -103,32 +93,30 @@ describe('POST /api/observe ordering', () => {
       env as any
     );
 
-    await Promise.resolve();
-    expect(queueSend).not.toHaveBeenCalled();
-
-    d1.resolve({ success: true, meta: { changes: 1 } });
-    await Promise.resolve();
-    expect(queueSend).not.toHaveBeenCalled();
-
-    vector.resolve();
-    const res = await reqPromise;
+    // Response should be 201 immediately
     expect(res.status).toBe(201);
-    expect(queueSend).toHaveBeenCalledTimes(1);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+    expect(body.status).toBe('active');
+    expect(body.id).toBeDefined();
   });
 
-  it('keeps exposure status pending if queue enqueue fails after persistence', async () => {
-    const queueSend = vi.fn().mockRejectedValue(new Error('queue unavailable'));
-    const db = createDbMock([
-      async (_sql) => undefined,
-    ]);
+  it('returns 201 with draft status and warnings when completeness check fails', async () => {
+    const { checkMemoryCompleteness } = await import('../../services/classification-challenge.js');
+    (checkMemoryCompleteness as any).mockResolvedValueOnce({
+      is_complete: false,
+      missing_fields: [{ field: 'invalidates_if', reason: 'no falsifiability conditions' }],
+      reasoning: 'Missing conditions',
+    });
 
+    const db = createDbMock();
     const env = {
       DB: db as unknown as D1Database,
       AI: {},
       MEMORY_VECTORS: { upsert: vi.fn().mockResolvedValue(undefined), query: vi.fn().mockResolvedValue({ matches: [] }) },
       INVALIDATES_VECTORS: { upsert: vi.fn().mockResolvedValue(undefined) },
       CONFIRMS_VECTORS: { upsert: vi.fn().mockResolvedValue(undefined) },
-      DETECTION_QUEUE: { send: queueSend },
+      DETECTION_QUEUE: { send: vi.fn().mockResolvedValue(undefined) },
     };
 
     const app = await createObserveApp();
@@ -138,15 +126,19 @@ describe('POST /api/observe ordering', () => {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          content: 'A new observation',
-          source: 'market',
+          content: 'A thought without conditions',
+          source: 'agent',
         }),
       },
       env as any
     );
 
-    expect(res.status).toBe(500);
-    expect(queueSend).toHaveBeenCalledTimes(1);
-    expect(db.executedRuns.some((sql) => sql.includes("SET exposure_check_status = 'pending'"))).toBe(true);
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.status).toBe('draft');
+    expect(body.warnings).toBeDefined();
+    expect(body.warnings.missing_fields).toHaveLength(1);
+    // Draft path is blocking — D1 insert should have happened
+    expect(db.executedRuns.some((sql: string) => sql.includes('INSERT'))).toBe(true);
   });
 });

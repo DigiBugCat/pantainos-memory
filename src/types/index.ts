@@ -15,9 +15,9 @@ export * from './history.js';
 // ============================================
 
 import type { ExposureCheckJob } from '../lib/shared/types/index.js';
-import type { MCPCoreEnv } from '@pantainos/mcp-core';
+import type { ObserveCommitJob } from '../usecases/observe-memory.js';
 
-export interface Env extends MCPCoreEnv {
+export interface Env {
   // Core bindings
   DB: D1Database;
   AI: Ai;
@@ -31,8 +31,8 @@ export interface Env extends MCPCoreEnv {
   // Confirms_if condition embeddings - for finding predictions an observation might support
   CONFIRMS_VECTORS: VectorizeIndex;
 
-  // Queue for async exposure checking
-  DETECTION_QUEUE: Queue<ExposureCheckJob>;
+  // Queue for async exposure checking + commit retries
+  DETECTION_QUEUE: Queue<ExposureCheckJob | ObserveCommitJob>;
 
   // API Key for authentication
   API_KEY?: string;
@@ -91,6 +91,7 @@ export interface Env extends MCPCoreEnv {
   CONFIRM_CONFIDENCE_THRESHOLD?: string;
   MAX_CANDIDATES?: string;
   MIN_SIMILARITY?: string;
+  EXPOSURE_LLM_MAX_CONCURRENCY?: string;
 
   // Pushover push notifications (optional - for core violation alerts)
   PUSHOVER_USER_KEY?: string;

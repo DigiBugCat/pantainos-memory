@@ -1,5 +1,5 @@
 /**
- * Pantainos Memory v4 - Cognitive Loop Architecture
+ * Pantainos Memory - Cognitive Loop Architecture
  *
  * Knowledge system with two primitives:
  * - Observations (obs): intake from reality - facts from the world
@@ -7,24 +7,22 @@
  *
  * Memories are weighted bets, not facts. Confidence = survival rate under test.
  * Queue processes exposure checking (violations + confirmations).
+ *
+ * MCP access is via external FastMCP proxy on fastmcp.cloud.
  */
 
 import { createWorkerApp, type LoggingEnv } from './lib/shared/hono/index.js';
-import { createStandaloneLogger, generateContextId, logField } from './lib/shared/logging/index.js';
+import { createStandaloneLogger, generateContextId } from './lib/shared/logging/index.js';
 import { cors } from 'hono/cors';
 import type { Env as BaseEnv } from './types/index.js';
 import type { ExposureCheckJob, ExposureCheckStatus } from './lib/shared/types/index.js';
 import { getConfig, type Config } from './lib/config.js';
-import { authorizeHandler, tokenHandler, registerHandler, validateAccessToken } from '@pantainos/mcp-core';
-
 // Route imports
 import flowRoutes from './routes/flow/index.js';
 import queryRoutes from './routes/query/index.js';
 import tagsRoutes from './routes/tags.js';
 import graphRoutes from './routes/graph.js';
 import experimentsRoutes from './experiments/index.js';
-import mcpRoutes from './routes/mcp.js';
-import internalRoutes from './routes/internal.js';
 import adminRoutes from './routes/admin.js';
 
 // Services for inline processing (no workflows)
@@ -49,6 +47,7 @@ import { computeSurprise } from './services/surprise.js';
 import { buildZoneHealth } from './services/zone-builder.js';
 import type { ZoneHealthReport } from './services/zone-builder.js';
 import { getStatsSummary } from './usecases/stats-summary.js';
+import { commitMemory, type ObserveCommitJob } from './usecases/observe-memory.js';
 
 // Extend Env with LoggingEnv for proper typing
 type Env = BaseEnv & LoggingEnv;
@@ -63,13 +62,11 @@ type Variables = {
 
 const app = createWorkerApp<Env, Variables>({ serviceName: 'memory' });
 
-// Global CORS for MCP/OAuth clients - must be applied to ALL routes
-// This matches the reference implementation pattern
+// Global CORS
 app.use('*', cors({
   origin: '*',
   allowMethods: ['GET', 'POST', 'OPTIONS'],
-  allowHeaders: ['Content-Type', 'Authorization', 'Mcp-Session-Id'],
-  exposeHeaders: ['Mcp-Session-Id'],
+  allowHeaders: ['Content-Type', 'Authorization'],
 }));
 
 // Middleware to inject config into context
@@ -118,162 +115,7 @@ app.use('*', async (c, next) => {
 // Public System Endpoints
 // ============================================
 
-// Helper to get issuer URL (from env or derive from request)
-const getIssuerUrl = (c: { env: Env; req: { url: string } }) =>
-  c.env.ISSUER_URL || new URL(c.req.url).origin;
-
-// Basic info / discovery endpoint (matches MCP OAuth reference)
-app.get('/', (c) => {
-  const issuer = getIssuerUrl(c);
-  return c.json({
-    name: 'memory',
-    version: '2.0.0',
-    description: 'Pantainos Memory API with OAuth authentication',
-    endpoints: {
-      mcp_http: `${issuer}/mcp`,
-      oauth_metadata: `${issuer}/.well-known/oauth-authorization-server`,
-      resource_metadata: `${issuer}/.well-known/oauth-protected-resource`,
-      register: `${issuer}/register`,
-      authorize: `${issuer}/authorize`,
-      token: `${issuer}/token`,
-      health: `${issuer}/health`,
-    },
-  });
-});
-
-// MCP Streamable HTTP transport at root (POST /)
-// This is the newer MCP transport format used by Claude
-app.options('/', cors({
-  origin: '*',
-  allowMethods: ['GET', 'POST', 'OPTIONS'],
-  allowHeaders: ['Content-Type', 'Authorization', 'Mcp-Session-Id'],
-  exposeHeaders: ['Mcp-Session-Id'],
-}));
-
-app.post('/', async (c) => {
-  logField(c, 'transport', 'streamable_http');
-  const tokenData = await validateAccessToken(c.req.raw, c.env);
-
-  if (!tokenData) {
-    logField(c, 'auth_result', 'no_token');
-    const issuer = getIssuerUrl(c);
-    return new Response('Unauthorized', {
-      status: 401,
-      headers: {
-        'WWW-Authenticate': `Bearer resource_metadata="${issuer}/.well-known/oauth-protected-resource"`,
-        'Content-Type': 'text/plain',
-        'Access-Control-Allow-Origin': '*',
-      },
-    });
-  }
-
-  logField(c, 'auth_email', tokenData.email);
-
-  // Forward to MCP handler
-  const body = await c.req.text();
-
-  let message;
-  try {
-    message = JSON.parse(body);
-    logField(c, 'mcp_method', message.method);
-    logField(c, 'mcp_id', message.id);
-  } catch {
-    logField(c, 'parse_error', true);
-    return c.json({
-      jsonrpc: '2.0',
-      error: { code: -32700, message: 'Parse error' },
-    }, 400);
-  }
-
-  // Import MCP handler dynamically to handle the message
-  const { handleMCPMessage } = await import('./routes/mcp.js');
-  const response = await handleMCPMessage(message, tokenData.email, c.env);
-
-  if (!response) {
-    logField(c, 'mcp_notification', true);
-    return new Response(null, { status: 202 });
-  }
-
-  return c.json(response);
-});
-
-// ============================================
-// OAuth 2.0 Endpoints (for MCP authentication)
-// ============================================
-// These endpoints enable mcp-remote OAuth flow with Cloudflare Access.
-// The OAuth flow is backed by CF Access for identity verification.
-
-// Permissive CORS for OAuth endpoints - MCP clients need this
-const oauthCors = cors({
-  origin: '*',
-  allowMethods: ['GET', 'POST', 'OPTIONS'],
-  allowHeaders: ['Content-Type', 'Authorization', 'Mcp-Session-Id'],
-  exposeHeaders: ['Mcp-Session-Id'],
-});
-
-// Apply permissive CORS to OAuth and well-known endpoints
-app.use('/.well-known/*', oauthCors);
-app.use('/register', oauthCors);
-app.use('/authorize', oauthCors);
-app.use('/token', oauthCors);
-
-// OAuth Authorization Server Metadata (RFC 8414)
-app.get('/.well-known/oauth-authorization-server', (c) => {
-  const issuer = getIssuerUrl(c);
-  return c.json({
-    issuer,
-    authorization_endpoint: `${issuer}/authorize`,
-    token_endpoint: `${issuer}/token`,
-    registration_endpoint: `${issuer}/register`,
-    response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code', 'refresh_token'],
-    code_challenge_methods_supported: ['S256', 'plain'],
-    token_endpoint_auth_methods_supported: ['none', 'client_secret_post'],
-    scopes_supported: ['mcp', 'openid', 'profile', 'email'],
-  });
-});
-
-// OAuth Protected Resource Metadata (RFC 9728)
-app.get('/.well-known/oauth-protected-resource', (c) => {
-  const issuer = getIssuerUrl(c);
-  logField(c, 'oauth_issuer', issuer);
-  return c.json({
-    resource: issuer,
-    authorization_servers: [issuer],
-    scopes_supported: ['mcp'],
-    bearer_methods_supported: ['header'],
-  });
-});
-
-// Dynamic Client Registration (RFC 7591)
-app.post('/register', async (c) => {
-  logField(c, 'oauth_flow', 'client_registration');
-  const body = await c.req.text();
-  const newReq = new Request(c.req.url, {
-    method: 'POST',
-    headers: c.req.raw.headers,
-    body: body,
-  });
-  return registerHandler(newReq, c.env);
-});
-
-// OAuth Authorization endpoint
-app.get('/authorize', async (c) => {
-  logField(c, 'oauth_flow', 'authorization');
-  return authorizeHandler(c.req.raw, c.env);
-});
-
-// OAuth Token endpoint
-app.post('/token', async (c) => {
-  logField(c, 'oauth_flow', 'token_exchange');
-  const body = await c.req.text();
-  const newReq = new Request(c.req.url, {
-    method: 'POST',
-    headers: c.req.raw.headers,
-    body: body,
-  });
-  return tokenHandler(newReq, c.env);
-});
+app.get('/', (c) => c.json({ name: 'memory', version: '2.0.0' }));
 
 // Detailed health check with dependency status
 app.get('/health', async (c) => {
@@ -369,75 +211,8 @@ app.route('/api/graph', graphRoutes);
 // Experiments (model/prompt evaluation framework)
 app.route('/api/experiments', experimentsRoutes);
 
-// Internal routes (called by MCP workers via service binding)
-// No authentication required - service bindings are trusted internal connections
-app.use('/internal/*', async (c, next) => {
-  // Inject config and requestId for internal routes
-  const config = c.get('config');
-  c.set('config', config);
-  c.set('requestId', c.req.header('X-Request-Id') || `internal-${Date.now()}`);
-  await next();
-});
-app.route('/internal', internalRoutes);
-
-// Admin routes (service-token auth, same pattern as internal routes)
-app.use('/api/admin/*', async (c, next) => {
-  const serviceTokenId = c.req.header('CF-Access-Client-Id');
-  if (!serviceTokenId) {
-    return c.json({ success: false, error: 'Unauthorized — requires CF Access service token' }, 401);
-  }
-  await next();
-});
+// Admin routes (CF Access handles authentication at the edge)
 app.route('/api/admin', adminRoutes);
-
-// MCP routes (Model Context Protocol for Claude Code integration)
-// Protected by OAuth token validation or CF Access service token
-
-// MCP-specific CORS - must be permissive for OAuth clients
-const mcpCors = cors({
-  origin: '*',
-  allowMethods: ['GET', 'POST', 'OPTIONS'],
-  allowHeaders: ['Content-Type', 'Authorization', 'Mcp-Session-Id'],
-  exposeHeaders: ['Mcp-Session-Id'],
-});
-app.use('/mcp/*', mcpCors);
-
-// MCP auth middleware
-app.use('/mcp/*', async (c, next) => {
-  // Check for OAuth token first
-  const tokenData = await validateAccessToken(c.req.raw, c.env);
-
-  if (tokenData) {
-    // Valid OAuth token - proceed
-    logField(c, 'auth_method', 'oauth');
-    logField(c, 'auth_email', tokenData.email);
-    await next();
-    return;
-  }
-
-  // Fallback to CF Access service token (CF-Access-Client-Id header)
-  // CF Access validates the token at the edge before reaching the worker
-  const serviceTokenId = c.req.header('CF-Access-Client-Id');
-  if (serviceTokenId) {
-    logField(c, 'auth_method', 'cf_access_service_token');
-    await next();
-    return;
-  }
-
-  // No valid authentication - return 401 with OAuth discovery hint
-  const issuer = getIssuerUrl(c);
-  logField(c, 'auth_result', 'unauthorized');
-  return new Response('Unauthorized', {
-    status: 401,
-    headers: {
-      'WWW-Authenticate': `Bearer resource_metadata="${issuer}/.well-known/oauth-protected-resource"`,
-      'Content-Type': 'text/plain',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Expose-Headers': 'Mcp-Session-Id',
-    },
-  });
-});
-app.route('/mcp', mcpRoutes);
 
 // ============================================
 // Helper Functions (inlined from workflows)
@@ -920,9 +695,9 @@ export default {
     }
   },
 
-  // Queue consumer for async exposure check jobs (inline processing)
+  // Queue consumer for async exposure checks + commit retries
   async queue(
-    batch: MessageBatch<ExposureCheckJob>,
+    batch: MessageBatch<ExposureCheckJob | ObserveCommitJob>,
     env: Env,
     _ctx: ExecutionContext
   ): Promise<void> {
@@ -940,19 +715,28 @@ export default {
       const job = message.body;
 
       try {
-        // Process exposure check inline (no workflow)
-        await processExposureCheck(env, job, log);
-        message.ack();
+        // Dispatch by message type
+        if ('type' in job && job.type === 'observe:commit') {
+          // Retry a failed observe commit (idempotent)
+          log.info('commit_retry_processing', { memory_id: job.id });
+          await commitMemory(env, job);
+          log.info('commit_retry_succeeded', { memory_id: job.id });
+          message.ack();
+        } else {
+          // Existing exposure check path
+          await processExposureCheck(env, job as ExposureCheckJob, log);
+          message.ack();
+        }
       } catch (error) {
-        log.error('exposure_check_failed', {
-          memory_id: job.memory_id,
-          is_observation: job.is_observation,
-          request_id: job.request_id,
+        const memoryId = 'type' in job && job.type === 'observe:commit' ? job.id : (job as ExposureCheckJob).memory_id;
+        log.error('queue_message_failed', {
+          memory_id: memoryId,
+          message_type: 'type' in job ? job.type : 'exposure_check',
           error: error instanceof Error ? error.message : String(error),
           stack: error instanceof Error ? error.stack : undefined,
         });
 
-        // Retry the message (up to max retries configured on queue)
+        // Retry the message (up to max retries configured on queue → then DLQ)
         message.retry();
       }
     }
