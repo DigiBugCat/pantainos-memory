@@ -51,13 +51,14 @@ def fmt_find(data: dict[str, Any]) -> str:
     lines: list[str] = []
     for i, r in enumerate(results, 1):
         m = r.get("memory", {})
+        content = m.get("content", "")[:80]
         sim = _pct(r.get("similarity", 0))
         conf = _pct(r.get("confidence", 0))
         icon = _outcome_icon(m.get("state"), m.get("outcome"))
         surp = r.get("surprise")
         surp_str = f" surp:{_pct(surp)}%" if surp is not None else ""
         lines.append(
-            f"{i}. [{m.get('id', '?')}] {m.get('content', '')}{icon}\n"
+            f"{i}. [{m.get('id', '?')}] {content}{icon}\n"
             f"   sim:{sim}% conf:{conf}%{surp_str}"
         )
 
@@ -66,7 +67,6 @@ def fmt_find(data: dict[str, Any]) -> str:
 
 def fmt_recall(data: dict[str, Any]) -> str:
     m = data.get("memory", data)
-    icon = _outcome_icon(m.get("state"), m.get("outcome"))
 
     state_label = m.get("state", "active")
     if state_label == "resolved" and m.get("outcome"):
@@ -74,9 +74,7 @@ def fmt_recall(data: dict[str, Any]) -> str:
 
     tt = m.get("times_tested", 0)
     confs = m.get("confirmations", 0)
-    confidence = (
-        f"{round(confs / tt * 100)}% ({confs}/{tt})" if tt > 0 else "untested"
-    )
+    confidence = f"{round(confs / tt * 100)}%" if tt > 0 else "untested"
 
     traits: list[str] = []
     if m.get("source"):
@@ -88,23 +86,34 @@ def fmt_recall(data: dict[str, Any]) -> str:
         traits.append("time-bound")
     trait_label = ", ".join(traits) if traits else "standalone"
 
-    text = f"[{m.get('id', '?')}] {m.get('content', '')}\n\n"
-    text += f"{trait_label} | State: {state_label}{icon} | Confidence: {confidence}\n"
+    text = f"[{m.get('id', '?')}] {m.get('content', '')}\n"
+    text += f"{trait_label} | {state_label} | {confidence}\n"
 
     if m.get("source"):
         text += f"Source: {m['source']}\n"
 
     violations = m.get("violations", [])
     if violations:
-        text += "\n⚠️ Violations:\n"
         for v in violations:
-            text += f'  - "{v.get("condition", "")}" (by {v.get("obs_id", "?")})\n'
+            text += f'Violation: "{v.get("condition", "")}" (by {v.get("obs_id", "?")})\n'
 
     connections = data.get("connections", [])
     if connections:
         ids = ", ".join(f"[{c.get('target_id', '?')}]" for c in connections)
-        text += f"\n🔗 Connections: {ids}"
+        text += f"Connections: {ids}\n"
 
+    return text.rstrip()
+
+
+def fmt_resolve(data: dict[str, Any]) -> str:
+    mid = data.get("memory_id", "?")
+    outcome = data.get("outcome", "?")
+    cascade = data.get("cascade_count", 0)
+    text = f"[{mid}] resolved:{outcome}"
+    if cascade:
+        text += f" ({cascade} cascade)"
+    if data.get("cascade_error"):
+        text += f" cascade_error: {data['cascade_error']}"
     return text
 
 
@@ -155,7 +164,51 @@ def fmt_insights(data: dict[str, Any]) -> str:
 
 
 def fmt_reference(data: dict[str, Any]) -> str:
-    return json.dumps(data, indent=2, default=str)
+    nodes = data.get("nodes", [])
+    edges = data.get("edges", [])
+    root_id = data.get("root", "?")
+
+    if not nodes:
+        return f"No graph data for [{root_id}]"
+
+    # Build adjacency: source_id -> [(target_id, edge_type)]
+    children: dict[str, list[tuple[str, str]]] = {}
+    parents: dict[str, list[tuple[str, str]]] = {}
+    for e in edges:
+        src = e.get("source_id", "")
+        tgt = e.get("target_id", "")
+        etype = e.get("edge_type", "derives_from")
+        children.setdefault(src, []).append((tgt, etype))
+        parents.setdefault(tgt, []).append((src, etype))
+
+    node_map = {n.get("id", ""): n for n in nodes}
+
+    def _label(nid: str) -> str:
+        n = node_map.get(nid, {})
+        content = n.get("content", "")[:60]
+        return f"[{nid}] {content}"
+
+    lines = [_label(root_id)]
+
+    # Show descendants (down)
+    visited: set[str] = {root_id}
+
+    def _walk_down(nid: str, indent: int) -> None:
+        for child_id, _ in children.get(nid, []):
+            if child_id not in visited:
+                visited.add(child_id)
+                lines.append(f"{'  ' * indent}> {_label(child_id)}")
+                _walk_down(child_id, indent + 1)
+
+    _walk_down(root_id, 1)
+
+    # Show ancestors (up)
+    for parent_id, _ in parents.get(root_id, []):
+        if parent_id not in visited:
+            visited.add(parent_id)
+            lines.append(f"  < {_label(parent_id)}")
+
+    return "\n".join(lines)
 
 
 def fmt_roots(data: dict[str, Any]) -> str:
@@ -171,7 +224,22 @@ def fmt_roots(data: dict[str, Any]) -> str:
 
 
 def fmt_zones(data: dict[str, Any]) -> str:
-    return json.dumps(data, indent=2, default=str)
+    memories = data.get("memories", [])
+    edges = data.get("edges", [])
+    stats = data.get("stats", {})
+
+    if not memories:
+        return "Empty zone"
+
+    total = stats.get("total_memories", len(memories))
+    total_edges = stats.get("total_edges", len(edges))
+
+    lines = [f"Zone: {total} members, {total_edges} edges"]
+    for m in memories:
+        content = m.get("content", "")[:60]
+        lines.append(f"[{m.get('id', '?')}] {content}")
+
+    return "\n".join(lines)
 
 
 def fmt_between(data: dict[str, Any]) -> str:
@@ -212,6 +280,59 @@ def fmt_session_recap(data: dict[str, Any]) -> str:
         if ids:
             text += "\n\nReferenced: " + ", ".join(f"[{mid}]" for mid in ids)
         return text
+    return json.dumps(data, indent=2, default=str)
+
+
+def fmt_admin(data: dict[str, Any]) -> str:
+    """Admin tool formatter — concise, actionable output."""
+    success = data.get("success", False)
+
+    # Bulk retract
+    if "retracted" in data:
+        count = data["retracted"]
+        reason = data.get("reason", "")
+        cascade = data.get("cascade_retracted", 0)
+        text = f"Retracted {count} memor{'y' if count == 1 else 'ies'}"
+        if cascade:
+            text += f" + {cascade} cascade"
+        if reason:
+            text += f" ({reason})"
+        return text
+
+    # Queue status
+    if "pending_count" in data or "event_types" in data:
+        return json.dumps(data, indent=2, default=str)
+
+    # Queue purge
+    if "purged" in data:
+        return f"Purged {data['purged']} events" + (" (dry run)" if data.get("dry_run") else "")
+
+    # Memory state change
+    if "previous_state" in data or "new_state" in data:
+        mid = data.get("memory_id", "?")
+        prev = data.get("previous_state", "?")
+        new = data.get("new_state", data.get("state", "?"))
+        return f"[{mid}] {prev} → {new}"
+
+    # Condition vectors cleanup
+    if "cleaned" in data:
+        return f"Cleaned {data['cleaned']} condition vectors" + (" (dry run)" if data.get("dry_run") else "")
+
+    # Diagnostics / generic success
+    if success and len(data) <= 2:
+        return "Done"
+
+    # Dry run results with items
+    if "would_retract" in data:
+        items = data["would_retract"]
+        if isinstance(items, list):
+            lines = [f"Would retract {len(items)} memories:"]
+            for m in items[:10]:
+                mid = m.get("id", "?") if isinstance(m, dict) else m
+                content = m.get("content", "") if isinstance(m, dict) else ""
+                lines.append(f"  [{mid}] {content[:80]}")
+            return "\n".join(lines)
+
     return json.dumps(data, indent=2, default=str)
 
 

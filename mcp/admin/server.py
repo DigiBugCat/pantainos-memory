@@ -38,7 +38,7 @@ async def queue_status(
     """View event queue state: pending counts, event type distribution, stuck sessions."""
     body = _body(detail_level=detail_level, session_id=session_id)
     data = await client.post("/admin/queue-status", body)
-    return fmt.fmt_default(data)
+    return fmt.fmt_admin(data)
 
 
 @mcp.tool(annotations=_destructive)
@@ -54,7 +54,7 @@ async def queue_purge(
         older_than_hours=older_than_hours, dry_run=dry_run,
     )
     data = await client.post("/admin/queue-purge", body)
-    return fmt.fmt_default(data)
+    return fmt.fmt_admin(data)
 
 
 @mcp.tool(annotations=_rw)
@@ -70,7 +70,7 @@ async def memory_state(
         reason=reason, outcome=outcome,
     )
     data = await client.post("/admin/memory-state", body)
-    return fmt.fmt_default(data)
+    return fmt.fmt_admin(data)
 
 
 @mcp.tool(annotations=_destructive)
@@ -82,7 +82,7 @@ async def condition_vectors_cleanup(
     """Delete condition vectors for non-active memories. Prevents stale exposure checks."""
     body = _body(memory_id=memory_id, batch_size=batch_size, dry_run=dry_run)
     data = await client.post("/admin/condition-vectors-cleanup", body)
-    return fmt.fmt_default(data)
+    return fmt.fmt_admin(data)
 
 
 @mcp.tool(annotations=_ro)
@@ -94,7 +94,7 @@ async def system_diagnostics(
     if include_samples:
         params["include_samples"] = "true"
     data = await client.get("/admin/system-diagnostics", params)
-    return fmt.fmt_default(data)
+    return fmt.fmt_admin(data)
 
 
 @mcp.tool(annotations=_ro)
@@ -103,7 +103,7 @@ async def force_dispatch(
 ) -> str:
     """View pending events for a session. Shows what would be dispatched."""
     data = await client.get("/admin/force-dispatch", {"session_id": session_id})
-    return fmt.fmt_default(data)
+    return fmt.fmt_admin(data)
 
 
 @mcp.tool(annotations=_ro)
@@ -112,7 +112,7 @@ async def graph_health(
 ) -> str:
     """Find graph anomalies: orphan edges, broken derivations, duplicate edges."""
     data = await client.get("/admin/graph-health", {"check": check})
-    return fmt.fmt_default(data)
+    return fmt.fmt_admin(data)
 
 
 @mcp.tool(annotations=_destructive)
@@ -129,7 +129,7 @@ async def bulk_retract(
         "cascade": cascade,
         "dry_run": dry_run,
     })
-    return fmt.fmt_default(data)
+    return fmt.fmt_admin(data)
 
 
 @mcp.tool(annotations=_rw)
@@ -145,7 +145,7 @@ async def re_evaluate_violations(
         dry_run=dry_run, confidence_threshold=confidence_threshold,
     )
     data = await client.post("/admin/re-evaluate-violations", body)
-    return fmt.fmt_default(data)
+    return fmt.fmt_admin(data)
 
 
 @mcp.tool(annotations=_rw)
@@ -160,7 +160,7 @@ async def backfill_surprise(
         "batch_size": batch_size,
         "dry_run": dry_run,
     })
-    return fmt.fmt_default(data)
+    return fmt.fmt_admin(data)
 
 
 # ─── CLI ───────────────────────────────────────────────────────────────────────

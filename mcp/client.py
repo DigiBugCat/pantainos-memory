@@ -9,6 +9,27 @@ import httpx
 from config import CF_WORKER_URL, CF_CLIENT_ID, CF_CLIENT_SECRET
 
 
+class APIError(Exception):
+    """Error from the CF Worker API with the actual error message."""
+
+    def __init__(self, status_code: int, detail: str) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(detail)
+
+
+def _raise_for_status(resp: httpx.Response) -> None:
+    """Like resp.raise_for_status() but includes the API error message."""
+    if resp.is_success:
+        return
+    try:
+        data = resp.json()
+        detail = data.get("error") or data.get("message") or resp.text
+    except Exception:
+        detail = resp.text or resp.reason_phrase
+    raise APIError(resp.status_code, detail)
+
+
 def _base_headers() -> dict[str, str]:
     import logging
     logger = logging.getLogger(__name__)
@@ -55,7 +76,7 @@ async def post(
     resp = await _get_client().post(
         f"/api{path}", json=body, headers=_extra_headers(session_id)
     )
-    resp.raise_for_status()
+    _raise_for_status(resp)
     return resp.json()  # type: ignore[no-any-return]
 
 
@@ -69,5 +90,5 @@ async def get(
     resp = await _get_client().get(
         f"/api{path}", params=params, headers=_extra_headers(session_id)
     )
-    resp.raise_for_status()
+    _raise_for_status(resp)
     return resp.json()  # type: ignore[no-any-return]

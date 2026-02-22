@@ -75,21 +75,17 @@ async def observe(
     data = await client.post("/observe", body)
     mem_id = data.get("id", "?")
     status = data.get("status", "active")
-    preview = f"{content[:100]}{'...' if len(content) > 100 else ''}"
 
     if status == "draft":
         warnings = data.get("warnings", {})
         missing = warnings.get("missing_fields", [])
-        reasoning = warnings.get("reasoning", "")
-        result = f"Draft [{mem_id}] — saved but NOT committed\n{preview}\n"
-        if missing:
-            for f in missing:
-                result += f"\n- {f.get('field', '?')}: {f.get('reason', '')}"
-        if reasoning:
-            result += f"\n\n{reasoning}"
-        result += f'\n\nTo commit: call override(memory_id="{mem_id}")'
+        fields = ", ".join(f.get("field", "?") for f in missing) if missing else ""
+        result = f"[{mem_id}] draft"
+        if fields:
+            result += f" — missing: {fields}"
+        result += f'. Call override("{mem_id}") to commit'
     else:
-        result = f"Stored [{mem_id}]\n{preview}"
+        result = f"[{mem_id}] stored"
 
     return await _with_notifications(result)
 
@@ -137,7 +133,7 @@ async def resolve(
         replaced_by=replaced_by, force=force if force else None,
     )
     data = await client.post("/resolve", body)
-    return await _with_notifications(fmt.fmt_default(data))
+    return await _with_notifications(fmt.fmt_resolve(data))
 
 
 @mcp.tool(annotations=_rw_idempotent)
