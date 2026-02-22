@@ -43,6 +43,8 @@ export async function callExternalLLM(
     body: JSON.stringify({
       model: options?.model ?? 'gpt-5-mini',
       messages: [{ role: 'user', content: prompt }],
+      max_tokens: 300,
+      response_format: { type: 'json_object' },
     }),
   });
 
