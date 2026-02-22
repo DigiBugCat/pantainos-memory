@@ -128,9 +128,24 @@ app.post('/', async (c) => {
   const timeBound = body.resolves_by !== undefined;
 
   // ── Pre-creation guards ──
-  // Generate content embedding early for duplicate check
+  // Run embedding + completeness + confidence in parallel (completeness doesn't need embedding)
   const t1 = performance.now();
-  const contentEmbedding = await generateEmbedding(c.env.AI, body.content, config, requestId);
+  const [contentEmbedding, completeness, startingConfidence] = await Promise.all([
+    generateEmbedding(c.env.AI, body.content, config, requestId),
+    checkMemoryCompleteness(c.env, c.env.AI, config, {
+      content: body.content,
+      has_source: hasSource,
+      has_derived_from: hasDerivedFrom,
+      has_invalidates_if: Boolean(body.invalidates_if?.length),
+      has_confirms_if: Boolean(body.confirms_if?.length),
+      has_resolves_by: timeBound,
+      atomic_override: body.atomic_override,
+      requestId,
+    }),
+    hasSource
+      ? getStartingConfidenceForSource(c.env.DB, normalizedSource!)
+      : Promise.resolve(timeBound ? TYPE_STARTING_CONFIDENCE.predict : TYPE_STARTING_CONFIDENCE.think),
+  ]);
   const t2 = performance.now();
 
   // Duplicate detection (two-phase: vector similarity → optional LLM) — always blocks
@@ -165,24 +180,6 @@ app.post('/', async (c) => {
       }
     }
   }
-
-  // Completeness check + confidence lookup in parallel (independent operations)
-  const t4 = performance.now();
-  const [completeness, startingConfidence] = await Promise.all([
-    checkMemoryCompleteness(c.env, c.env.AI, config, {
-      content: body.content,
-      has_source: hasSource,
-      has_derived_from: hasDerivedFrom,
-      has_invalidates_if: Boolean(body.invalidates_if?.length),
-      has_confirms_if: Boolean(body.confirms_if?.length),
-      has_resolves_by: timeBound,
-      atomic_override: body.atomic_override,
-      requestId,
-    }),
-    hasSource
-      ? getStartingConfidenceForSource(c.env.DB, normalizedSource!)
-      : Promise.resolve(timeBound ? TYPE_STARTING_CONFIDENCE.predict : TYPE_STARTING_CONFIDENCE.think),
-  ]);
 
   let completenessWarnings: ObserveResponse['warnings'];
   if (completeness && !completeness.is_complete && completeness.missing_fields.length > 0) {
@@ -290,8 +287,8 @@ app.post('/', async (c) => {
   // ── Active path (common): optimistic return, defer writes to waitUntil ──
   logOperation(c, 'exposure', 'queued', { entity_id: id });
 
-  const t5 = performance.now();
-  console.log(`[observe response] id=${id} embedding=${(t2-t1).toFixed(0)}ms dedup=${(t3-t2).toFixed(0)}ms completeness=${(t5-t4).toFixed(0)}ms total=${(t5-t0).toFixed(0)}ms`);
+  const t4 = performance.now();
+  console.log(`[observe response] id=${id} parallel=${(t2-t1).toFixed(0)}ms dedup=${(t3-t2).toFixed(0)}ms total=${(t4-t0).toFixed(0)}ms`);
 
   // Defer all writes to background
   const commitTask = commitMemory(c.env, commitPayload).catch(async (err) => {
