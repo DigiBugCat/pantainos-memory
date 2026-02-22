@@ -138,17 +138,19 @@ app.post('/', async (c) => {
   const t3 = performance.now();
   if (dupCheck.id && dupCheck.similarity >= config.dedupThreshold) {
     const existing = await c.env.DB.prepare(
-      `SELECT content FROM memories WHERE id = ?`
+      `SELECT content FROM memories WHERE id = ? AND retracted = 0`
     ).bind(dupCheck.id).first<{ content: string }>();
-    return c.json({
-      success: false,
-      error: `Duplicate detected (${Math.round(dupCheck.similarity * 100)}% match)`,
-      duplicate_id: dupCheck.id,
-      duplicate_content: existing?.content || null,
-    }, 409);
+    if (existing) {
+      return c.json({
+        success: false,
+        error: `Duplicate detected (${Math.round(dupCheck.similarity * 100)}% match)`,
+        duplicate_id: dupCheck.id,
+        duplicate_content: existing.content,
+      }, 409);
+    }
   } else if (dupCheck.id && dupCheck.similarity >= config.dedupLowerThreshold) {
     const existing = await c.env.DB.prepare(
-      `SELECT content FROM memories WHERE id = ?`
+      `SELECT content FROM memories WHERE id = ? AND retracted = 0`
     ).bind(dupCheck.id).first<{ content: string }>();
     if (existing) {
       const llmResult = await checkDuplicateWithLLM(c.env.AI, body.content, existing.content, config, requestId, c.env);
