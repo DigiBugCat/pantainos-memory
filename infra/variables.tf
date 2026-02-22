@@ -36,7 +36,7 @@ variable "llm_judge_url" {
 variable "llm_judge_model" {
   description = "Model name for LLM judge calls"
   type        = string
-  default     = "gpt-5.2"
+  default     = "gpt-5-chat-latest"
 }
 
 variable "llm_judge_api_key" {

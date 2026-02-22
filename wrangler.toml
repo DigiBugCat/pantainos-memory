@@ -76,7 +76,7 @@ RESOLVER_TYPE = "github"
 RESOLVER_GITHUB_REPO = "DigiBugCat/Cassandra-Finance"
 CLASSIFICATION_CHALLENGE_ENABLED = "true"
 LLM_JUDGE_URL = "https://api.openai.com/v1/chat/completions"
-LLM_JUDGE_MODEL = "gpt-5.2"
+LLM_JUDGE_MODEL = "gpt-5-chat-latest"
 EXPOSURE_LLM_MAX_CONCURRENCY = "20"
 
 # ============================================
@@ -98,7 +98,7 @@ RESOLVER_TYPE = "github"
 RESOLVER_GITHUB_REPO = "DigiBugCat/Cassandra-Finance"
 CLASSIFICATION_CHALLENGE_ENABLED = "true"
 LLM_JUDGE_URL = "https://api.openai.com/v1/chat/completions"
-LLM_JUDGE_MODEL = "gpt-5.2"
+LLM_JUDGE_MODEL = "gpt-5-chat-latest"
 # Exposure check thresholds (lower = more sensitive)
 MIN_SIMILARITY = "0.35"
 VIOLATION_CONFIDENCE_THRESHOLD = "0.6"
