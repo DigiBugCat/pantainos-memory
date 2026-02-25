@@ -157,13 +157,27 @@ export async function claimEventsForDispatch(
   context: string;
   created_at: number;
 }[]> {
-  // First get undispatched events for this session
-  const pending = await env.DB.prepare(`
+  const now = Date.now();
+
+  // Claim first, then read only what this claim actually owns.
+  // This avoids select-then-update races between concurrent schedulers.
+  const claimResult = await env.DB.prepare(`
+    UPDATE memory_events
+    SET dispatched = 1, dispatched_at = ?, workflow_id = ?
+    WHERE session_id = ? AND dispatched = 0
+  `).bind(now, workflowId, sessionId).run();
+
+  const changed = claimResult.meta.changes ?? 0;
+  if (changed === 0) {
+    return [];
+  }
+
+  const claimed = await env.DB.prepare(`
     SELECT id, session_id, event_type, memory_id, violated_by, damage_level, context, created_at
     FROM memory_events
-    WHERE session_id = ? AND dispatched = 0
+    WHERE session_id = ? AND workflow_id = ? AND dispatched = 1
     ORDER BY created_at
-  `).bind(sessionId).all<{
+  `).bind(sessionId, workflowId).all<{
     id: string;
     session_id: string;
     event_type: string;
@@ -174,19 +188,12 @@ export async function claimEventsForDispatch(
     created_at: number;
   }>();
 
-  const events = pending.results || [];
-  if (events.length === 0) return [];
-
-  // Mark them as dispatched immediately to prevent next cron tick from claiming them
-  const ids = events.map(e => e.id);
-  const placeholders = ids.map(() => '?').join(',');
-  await env.DB.prepare(`
-    UPDATE memory_events
-    SET dispatched = 1, dispatched_at = ?, workflow_id = ?
-    WHERE id IN (${placeholders}) AND dispatched = 0
-  `).bind(Date.now(), workflowId, ...ids).run();
-
-  getLog().info('events_claimed', { session_id: sessionId, event_count: events.length });
+  const events = claimed.results || [];
+  getLog().info('events_claimed', {
+    session_id: sessionId,
+    event_count: events.length,
+    claimed_changes: changed,
+  });
 
   return events;
 }

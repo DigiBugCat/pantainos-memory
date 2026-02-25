@@ -9,7 +9,7 @@
     "dev:down": "./scripts/dev-down.sh",
     "deploy": "wrangler deploy",
     "deploy:dev": "wrangler deploy --env dev",
-    "build": "wrangler deploy --dry-run --outdir=dist && wrangler deploy --config wrangler-mcp.toml --dry-run --outdir=dist && wrangler deploy --config wrangler-admin.toml --dry-run --outdir=dist",
+    "build": "wrangler deploy --dry-run --outdir=dist",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -18,9 +18,6 @@
     "test:integration:local": "PANTAINOS_URL=http://localhost:8794 vitest run --config vitest.integration.config.ts"
   },
   "dependencies": {
-    "@cloudflare/workers-oauth-provider": "^0.2.2",
-    "@modelcontextprotocol/sdk": "^1.26.0",
-    "@pantainos/mcp-core": "github:Pantainos-Toolkit/mcp-core",
     "hono": "^4.6.14",
     "nanoid": "^5.0.9"
   },

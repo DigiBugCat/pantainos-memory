@@ -312,6 +312,42 @@ interface AiGatewayOptions {
 }
 
 /**
+ * Simple in-memory async limiter for per-request fan-out control.
+ * Preserves ordering of waiters and avoids unbounded concurrent LLM calls.
+ */
+function createConcurrencyLimiter(maxConcurrency: number) {
+  const limit = Math.max(1, Math.floor(maxConcurrency));
+  let active = 0;
+  const queue: Array<() => void> = [];
+
+  return async function runLimited<T>(work: () => Promise<T>): Promise<T> {
+    if (active >= limit) {
+      await new Promise<void>((resolve) => queue.push(resolve));
+    }
+
+    active += 1;
+    try {
+      return await work();
+    } finally {
+      active -= 1;
+      const next = queue.shift();
+      if (next) next();
+    }
+  };
+}
+
+const limiterByConcurrency = new Map<number, ReturnType<typeof createConcurrencyLimiter>>();
+function getSharedLimiter(maxConcurrency: number) {
+  const limit = Math.max(1, Math.floor(maxConcurrency));
+  let limiter = limiterByConcurrency.get(limit);
+  if (!limiter) {
+    limiter = createConcurrencyLimiter(limit);
+    limiterByConcurrency.set(limit, limiter);
+  }
+  return limiter;
+}
+
+/**
  * Build AI Gateway config for routing through gateway with metadata tags.
  * Returns undefined if no gateway configured (graceful degradation for dev).
  */
@@ -528,6 +564,7 @@ export async function checkExposures(
 ): Promise<ExposureCheckResult> {
   const overallStart = Date.now();
   const config = getConfig(env as unknown as Record<string, string | undefined>);
+  const runLlmLimited = getSharedLimiter(config.exposureLlmMaxConcurrency);
   const thresholds = getThresholds(env);
 
   const result: ExposureCheckResult = {
@@ -582,10 +619,10 @@ export async function checkExposures(
       if (!memory || memory.state !== 'active' || hasPending) return null;
 
       const llmStart = Date.now();
-      const match = await checkConditionMatch(
+      const match = await runLlmLimited(() => checkConditionMatch(
         env, config, observationContent,
         candidate.condition_text, 'invalidates_if', memory.content
-      );
+      ));
 
       getLog().info('llm_judge_result', {
         memory_id: candidate.memory_id,
@@ -660,10 +697,10 @@ export async function checkExposures(
       ]);
       if (!memory || memory.resolves_by == null || memory.state !== 'active' || hasPending) return null;
 
-      const match = await checkConditionMatch(
+      const match = await runLlmLimited(() => checkConditionMatch(
         env, config, observationContent,
         candidate.condition_text, 'confirms_if', memory.content
-      );
+      ));
 
       if (match.matches && match.confidence >= thresholds.confirmConfidence) {
         await autoConfirmThought(env, candidate.memory_id, observationId);
@@ -778,6 +815,7 @@ export async function checkExposuresForNewThought(
   timeBound: boolean = false
 ): Promise<ExposureCheckResult> {
   const config = getConfig(env as unknown as Record<string, string | undefined>);
+  const runLlmLimited = getSharedLimiter(config.exposureLlmMaxConcurrency);
   const thresholds = getThresholds(env);
 
   const result: ExposureCheckResult = {
@@ -840,9 +878,9 @@ export async function checkExposuresForNewThought(
       if (!obs) continue;
       if (hasResolutionTag(obs.tags)) continue;
 
-      const match = await checkConditionMatch(
+      const match = await runLlmLimited(() => checkConditionMatch(
         env, config, obs.content, condition, 'invalidates_if', memoryContent
-      );
+      ));
 
       if (match.matches && match.confidence >= thresholds.violationConfidence) {
         const damageLevel = getDamageLevel(memory.centrality);
@@ -888,9 +926,9 @@ export async function checkExposuresForNewThought(
           if (!obs) continue;
           if (hasResolutionTag(obs.tags)) continue;
 
-          const match = await checkConditionMatch(
+          const match = await runLlmLimited(() => checkConditionMatch(
             env, config, obs.content, condition, 'confirms_if', memoryContent
-          );
+          ));
 
           if (match.matches && match.confidence >= thresholds.confirmConfidence) {
             // Return data — don't call autoConfirmThought (avoids duplicate calls)

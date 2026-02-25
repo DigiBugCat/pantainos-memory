@@ -11,6 +11,7 @@ export interface Config {
   // Models
   embeddingModel: string;
   reasoningModel: string;
+  exposureLlmMaxConcurrency: number;
 
   // AI Gateway (for observability)
   aiGatewayId: string | null;
@@ -140,6 +141,13 @@ export function getConfig(env: Record<string, string | undefined>): Config {
     // Models (strings - just validate non-empty)
     embeddingModel: env.EMBEDDING_MODEL || '@cf/google/embeddinggemma-300m',
     reasoningModel: env.REASONING_MODEL || '@cf/openai/gpt-oss-120b',
+    exposureLlmMaxConcurrency: parseInt_(
+      env.EXPOSURE_LLM_MAX_CONCURRENCY,
+      6,
+      1,
+      50,
+      'EXPOSURE_LLM_MAX_CONCURRENCY'
+    ),
 
     // AI Gateway (optional - for observability)
     aiGatewayId: env.AI_GATEWAY_ID || null,

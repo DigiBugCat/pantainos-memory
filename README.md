@@ -213,6 +213,7 @@ pnpm deploy:dev   # Deploy API worker to dev
 | `MIN_SIMILARITY` | Vector search threshold | `0.35` |
 | `VIOLATION_CONFIDENCE_THRESHOLD` | LLM confidence for violations | `0.6` |
 | `CONFIRM_CONFIDENCE_THRESHOLD` | LLM confidence for confirmations | `0.7` |
+| `EXPOSURE_LLM_MAX_CONCURRENCY` | Max concurrent exposure LLM checks per request | `6` |
 | `CLASSIFICATION_CHALLENGE_ENABLED` | Enable memory completeness checks | `true` |
 | `CF_ACCESS_TEAM` | Cloudflare Access team name | - |
 | `CF_ACCESS_AUD` | Access application AUD tag | - |

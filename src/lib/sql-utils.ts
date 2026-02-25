@@ -90,3 +90,86 @@ export async function queryContradictionGate<T>(
 
   return results;
 }
+
+interface FetchMemoryOptions {
+  includeRetracted?: boolean;
+}
+
+/**
+ * Bulk-fetch memories by IDs with D1-safe chunking.
+ * Returned rows follow input ID order (missing IDs omitted).
+ */
+export async function fetchMemoriesByIds<T extends { id: string; retracted?: number }>(
+  db: D1Database,
+  ids: string[],
+  options: FetchMemoryOptions = {},
+): Promise<T[]> {
+  const uniqueIds = [...new Set(ids.filter(Boolean))];
+  if (uniqueIds.length === 0) return [];
+
+  const includeRetracted = options.includeRetracted ?? false;
+  const rows = await queryInChunks<T>(
+    db,
+    (placeholders) =>
+      `SELECT * FROM memories WHERE id IN (${placeholders}) ${includeRetracted ? '' : 'AND retracted = 0'}`,
+    uniqueIds,
+    [],
+    [],
+    1
+  );
+
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  return uniqueIds.map((id) => byId.get(id)).filter((row): row is T => Boolean(row));
+}
+
+/**
+ * Bulk-fetch edges by source IDs with optional edge type filter.
+ */
+export async function fetchEdgesBySourceIds<T extends { source_id: string; edge_type?: string }>(
+  db: D1Database,
+  sourceIds: string[],
+  edgeTypes?: string[],
+): Promise<T[]> {
+  const uniqueIds = [...new Set(sourceIds.filter(Boolean))];
+  if (uniqueIds.length === 0) return [];
+
+  const typePlaceholders = edgeTypes && edgeTypes.length > 0
+    ? ` AND edge_type IN (${edgeTypes.map(() => '?').join(',')})`
+    : '';
+
+  return queryInChunks<T>(
+    db,
+    (placeholders) =>
+      `SELECT * FROM edges WHERE source_id IN (${placeholders})${typePlaceholders}`,
+    uniqueIds,
+    [],
+    edgeTypes && edgeTypes.length > 0 ? edgeTypes : [],
+    1
+  );
+}
+
+/**
+ * Bulk-fetch edges by target IDs with optional edge type filter.
+ */
+export async function fetchEdgesByTargetIds<T extends { target_id: string; edge_type?: string }>(
+  db: D1Database,
+  targetIds: string[],
+  edgeTypes?: string[],
+): Promise<T[]> {
+  const uniqueIds = [...new Set(targetIds.filter(Boolean))];
+  if (uniqueIds.length === 0) return [];
+
+  const typePlaceholders = edgeTypes && edgeTypes.length > 0
+    ? ` AND edge_type IN (${edgeTypes.map(() => '?').join(',')})`
+    : '';
+
+  return queryInChunks<T>(
+    db,
+    (placeholders) =>
+      `SELECT * FROM edges WHERE target_id IN (${placeholders})${typePlaceholders}`,
+    uniqueIds,
+    [],
+    edgeTypes && edgeTypes.length > 0 ? edgeTypes : [],
+    1
+  );
+}
