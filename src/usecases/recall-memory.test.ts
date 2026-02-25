@@ -31,7 +31,7 @@ function memoryRow(id: string, content: string): MemoryRow {
     surprise: null,
     exposure_check_status: 'completed',
     exposure_check_completed_at: null,
-    agent_id: '_default',
+    agent_id: '_global',
     tags: null,
     obsidian_sources: null,
     session_id: null,

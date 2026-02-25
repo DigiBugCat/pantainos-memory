@@ -88,7 +88,7 @@ app.use('*', async (c, next) => {
 // Agent scope middleware - extract X-Agent-Id and X-Memory-Scope headers
 app.use('*', async (c, next) => {
   const rawAgentId = c.req.header('X-Agent-Id');
-  const agentId = rawAgentId?.trim() || '_default';
+  const agentId = rawAgentId?.trim() || '_global';
 
   const rawScope = c.req.header('X-Memory-Scope');
   let scopeIds: string[];

@@ -44,7 +44,7 @@ function buildMemoryRow(id: string, content: string, derivedFrom?: string[] | nu
     surprise: null,
     exposure_check_status: 'completed',
     exposure_check_completed_at: null,
-    agent_id: '_default',
+    agent_id: '_global',
     tags: null,
     obsidian_sources: null,
     session_id: null,
@@ -116,8 +116,8 @@ function createTestApp(routePath: string, route: Hono<any>) {
     c.set('config', getConfig({}));
     c.set('requestId', 'req-1');
     c.set('sessionId', 'session-1');
-    c.set('agentId', '_default');
-    c.set('memoryScope', ['_default']);
+    c.set('agentId', '_global');
+    c.set('memoryScope', ['_global']);
     await next();
   });
   app.route(routePath, route);

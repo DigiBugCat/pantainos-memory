@@ -69,7 +69,7 @@ export async function commitMemory(env: Env, payload: CommitPayload): Promise<vo
     body.resolves_by || null,
     startingConfidence,
     initialState,
-    agentId || '_default',
+    agentId || '_global',
     body.tags ? JSON.stringify(body.tags) : null,
     body.obsidian_sources ? JSON.stringify(body.obsidian_sources) : null,
     sessionId || null,
