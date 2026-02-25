@@ -6,7 +6,7 @@ from typing import Any
 
 import httpx
 
-from config import CF_WORKER_URL, CF_CLIENT_ID, CF_CLIENT_SECRET
+from config import CF_WORKER_URL, CF_CLIENT_ID, CF_CLIENT_SECRET, AGENT_ID, MEMORY_SCOPE
 
 
 class APIError(Exception):
@@ -63,6 +63,10 @@ def _extra_headers(session_id: str | None = None) -> dict[str, str]:
     headers: dict[str, str] = {}
     if session_id:
         headers["X-Session-Id"] = session_id
+    if AGENT_ID:
+        headers["X-Agent-Id"] = AGENT_ID
+    if MEMORY_SCOPE:
+        headers["X-Memory-Scope"] = MEMORY_SCOPE
     return headers
 
 

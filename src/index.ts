@@ -56,6 +56,8 @@ type Variables = {
   config: Config;
   requestId: string;
   sessionId: string | undefined;
+  agentId: string;
+  memoryScope: string[];
   userAgent: string | undefined;
   ipHash: string | undefined;
 };
@@ -80,6 +82,29 @@ app.use('*', async (c, next) => {
 app.use('*', async (c, next) => {
   const sessionId = c.req.header('X-Session-Id');
   c.set('sessionId', sessionId);
+  await next();
+});
+
+// Agent scope middleware - extract X-Agent-Id and X-Memory-Scope headers
+app.use('*', async (c, next) => {
+  const rawAgentId = c.req.header('X-Agent-Id');
+  const agentId = rawAgentId?.trim() || '_default';
+
+  const rawScope = c.req.header('X-Memory-Scope');
+  let scopeIds: string[];
+  if (!rawScope) {
+    // Default: agent-only scope
+    scopeIds = [agentId];
+  } else {
+    const parts = rawScope.split(',').map(s => s.trim());
+    scopeIds = [];
+    if (parts.includes('agent')) scopeIds.push(agentId);
+    if (parts.includes('global')) scopeIds.push('_global');
+    if (scopeIds.length === 0) scopeIds = [agentId]; // fallback
+  }
+
+  c.set('agentId', agentId);
+  c.set('memoryScope', scopeIds);
   await next();
 });
 

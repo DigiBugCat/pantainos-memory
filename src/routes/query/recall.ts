@@ -7,22 +7,21 @@
 import { Hono } from 'hono';
 import type {
   Env,
-  MemoryRow,
-  EdgeRow,
   MemoryEdge,
-  Memory,
   RecallResponse,
 } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
 import { recordAccess } from '../../services/access-service.js';
-import { rowToMemory } from '../../lib/transforms.js';
 import { getConfidenceStats } from '../../services/confidence.js';
 import { getDisplayType } from '../../lib/shared/types/index.js';
+import { recallMemory } from '../../usecases/recall-memory.js';
 
 type Variables = {
   config: Config;
   requestId: string;
   sessionId: string | undefined;
+  agentId: string;
+  memoryScope: string[];
   userAgent: string | undefined;
   ipHash: string | undefined;
 };
@@ -41,24 +40,21 @@ app.get('/:id', async (c) => {
     return c.json({ success: false, error: 'id is required' }, 400);
   }
 
-  // Fetch memory from unified table
-  const row = await c.env.DB.prepare(
-    `SELECT * FROM memories WHERE id = ?`
-  ).bind(id).first<MemoryRow>();
-
-  if (!row) {
+  const recallResult = await recallMemory(c.env.DB, id);
+  if (!recallResult) {
     return c.json({ success: false, error: 'Memory not found' }, 404);
   }
 
-  const memory = rowToMemory(row);
+  // Scope gate: only return if agent_id is in caller's scope
+  const memoryScope = c.get('memoryScope');
+  if (!memoryScope.includes(recallResult.row.agent_id)) {
+    return c.json({ success: false, error: 'Memory not found' }, 404);
+  }
+
+  const { memory, edges: edgeRows, connections } = recallResult;
   const stats = getConfidenceStats(memory);
 
-  // Get edges (what this memory is derived from and what derives from it)
-  const edgeRows = await c.env.DB.prepare(
-    `SELECT * FROM edges WHERE source_id = ? OR target_id = ?`
-  ).bind(id, id).all<EdgeRow>();
-
-  const edges: MemoryEdge[] = (edgeRows.results || []).map(r => ({
+  const edges: MemoryEdge[] = edgeRows.map(r => ({
     id: r.id,
     source_id: r.source_id,
     target_id: r.target_id,
@@ -66,23 +62,6 @@ app.get('/:id', async (c) => {
     strength: r.strength,
     created_at: r.created_at,
   }));
-
-  // Fetch connected memories
-  const connectedIds = new Set<string>();
-  for (const edge of edges) {
-    if (edge.source_id !== id) connectedIds.add(edge.source_id);
-    if (edge.target_id !== id) connectedIds.add(edge.target_id);
-  }
-
-  const connections: Memory[] = [];
-  for (const connectedId of connectedIds) {
-    const connectedRow = await c.env.DB.prepare(
-      `SELECT * FROM memories WHERE id = ? AND retracted = 0`
-    ).bind(connectedId).first<MemoryRow>();
-    if (connectedRow) {
-      connections.push(rowToMemory(connectedRow));
-    }
-  }
 
   // Record access event for audit trail
   await recordAccess(c.env.DB, {

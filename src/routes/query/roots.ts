@@ -10,11 +10,14 @@ import type { Env, MemoryRow, EdgeRow, Memory } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
 import { rowToMemory } from '../../lib/transforms.js';
 import { getDisplayType } from '../../lib/shared/types/index.js';
+import { fetchEdgesByTargetIds, fetchMemoriesByIds } from '../../lib/sql-utils.js';
 
 type Variables = {
   config: Config;
   requestId: string;
   sessionId: string | undefined;
+  agentId: string;
+  memoryScope: string[];
 };
 
 /** Display type for memory entities */
@@ -48,6 +51,12 @@ app.get('/:id', async (c) => {
     return c.json({ success: false, error: 'Memory not found' }, 404);
   }
 
+  // Scope gate on entry point
+  const memoryScope = c.get('memoryScope');
+  if (!memoryScope.includes(row.agent_id)) {
+    return c.json({ success: false, error: 'Memory not found' }, 404);
+  }
+
   const memory = rowToMemory(row);
 
   // If this memory has no derivation chain, it's already a root
@@ -64,14 +73,50 @@ app.get('/:id', async (c) => {
     return c.json(response);
   }
 
-  // Trace up the edge DAG to find all roots (memories with no parents)
-  const visited = new Set<string>();
-  const roots: Memory[] = [];
-  let maxDepth = 0;
+  // Trace up the edge DAG to find all roots with batched layer fetches.
+  const visited = new Set<string>([id]);
+  const nodeDepth = new Map<string, number>([[id, 0]]);
+  const rootIds = new Set<string>();
+  let frontier = [id];
 
-  await traceToRoots(c.env.DB, id, 0, visited, roots, (depth) => {
-    if (depth > maxDepth) maxDepth = depth;
+  while (frontier.length > 0) {
+    const derivedFrom = await fetchEdgesByTargetIds<Pick<EdgeRow, 'source_id' | 'target_id' | 'edge_type'>>(
+      c.env.DB,
+      frontier,
+      ['derived_from']
+    );
+
+    const parentMap = new Map<string, string[]>();
+    for (const edge of derivedFrom) {
+      const parents = parentMap.get(edge.target_id) || [];
+      parents.push(edge.source_id);
+      parentMap.set(edge.target_id, parents);
+    }
+
+    const nextFrontier: string[] = [];
+    for (const childId of frontier) {
+      const parents = parentMap.get(childId) || [];
+      if (parents.length === 0) {
+        rootIds.add(childId);
+      } else {
+        const childDepth = nodeDepth.get(childId) || 0;
+        for (const parentId of parents) {
+          if (visited.has(parentId)) continue;
+          visited.add(parentId);
+          nodeDepth.set(parentId, childDepth + 1);
+          nextFrontier.push(parentId);
+        }
+      }
+    }
+
+    frontier = nextFrontier;
+  }
+
+  const rootRows = await fetchMemoriesByIds<MemoryRow>(c.env.DB, [...rootIds], {
+    includeRetracted: false,
   });
+  const roots: Memory[] = rootRows.map((r) => rowToMemory(r));
+  const maxDepth = roots.reduce((acc, r) => Math.max(acc, nodeDepth.get(r.id) || 0), 0);
 
   const response: RootsResponse = {
     memory: {
@@ -85,43 +130,5 @@ app.get('/:id', async (c) => {
 
   return c.json(response);
 });
-
-/**
- * Recursively trace up the edge DAG to find root memories (no parents).
- */
-async function traceToRoots(
-  db: D1Database,
-  memoryId: string,
-  depth: number,
-  visited: Set<string>,
-  roots: Memory[],
-  updateMaxDepth: (depth: number) => void
-): Promise<void> {
-  if (visited.has(memoryId)) return;
-  visited.add(memoryId);
-
-  // Get what this memory is derived from
-  const derivedFrom = await db.prepare(
-    `SELECT source_id FROM edges WHERE target_id = ? AND edge_type = 'derived_from'`
-  ).bind(memoryId).all<Pick<EdgeRow, 'source_id'>>();
-
-  // If no parents, this is a root
-  if (!derivedFrom.results || derivedFrom.results.length === 0) {
-    const row = await db.prepare(
-      `SELECT * FROM memories WHERE id = ? AND retracted = 0`
-    ).bind(memoryId).first<MemoryRow>();
-
-    if (row && !roots.some(r => r.id === memoryId)) {
-      roots.push(rowToMemory(row));
-      updateMaxDepth(depth);
-    }
-    return;
-  }
-
-  // Trace up from each parent
-  for (const parent of derivedFrom.results) {
-    await traceToRoots(db, parent.source_id, depth + 1, visited, roots, updateMaxDepth);
-  }
-}
 
 export default app;

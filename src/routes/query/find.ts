@@ -12,20 +12,20 @@
  */
 
 import { Hono } from 'hono';
-import type { Env, FindRequest, FindResponse, ScoredMemory, MemoryRow, RecordAccessParams } from '../../types/index.js';
+import type { Env, FindRequest, FindResponse, RecordAccessParams } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
-import { generateEmbedding, searchSimilar } from '../../lib/embeddings.js';
 import { logField } from '../../lib/shared/logging/index.js';
 import { recordAccessBatch } from '../../services/access-service.js';
-import { rowToMemory } from '../../lib/transforms.js';
-import { createScoredMemory } from '../../lib/scoring.js';
 import { getMaxTimesTested } from '../../jobs/compute-stats.js';
 import { getDisplayType } from '../../lib/shared/types/index.js';
+import { findMemories } from '../../usecases/find-memories.js';
 
 type Variables = {
   config: Config;
   requestId: string;
   sessionId: string | undefined;
+  agentId: string;
+  memoryScope: string[];
   userAgent: string | undefined;
   ipHash: string | undefined;
 };
@@ -64,49 +64,30 @@ app.post('/', async (c) => {
   const allowThoughts = !body.filter || body.filter.thoughts_only || (!body.filter.observations_only && !body.filter.predictions_only);
   const allowPredictions = !body.filter || body.filter.predictions_only || (!body.filter.observations_only && !body.filter.thoughts_only);
 
-  // Generate embedding for query
-  const queryEmbedding = await generateEmbedding(c.env.AI, body.query, config, requestId);
-
-  // Search Vectorize
-  const searchResults = await searchSimilar(
-    c.env,
-    queryEmbedding,
-    limit * 2, // Get more to allow for filtering
-    minSimilarity,
-    requestId
-  );
-
   // Get max_times_tested from system_stats for proper confidence normalization
   const maxTimesTested = await getMaxTimesTested(c.env.DB);
 
-  // Fetch memory details and filter
-  const results: ScoredMemory[] = [];
+  const memoryScope = c.get('memoryScope');
 
-  for (const match of searchResults) {
-    if (results.length >= limit) break;
-
-    // Fetch from unified memories table
-    const row = await c.env.DB.prepare(
-      `SELECT * FROM memories WHERE id = ? ${includeRetracted ? '' : 'AND retracted = 0'}`
-    ).bind(match.id).first<MemoryRow>();
-
-    if (!row) continue;
-
-    // Filter by field presence (legacy type filters)
-    const hasSource = row.source != null;
-    const hasResolveBy = row.resolves_by != null;
-    const hasDerived = row.derived_from != null;
-    if (hasSource && !allowObservations) continue;
-    if (!hasSource && hasDerived && !hasResolveBy && !allowThoughts) continue;
-    if (hasResolveBy && !allowPredictions) continue;
-
-    const memory = rowToMemory(row);
-    const scoredMemory = createScoredMemory(memory, match.similarity, config, maxTimesTested);
-    results.push(scoredMemory);
-  }
-
-  // Sort by score descending
-  results.sort((a, b) => b.score - a.score);
+  const results = await findMemories(c.env, config, {
+    query: body.query,
+    limit,
+    minSimilarity,
+    includeRetracted,
+    requestId,
+    candidateMultiplier: 2,
+    maxTimesTested,
+    agentIds: memoryScope,
+    filter: (row) => {
+      const hasSource = row.source != null;
+      const hasResolveBy = row.resolves_by != null;
+      const hasDerived = row.derived_from != null;
+      if (hasSource && !allowObservations) return false;
+      if (!hasSource && hasDerived && !hasResolveBy && !allowThoughts) return false;
+      if (hasResolveBy && !allowPredictions) return false;
+      return true;
+    },
+  });
 
   // Record access events for all returned results
   if (results.length > 0) {

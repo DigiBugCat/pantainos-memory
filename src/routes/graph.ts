@@ -9,8 +9,14 @@
 
 import { Hono } from 'hono';
 import type { Env } from '../types/index.js';
+import { fetchEdgesBySourceIds, queryInChunks } from '../lib/sql-utils.js';
 
-const app = new Hono<{ Bindings: Env }>();
+type Variables = {
+  agentId: string;
+  memoryScope: string[];
+};
+
+const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 /** Display type for graph nodes */
 type DisplayType = 'memory';
@@ -40,14 +46,11 @@ interface GraphEdge {
  * Used by graph viewer for initial dashboard load
  */
 app.get('/', async (c) => {
-  const [
-    memories,
-    edges,
-    edgeCounts,
-    accessCounts,
-  ] = await Promise.all([
-    // All active memories - derive type from field presence
-    c.env.DB.prepare(`
+  const scopeIds = c.get('memoryScope');
+  const scopePlaceholders = scopeIds.map(() => '?').join(',');
+
+  // All active memories in scope - derive type from field presence
+  const memories = await c.env.DB.prepare(`
       SELECT id, content,
              CASE
                WHEN source IS NOT NULL THEN 'observation'
@@ -58,50 +61,49 @@ app.get('/', async (c) => {
              source, state, tags,
              times_tested, confirmations, created_at
       FROM memories
-      WHERE retracted = 0
+      WHERE retracted = 0 AND agent_id IN (${scopePlaceholders})
       ORDER BY created_at DESC
       LIMIT 1000
-    `).all<{
-      id: string;
-      content: string;
-      type: DisplayType;
-      source: string | null;
-      state: string;
-      tags: string | null;
-      times_tested: number;
-      confirmations: number;
-      created_at: number;
-    }>(),
+    `).bind(...scopeIds).all<{
+    id: string;
+    content: string;
+    type: DisplayType;
+    source: string | null;
+    state: string;
+    tags: string | null;
+    times_tested: number;
+    confirmations: number;
+    created_at: number;
+  }>();
 
-    // All edges
-    c.env.DB.prepare(`
-      SELECT source_id, target_id, strength
-      FROM edges
-    `).all<GraphEdge>(),
-
-    // Edge count per entity (outgoing edges)
-    c.env.DB.prepare(`
-      SELECT source_id as entity_id, COUNT(*) as count
-      FROM edges
-      GROUP BY source_id
-    `).all<{ entity_id: string; count: number }>(),
-
-    // Access count per entity
-    c.env.DB.prepare(`
-      SELECT entity_id, COUNT(*) as count
-      FROM access_events
-      GROUP BY entity_id
-    `).all<{ entity_id: string; count: number }>(),
+  const memoryIds = (memories.results || []).map((m) => m.id);
+  const memoryIdSet = new Set(memoryIds);
+  const [edgesRaw, accessCounts] = await Promise.all([
+    fetchEdgesBySourceIds<GraphEdge>(c.env.DB, memoryIds),
+    queryInChunks<{ entity_id: string; count: number }>(
+      c.env.DB,
+      (placeholders) => `
+        SELECT entity_id, COUNT(*) as count
+        FROM access_events
+        WHERE entity_id IN (${placeholders})
+        GROUP BY entity_id
+      `,
+      memoryIds,
+      [],
+      [],
+      1
+    ),
   ]);
+  const edges = edgesRaw.filter((edge) => memoryIdSet.has(edge.target_id));
 
   // Build lookup maps for counts
   const edgeCountMap = new Map<string, number>();
-  for (const row of edgeCounts.results || []) {
-    edgeCountMap.set(row.entity_id, row.count);
+  for (const edge of edges) {
+    edgeCountMap.set(edge.source_id, (edgeCountMap.get(edge.source_id) || 0) + 1);
   }
 
   const accessCountMap = new Map<string, number>();
-  for (const row of accessCounts.results || []) {
+  for (const row of accessCounts) {
     accessCountMap.set(row.entity_id, row.count);
   }
 
@@ -122,10 +124,10 @@ app.get('/', async (c) => {
 
   return c.json({
     memories: entities,
-    edges: edges.results || [],
+    edges,
     stats: {
       total_memories: entities.length,
-      total_edges: edges.results?.length || 0,
+      total_edges: edges.length,
     },
   });
 });

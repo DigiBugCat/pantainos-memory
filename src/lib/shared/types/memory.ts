@@ -135,6 +135,9 @@ export interface Memory {
   exposure_check_status: ExposureCheckStatus;
   exposure_check_completed_at?: number;
 
+  // Scoping
+  agent_id: string;
+
   // Metadata
   tags?: string[];
   obsidian_sources?: string[];
@@ -174,6 +177,8 @@ export interface MemoryRow {
   // Exposure check tracking
   exposure_check_status: string;
   exposure_check_completed_at: number | null;
+  // Scoping
+  agent_id: string;
   // Metadata
   tags: string | null;
   obsidian_sources: string | null;

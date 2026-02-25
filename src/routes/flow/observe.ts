@@ -53,6 +53,8 @@ type Variables = {
   config: Config;
   requestId: string;
   sessionId: string | undefined;
+  agentId: string;
+  memoryScope: string[];
   userAgent: string | undefined;
   ipHash: string | undefined;
 };
@@ -79,6 +81,7 @@ app.post('/', async (c) => {
   const config = c.get('config');
   const requestId = c.get('requestId');
   const sessionId = c.get('sessionId');
+  const agentId = c.get('agentId');
   const userAgent = c.get('userAgent');
   const ipHash = c.get('ipHash');
 
@@ -149,12 +152,13 @@ app.post('/', async (c) => {
   const t2 = performance.now();
 
   // Duplicate detection (two-phase: vector similarity → optional LLM) — always blocks
+  // Only dedup within the same agent's scope (cross-agent duplicates are intentional)
   const dupCheck = await checkDuplicate(c.env, contentEmbedding, requestId);
   const t3 = performance.now();
   if (dupCheck.id && dupCheck.similarity >= config.dedupThreshold) {
     const existing = await c.env.DB.prepare(
-      `SELECT content FROM memories WHERE id = ? AND retracted = 0`
-    ).bind(dupCheck.id).first<{ content: string }>();
+      `SELECT content FROM memories WHERE id = ? AND retracted = 0 AND agent_id = ?`
+    ).bind(dupCheck.id, agentId).first<{ content: string }>();
     if (existing) {
       return c.json({
         success: false,
@@ -165,8 +169,8 @@ app.post('/', async (c) => {
     }
   } else if (dupCheck.id && dupCheck.similarity >= config.dedupLowerThreshold) {
     const existing = await c.env.DB.prepare(
-      `SELECT content FROM memories WHERE id = ? AND retracted = 0`
-    ).bind(dupCheck.id).first<{ content: string }>();
+      `SELECT content FROM memories WHERE id = ? AND retracted = 0 AND agent_id = ?`
+    ).bind(dupCheck.id, agentId).first<{ content: string }>();
     if (existing) {
       const llmResult = await checkDuplicateWithLLM(c.env.AI, body.content, existing.content, config, requestId, c.env);
       if (llmResult.isDuplicate && llmResult.confidence >= config.dedupConfidenceThreshold) {
@@ -202,7 +206,7 @@ app.post('/', async (c) => {
     id, body, normalizedSource, hasSource, hasDerivedFrom,
     initialState, timeBound, hasConditions: Boolean(hasConditions),
     startingConfidence, contentEmbedding,
-    sessionId, requestId, userAgent, ipHash, now, config,
+    agentId, sessionId, requestId, userAgent, ipHash, now, config,
   };
 
   logField(c, 'memory_id', id);

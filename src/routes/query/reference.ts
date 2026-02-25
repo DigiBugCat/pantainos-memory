@@ -10,11 +10,14 @@ import type { Env, EdgeRow, MemoryRow, EdgeType } from '../../types/index.js';
 import type { Config } from '../../lib/config.js';
 import { rowToMemory } from '../../lib/transforms.js';
 import { getDisplayType } from '../../lib/shared/types/index.js';
+import { fetchEdgesBySourceIds, fetchEdgesByTargetIds, fetchMemoriesByIds } from '../../lib/sql-utils.js';
 
 type Variables = {
   config: Config;
   requestId: string;
   sessionId: string | undefined;
+  agentId: string;
+  memoryScope: string[];
 };
 
 /** Display type for memory entities */
@@ -47,7 +50,7 @@ app.get('/:id', async (c) => {
 
   const nodes: Map<string, GraphNode> = new Map();
   const edges: GraphEdge[] = [];
-  const visited = new Set<string>();
+  const visited = new Set<string>([id]);
 
   // Start from the given memory
   const rootRow = await c.env.DB.prepare(
@@ -55,6 +58,12 @@ app.get('/:id', async (c) => {
   ).bind(id).first<MemoryRow>();
 
   if (!rootRow) {
+    return c.json({ success: false, error: 'Memory not found' }, 404);
+  }
+
+  // Scope gate on root entry point
+  const memoryScope = c.get('memoryScope');
+  if (!memoryScope.includes(rootRow.agent_id)) {
     return c.json({ success: false, error: 'Memory not found' }, 404);
   }
 
@@ -67,8 +76,81 @@ app.get('/:id', async (c) => {
     depth: 0,
   });
 
-  // Traverse the graph
-  await traverse(c.env.DB, id, 0, maxDepth, direction, nodes, edges, visited);
+  // Traverse the graph layer-by-layer with batched DB fetches.
+  let frontier = [id];
+  let depth = 0;
+  const edgeSeen = new Set<string>();
+
+  while (frontier.length > 0 && depth < maxDepth) {
+    const [incoming, outgoing] = await Promise.all([
+      (direction === 'up' || direction === 'both')
+        ? fetchEdgesByTargetIds<EdgeRow>(c.env.DB, frontier)
+        : Promise.resolve([] as EdgeRow[]),
+      (direction === 'down' || direction === 'both')
+        ? fetchEdgesBySourceIds<EdgeRow>(c.env.DB, frontier)
+        : Promise.resolve([] as EdgeRow[]),
+    ]);
+
+    const nextIds: string[] = [];
+
+    for (const row of incoming) {
+      const key = `${row.source_id}:${row.target_id}:${row.edge_type}`;
+      if (!edgeSeen.has(key)) {
+        edgeSeen.add(key);
+        edges.push({
+          source: row.source_id,
+          target: row.target_id,
+          type: row.edge_type as EdgeType,
+          strength: row.strength,
+        });
+      }
+      if (!visited.has(row.source_id)) {
+        nextIds.push(row.source_id);
+      }
+    }
+
+    for (const row of outgoing) {
+      const key = `${row.source_id}:${row.target_id}:${row.edge_type}`;
+      if (!edgeSeen.has(key)) {
+        edgeSeen.add(key);
+        edges.push({
+          source: row.source_id,
+          target: row.target_id,
+          type: row.edge_type as EdgeType,
+          strength: row.strength,
+        });
+      }
+      if (!visited.has(row.target_id)) {
+        nextIds.push(row.target_id);
+      }
+    }
+
+    const uniqueNextIds = [...new Set(nextIds)];
+    if (uniqueNextIds.length === 0) break;
+
+    const nextRows = await fetchMemoriesByIds<MemoryRow>(c.env.DB, uniqueNextIds, {
+      includeRetracted: false,
+    });
+
+    for (const row of nextRows) {
+      if (!nodes.has(row.id)) {
+        const mem = rowToMemory(row);
+        nodes.set(row.id, {
+          id: row.id,
+          type: getDisplayType(mem),
+          content: mem.content,
+          depth: depth + 1,
+        });
+      }
+    }
+
+    for (const nextId of uniqueNextIds) {
+      visited.add(nextId);
+    }
+
+    frontier = uniqueNextIds;
+    depth += 1;
+  }
 
   return c.json({
     success: true,
@@ -77,89 +159,5 @@ app.get('/:id', async (c) => {
     edges,
   });
 });
-
-async function traverse(
-  db: D1Database,
-  memoryId: string,
-  currentDepth: number,
-  maxDepth: number,
-  direction: string,
-  nodes: Map<string, GraphNode>,
-  edges: GraphEdge[],
-  visited: Set<string>
-): Promise<void> {
-  if (currentDepth >= maxDepth || visited.has(memoryId)) {
-    return;
-  }
-  visited.add(memoryId);
-
-  // Traverse up (what this memory is derived from)
-  if (direction === 'up' || direction === 'both') {
-    const derivedFrom = await db.prepare(
-      `SELECT * FROM edges WHERE target_id = ?`
-    ).bind(memoryId).all<EdgeRow>();
-
-    for (const row of derivedFrom.results || []) {
-      if (!nodes.has(row.source_id)) {
-        const sourceRow = await db.prepare(
-          `SELECT * FROM memories WHERE id = ? AND retracted = 0`
-        ).bind(row.source_id).first<MemoryRow>();
-
-        if (sourceRow) {
-          const sourceMemory = rowToMemory(sourceRow);
-          nodes.set(row.source_id, {
-            id: row.source_id,
-            type: getDisplayType(sourceMemory),
-            content: sourceMemory.content,
-            depth: currentDepth + 1,
-          });
-        }
-      }
-
-      edges.push({
-        source: row.source_id,
-        target: memoryId,
-        type: row.edge_type as EdgeType,
-        strength: row.strength,
-      });
-
-      await traverse(db, row.source_id, currentDepth + 1, maxDepth, 'up', nodes, edges, visited);
-    }
-  }
-
-  // Traverse down (what derives from this memory)
-  if (direction === 'down' || direction === 'both') {
-    const derivesTo = await db.prepare(
-      `SELECT * FROM edges WHERE source_id = ?`
-    ).bind(memoryId).all<EdgeRow>();
-
-    for (const row of derivesTo.results || []) {
-      if (!nodes.has(row.target_id)) {
-        const targetRow = await db.prepare(
-          `SELECT * FROM memories WHERE id = ? AND retracted = 0`
-        ).bind(row.target_id).first<MemoryRow>();
-
-        if (targetRow) {
-          const targetMemory = rowToMemory(targetRow);
-          nodes.set(row.target_id, {
-            id: row.target_id,
-            type: getDisplayType(targetMemory),
-            content: targetMemory.content,
-            depth: currentDepth + 1,
-          });
-        }
-      }
-
-      edges.push({
-        source: memoryId,
-        target: row.target_id,
-        type: row.edge_type as EdgeType,
-        strength: row.strength,
-      });
-
-      await traverse(db, row.target_id, currentDepth + 1, maxDepth, 'down', nodes, edges, visited);
-    }
-  }
-}
 
 export default app;

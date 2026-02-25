@@ -21,6 +21,7 @@ export interface CommitPayload {
   hasConditions: boolean;
   startingConfidence: number;
   contentEmbedding: number[];
+  agentId: string;
   sessionId: string | undefined;
   requestId: string;
   userAgent: string | undefined;
@@ -42,7 +43,7 @@ export async function commitMemory(env: Env, payload: CommitPayload): Promise<vo
   const {
     id, body, normalizedSource, hasSource, hasDerivedFrom,
     initialState, timeBound, hasConditions, startingConfidence,
-    contentEmbedding, sessionId, requestId, userAgent, ipHash, now, config,
+    contentEmbedding, agentId, sessionId, requestId, userAgent, ipHash, now, config,
   } = payload;
 
   // Step 1: D1 INSERT (OR IGNORE for idempotent retries)
@@ -53,8 +54,8 @@ export async function commitMemory(env: Env, payload: CommitPayload): Promise<vo
       outcome_condition, resolves_by,
       starting_confidence, confirmations, times_tested, contradictions,
       centrality, state, violations,
-      retracted, tags, obsidian_sources, session_id, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, '[]', 0, ?, ?, ?, ?)`
+      retracted, agent_id, tags, obsidian_sources, session_id, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, '[]', 0, ?, ?, ?, ?, ?)`
   ).bind(
     id,
     body.content,
@@ -68,6 +69,7 @@ export async function commitMemory(env: Env, payload: CommitPayload): Promise<vo
     body.resolves_by || null,
     startingConfidence,
     initialState,
+    agentId || '_default',
     body.tags ? JSON.stringify(body.tags) : null,
     body.obsidian_sources ? JSON.stringify(body.obsidian_sources) : null,
     sessionId || null,
@@ -141,8 +143,8 @@ export async function commitMemory(env: Env, payload: CommitPayload): Promise<vo
     const invCount = (hasConditions ? body.invalidates_if?.length : 0) ?? 0;
 
     const contentMetadata = hasSource
-      ? { type: 'obs', source: normalizedSource, has_invalidates_if: Boolean(hasConditions && body.invalidates_if?.length), has_confirms_if: Boolean(hasConditions && body.confirms_if?.length) }
-      : { type: 'thought', has_invalidates_if: Boolean(body.invalidates_if?.length), has_assumes: Boolean(body.assumes?.length), has_confirms_if: Boolean(body.confirms_if?.length), has_outcome: timeBound, resolves_by: body.resolves_by, time_bound: timeBound };
+      ? { type: 'obs', source: normalizedSource, agent_id: agentId, has_invalidates_if: Boolean(hasConditions && body.invalidates_if?.length), has_confirms_if: Boolean(hasConditions && body.confirms_if?.length) }
+      : { type: 'thought', agent_id: agentId, has_invalidates_if: Boolean(body.invalidates_if?.length), has_assumes: Boolean(body.assumes?.length), has_confirms_if: Boolean(body.confirms_if?.length), has_outcome: timeBound, resolves_by: body.resolves_by, time_bound: timeBound };
 
     const upserts: Promise<unknown>[] = [
       env.MEMORY_VECTORS.upsert([{ id, values: contentEmbedding, metadata: contentMetadata as any }]),
