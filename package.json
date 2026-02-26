@@ -18,7 +18,7 @@
     "test:integration:local": "PANTAINOS_URL=http://localhost:8794 vitest run --config vitest.integration.config.ts"
   },
   "dependencies": {
-    "hono": "^4.6.14",
+    "hono": "^4.12.2",
     "nanoid": "^5.0.9"
   },
   "devDependencies": {
