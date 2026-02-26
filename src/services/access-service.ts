@@ -113,12 +113,6 @@ export async function getAccessLog(
   entityId: string,
   limit: number = 20
 ): Promise<AccessLogResponse | null> {
-  // Infer entity type from ID prefix
-  const entityType = inferEntityType(entityId);
-  if (!entityType) {
-    return null;
-  }
-
   // Get total count
   const countResult = await db.prepare(
     `SELECT COUNT(*) as total FROM access_events WHERE entity_id = ?`
@@ -169,6 +163,9 @@ export async function getAccessLog(
     similarityScore: row.similarity_score ?? undefined,
     accessedAt: new Date(row.accessed_at).toISOString(),
   }));
+
+  // Use entity_type from the first event, or 'memory' as default
+  const entityType: HistoryEntityType = (recentEvents[0]?.entityType as HistoryEntityType) ?? 'memory';
 
   return {
     entityId,
@@ -336,13 +333,3 @@ export async function querySessionMemories(
   });
 }
 
-/**
- * Infer entity type from ID prefix.
- * Note: With unified model, IDs no longer have prefixes.
- * This function is kept for legacy compatibility only.
- */
-function inferEntityType(_id: string): HistoryEntityType | null {
-  // With unified model, we can't infer type from ID
-  // Return null to indicate lookup is required
-  return null;
-}

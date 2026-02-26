@@ -69,13 +69,7 @@ export async function getHistory(
   entityId: string,
   limit: number = 20
 ): Promise<HistoryResponse | null> {
-  // Infer entity type from ID prefix
-  const entityType = inferEntityType(entityId);
-  if (!entityType) {
-    return null;
-  }
-
-  // Get versions
+  // Query by entity_id directly — entity_type is stored in the data for display
   const rows = await db.prepare(
     `SELECT * FROM entity_versions
      WHERE entity_id = ?
@@ -102,6 +96,9 @@ export async function getHistory(
     ipHash: row.ip_hash ?? undefined,
     createdAt: new Date(row.created_at).toISOString(),
   }));
+
+  // Use entity_type from the first version row
+  const entityType = versions[0].entityType;
 
   return {
     entityId,
@@ -145,13 +142,3 @@ export async function getVersion(
   };
 }
 
-/**
- * Infer entity type from ID prefix.
- * Note: With unified model, IDs no longer have prefixes.
- * This function is kept for edge IDs only.
- */
-function inferEntityType(_id: string): HistoryEntityType | null {
-  // With unified model, we can't infer type from ID
-  // Caller should provide entityType explicitly
-  return null;
-}

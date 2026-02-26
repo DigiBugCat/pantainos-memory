@@ -94,7 +94,17 @@ async def system_diagnostics(
     if include_samples:
         params["include_samples"] = "true"
     data = await client.get("/admin/system-diagnostics", params)
-    return fmt.fmt_admin(data)
+    return fmt.fmt_diagnostics(data)
+
+
+@mcp.tool(annotations=_ro)
+async def memory_trace(
+    memory_id: Annotated[str, Field(description="Memory ID to trace")],
+    limit: Annotated[int, Field(50, description="Max access events to include", ge=1, le=200)] = 50,
+) -> str:
+    """Trace a memory's full lifecycle: versions, edges, events, and accesses in chronological order."""
+    data = await client.get(f"/admin/trace/{memory_id}", {"limit": str(limit)})
+    return fmt.fmt_trace(data)
 
 
 @mcp.tool(annotations=_ro)

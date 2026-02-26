@@ -573,6 +573,143 @@ app.post('/re-evaluate-violations', async (c) => {
 });
 
 // ============================================
+// GET /trace/:memoryId
+// ============================================
+app.get('/trace/:memoryId', async (c) => {
+  const memoryId = c.req.param('memoryId');
+  const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 200);
+
+  // Fetch current memory state
+  const memory = await c.env.DB.prepare(
+    `SELECT id, content, source, source_url, derived_from, resolves_by,
+            state, outcome, confidence, times_tested, confirmations, contradictions,
+            surprise, agent_id, created_at, updated_at, retracted, retracted_at, retraction_reason
+     FROM memories WHERE id = ?`
+  ).bind(memoryId).first<Record<string, unknown>>();
+
+  if (!memory) return errorResponse(c, `Memory not found: ${memoryId}`, 404);
+
+  // Fetch all data sources in parallel
+  const [versionsResult, edgesResult, eventsResult, accessResult] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT id, entity_type, version_number, change_type, change_reason, changed_fields, created_at
+       FROM entity_versions WHERE entity_id = ? ORDER BY created_at ASC`
+    ).bind(memoryId).all<{
+      id: string; entity_type: string; version_number: number;
+      change_type: string; change_reason: string | null; changed_fields: string | null; created_at: number;
+    }>(),
+    c.env.DB.prepare(
+      `SELECT id, source_id, target_id, edge_type, strength, created_at
+       FROM edges WHERE source_id = ? OR target_id = ?`
+    ).bind(memoryId, memoryId).all<{
+      id: string; source_id: string; target_id: string; edge_type: string; strength: number | null; created_at: number;
+    }>(),
+    c.env.DB.prepare(
+      `SELECT id, event_type, session_id, violated_by, damage_level, context, dispatched, created_at
+       FROM memory_events WHERE memory_id = ? ORDER BY created_at ASC`
+    ).bind(memoryId).all<{
+      id: string; event_type: string; session_id: string; violated_by: string | null;
+      damage_level: string | null; context: string; dispatched: number; created_at: number;
+    }>(),
+    c.env.DB.prepare(
+      `SELECT id, access_type, query_text, session_id, accessed_at
+       FROM access_events WHERE entity_id = ? ORDER BY accessed_at DESC LIMIT ?`
+    ).bind(memoryId, limit).all<{
+      id: string; access_type: string; query_text: string | null; session_id: string | null; accessed_at: number;
+    }>(),
+  ]);
+
+  const versions = versionsResult.results || [];
+  const edges = edgesResult.results || [];
+  const events = eventsResult.results || [];
+  const accesses = accessResult.results || [];
+
+  // Build unified timeline
+  type TimelineEntry = {
+    type: string;
+    timestamp: number;
+    [key: string]: unknown;
+  };
+
+  const timeline: TimelineEntry[] = [];
+
+  for (const v of versions) {
+    timeline.push({
+      type: 'version',
+      timestamp: v.created_at,
+      change_type: v.change_type,
+      change_reason: v.change_reason,
+      changed_fields: v.changed_fields ? JSON.parse(v.changed_fields) : null,
+      version_number: v.version_number,
+    });
+  }
+
+  for (const e of edges) {
+    const direction = e.source_id === memoryId ? 'outgoing' : 'incoming';
+    const otherId = e.source_id === memoryId ? e.target_id : e.source_id;
+    timeline.push({
+      type: 'edge',
+      timestamp: e.created_at,
+      edge_type: e.edge_type,
+      other_id: otherId,
+      direction,
+      strength: e.strength,
+    });
+  }
+
+  for (const ev of events) {
+    let contextSummary: string | null = null;
+    try {
+      const ctx = JSON.parse(ev.context || '{}');
+      contextSummary = ctx.condition || ctx.reason || null;
+    } catch { /* ignore */ }
+    timeline.push({
+      type: 'event',
+      timestamp: ev.created_at,
+      event_type: ev.event_type,
+      dispatched: ev.dispatched === 1,
+      violated_by: ev.violated_by,
+      context_summary: contextSummary,
+    });
+  }
+
+  for (const a of accesses) {
+    timeline.push({
+      type: 'access',
+      timestamp: a.accessed_at,
+      access_type: a.access_type,
+      query_text: a.query_text,
+    });
+  }
+
+  // Sort chronologically
+  timeline.sort((a, b) => a.timestamp - b.timestamp);
+
+  return c.json({
+    success: true,
+    memory: {
+      id: memory.id,
+      content: memory.content,
+      source: memory.source,
+      state: memory.state,
+      outcome: memory.outcome,
+      confidence: memory.confidence,
+      agent_id: memory.agent_id,
+      created_at: memory.created_at,
+      updated_at: memory.updated_at,
+      retracted: memory.retracted,
+    },
+    timeline,
+    summary: {
+      versions: versions.length,
+      edges: edges.length,
+      events: events.length,
+      accesses: accesses.length,
+    },
+  });
+});
+
+// ============================================
 // POST /backfill-surprise
 // ============================================
 app.post('/backfill-surprise', async (c) => {

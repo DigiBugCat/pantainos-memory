@@ -283,6 +283,158 @@ def fmt_session_recap(data: dict[str, Any]) -> str:
     return json.dumps(data, indent=2, default=str)
 
 
+def fmt_trace(data: dict[str, Any]) -> str:
+    """Format memory trace timeline."""
+    memory = data.get("memory", {})
+    timeline = data.get("timeline", [])
+    summary = data.get("summary", {})
+
+    if not memory:
+        return data.get("error", "Memory not found")
+
+    mid = memory.get("id", "?")
+    content = memory.get("content", "")[:80]
+    state = memory.get("state", "?")
+    source = memory.get("source", "unknown")
+    created = _ts(memory.get("created_at"))
+
+    lines = [
+        f"[{mid}] {content}",
+        f"State: {state} | Source: {source} | Created: {created}",
+        "",
+    ]
+
+    if timeline:
+        lines.append(f"Timeline ({len(timeline)} events):")
+        for entry in timeline:
+            ts = _ts(entry.get("timestamp"))
+            etype = entry.get("type", "?")
+
+            if etype == "version":
+                change = entry.get("change_type", "?")
+                reason = entry.get("change_reason")
+                fields = entry.get("changed_fields")
+                detail = change
+                if fields:
+                    detail += f" — changed: {fields}"
+                if reason:
+                    detail += f" ({reason})"
+                lines.append(f"  {ts}  VERSION   {detail}")
+
+            elif etype == "edge":
+                edge_type = entry.get("edge_type", "?")
+                other = entry.get("other_id", "?")
+                direction = "→" if entry.get("direction") == "outgoing" else "←"
+                lines.append(f"  {ts}  EDGE      {edge_type} {direction} [{other}]")
+
+            elif etype == "event":
+                event_type = entry.get("event_type", "?")
+                dispatched = "✓" if entry.get("dispatched") else "pending"
+                ctx = entry.get("context_summary") or ""
+                ctx_str = f" — {ctx}" if ctx else ""
+                lines.append(f"  {ts}  EVENT     {event_type} — dispatched {dispatched}{ctx_str}")
+
+            elif etype == "access":
+                access_type = entry.get("access_type", "?")
+                query = entry.get("query_text") or ""
+                query_str = f' (query: "{query[:40]}")' if query else ""
+                lines.append(f"  {ts}  ACCESS    {access_type}{query_str}")
+    else:
+        lines.append("No timeline events found.")
+
+    lines.append("")
+    lines.append(
+        f"Summary: {summary.get('versions', 0)} versions, "
+        f"{summary.get('edges', 0)} edges, "
+        f"{summary.get('events', 0)} events, "
+        f"{summary.get('accesses', 0)} accesses"
+    )
+
+    return "\n".join(lines)
+
+
+def _ts(value: int | float | None) -> str:
+    """Format a millisecond timestamp as MM-DD HH:MM."""
+    if value is None:
+        return "??-?? ??:??"
+    ms = value * 1000 if value < 1e12 else value
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%m-%d %H:%M")
+
+
+def fmt_diagnostics(data: dict[str, Any]) -> str:
+    """Format system diagnostics as scannable text."""
+    if not data.get("success"):
+        return data.get("error", "Diagnostics failed")
+
+    mem = data.get("memories", {})
+    graph = data.get("graph", {})
+    queue = data.get("queue", {})
+    exposure = mem.get("exposure_check", {})
+
+    total_active = mem.get("total_active", 0)
+    retracted = mem.get("retracted", 0)
+    observations = mem.get("observations", 0)
+    thoughts = mem.get("thoughts", 0)
+    predictions = mem.get("predictions", 0)
+    states = mem.get("state_distribution", {})
+
+    total_edges = graph.get("total_edges", 0)
+    edge_types = graph.get("edge_types", {})
+    orphans = graph.get("orphan_thoughts", 0)
+    brittle = graph.get("brittle", 0)
+
+    pending = queue.get("pending", 0)
+    dispatched = queue.get("dispatched", 0)
+    sessions = queue.get("active_sessions", 0)
+
+    exp_completed = exposure.get("completed", 0)
+    exp_pending = exposure.get("pending", 0)
+    exp_processing = exposure.get("processing", 0)
+
+    # Build state line
+    state_parts = []
+    for s in ["active", "violated", "confirmed", "resolved", "draft"]:
+        if states.get(s, 0) > 0:
+            state_parts.append(f"{states[s]:,} {s}")
+
+    # Build edge type line
+    edge_parts = []
+    for et, count in edge_types.items():
+        edge_parts.append(f"{count:,} {et}")
+
+    lines = [
+        "=== SYSTEM HEALTH ===",
+        "",
+        f"Memories: {total_active:,} active ({retracted:,} retracted)",
+        f"  Observations: {observations:,} | Thoughts: {thoughts:,} | Predictions: {predictions:,}",
+    ]
+    if state_parts:
+        lines.append(f"  States: {', '.join(state_parts)}")
+
+    lines.append("")
+    lines.append(f"Graph: {total_edges:,} edges" + (f" ({', '.join(edge_parts)})" if edge_parts else ""))
+    if orphans or brittle:
+        lines.append(f"  {orphans:,} orphan thoughts | {brittle:,} brittle (<3 tests)")
+
+    lines.append("")
+    lines.append(f"Queue: {pending:,} pending, {dispatched:,} dispatched, {sessions:,} active sessions")
+
+    if any([exp_completed, exp_pending, exp_processing]):
+        lines.append("")
+        lines.append(f"Exposure: {exp_completed:,} completed, {exp_pending:,} pending, {exp_processing:,} processing")
+
+    # Include samples if present
+    samples = data.get("samples")
+    if samples:
+        lines.append("")
+        lines.append("Samples:")
+        for state, mems in samples.items():
+            for m in mems:
+                lines.append(f"  [{m.get('id', '?')}] {state}: {m.get('content', '')}")
+
+    return "\n".join(lines)
+
+
 def fmt_admin(data: dict[str, Any]) -> str:
     """Admin tool formatter — concise, actionable output."""
     success = data.get("success", False)
