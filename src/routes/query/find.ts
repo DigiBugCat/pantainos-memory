@@ -75,7 +75,7 @@ app.post('/', async (c) => {
     minSimilarity,
     includeRetracted,
     requestId,
-    candidateMultiplier: 2,
+    candidateMultiplier: config.search.candidateMultiplier,
     maxTimesTested,
     agentIds: memoryScope,
     filter: (row) => {

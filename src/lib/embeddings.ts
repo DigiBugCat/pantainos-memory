@@ -273,7 +273,7 @@ export async function searchSimilar(
   let results;
   try {
     results = await withRetry(
-      () => env.MEMORY_VECTORS.query(embedding, { topK, returnMetadata: 'all' }),
+      () => env.MEMORY_VECTORS.query(embedding, { topK: Math.min(topK, 100), returnMetadata: 'none' }),
       { retries: 2, delay: 100, name: 'searchSimilar', requestId }
     );
   } catch (error) {

@@ -184,7 +184,7 @@ export function getConfig(env: Record<string, string | undefined>): Config {
     // Search
     search: {
       defaultLimit: parseInt_(env.SEARCH_DEFAULT_LIMIT, 10, 1, 100, 'SEARCH_DEFAULT_LIMIT'),
-      minSimilarity: parseNumber(env.SEARCH_MIN_SIMILARITY, 0, 0, 1.0, 'SEARCH_MIN_SIMILARITY'),
+      minSimilarity: parseNumber(env.SEARCH_MIN_SIMILARITY, 0.45, 0, 1.0, 'SEARCH_MIN_SIMILARITY'),
       candidateMultiplier: parseInt_(env.SEARCH_CANDIDATE_MULTIPLIER, 5, 1, 20, 'SEARCH_CANDIDATE_MULTIPLIER'),
     },
 
