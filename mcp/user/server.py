@@ -116,7 +116,7 @@ async def update(
         outcome_condition=outcome_condition, tags=tags, obsidian_sources=obsidian_sources,
     )
     data = await client.post("/update", body)
-    return await _with_notifications(fmt.fmt_recall(data))
+    return await _with_notifications(fmt.fmt_update(data))
 
 
 @mcp.tool(annotations=_rw_idempotent)

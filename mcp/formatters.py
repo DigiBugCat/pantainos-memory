@@ -48,6 +48,10 @@ def fmt_find(data: dict[str, Any]) -> str:
     if not results:
         return f'No results for "{query}"'
 
+    # Check if best results are weak (low relevance)
+    best_sim = max((r.get("similarity", 0) for r in results), default=0)
+    LOW_RELEVANCE_THRESHOLD = 0.55
+
     lines: list[str] = []
     for i, r in enumerate(results, 1):
         m = r.get("memory", {})
@@ -62,7 +66,10 @@ def fmt_find(data: dict[str, Any]) -> str:
             f"   sim:{sim}% conf:{conf}%{surp_str}"
         )
 
-    return f'Found {len(results)} for "{query}":\n\n' + "\n\n".join(lines)
+    header = f'Found {len(results)} for "{query}":\n'
+    if best_sim < LOW_RELEVANCE_THRESHOLD:
+        header += f"(Low relevance — best match only {_pct(best_sim)}% similar. No strong matches found.)\n"
+    return header + "\n" + "\n\n".join(lines)
 
 
 def fmt_recall(data: dict[str, Any]) -> str:
@@ -99,10 +106,22 @@ def fmt_recall(data: dict[str, Any]) -> str:
 
     connections = data.get("connections", [])
     if connections:
-        ids = ", ".join(f"[{c.get('target_id', '?')}]" for c in connections)
+        ids = ", ".join(f"[{c.get('id', '?')}]" for c in connections)
         text += f"Connections: {ids}\n"
 
     return text.rstrip()
+
+
+def fmt_update(data: dict[str, Any]) -> str:
+    mid = data.get("memory_id", "?")
+    changes = data.get("changes", [])
+    warnings = data.get("warnings", [])
+    text = f"[{mid}] updated"
+    if changes:
+        text += f": {', '.join(changes)}"
+    if warnings:
+        text += f"\nWarnings: {'; '.join(warnings)}"
+    return text
 
 
 def fmt_resolve(data: dict[str, Any]) -> str:
@@ -224,20 +243,34 @@ def fmt_roots(data: dict[str, Any]) -> str:
 
 
 def fmt_zones(data: dict[str, Any]) -> str:
-    memories = data.get("memories", [])
-    edges = data.get("edges", [])
-    stats = data.get("stats", {})
+    members = data.get("zone_members", data.get("memories", []))
+    edges = data.get("internal_edges", data.get("edges", []))
+    boundary = data.get("boundary", [])
+    safe = data.get("safe")
+    quality = data.get("quality")
 
-    if not memories:
+    if not members:
         return "Empty zone"
 
-    total = stats.get("total_memories", len(memories))
-    total_edges = stats.get("total_edges", len(edges))
+    header = f"Zone: {len(members)} members, {len(edges)} edges"
+    if quality is not None:
+        header += f", quality:{quality}%"
+    if safe is not None:
+        header += " (safe)" if safe else " (UNSAFE)"
 
-    lines = [f"Zone: {total} members, {total_edges} edges"]
-    for m in memories:
+    lines = [header]
+    for m in members:
         content = m.get("content", "")[:60]
-        lines.append(f"[{m.get('id', '?')}] {content}")
+        semantic = " [semantic]" if m.get("semantic") else ""
+        lines.append(f"[{m.get('id', '?')}] {content}{semantic}")
+
+    if boundary:
+        lines.append("")
+        lines.append(f"Boundary ({len(boundary)}):")
+        for b in boundary:
+            content = b.get("content", "")[:60]
+            reasons = ", ".join(b.get("reasons", []))
+            lines.append(f"  [{b.get('id', '?')}] {content} ({reasons})")
 
     return "\n".join(lines)
 
