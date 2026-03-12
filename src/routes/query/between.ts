@@ -36,19 +36,9 @@ export interface BetweenResponse {
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
-app.get('/', async (c) => {
+async function handleBetween(c: any, inputIds: string[], limit: number) {
   const config = c.get('config');
   const requestId = c.get('requestId');
-
-  // Parse query params
-  const idsParam = c.req.query('ids');
-  const limit = parseInt(c.req.query('limit') || '5', 10);
-
-  if (!idsParam) {
-    return c.json({ success: false, error: 'ids query parameter is required' }, 400);
-  }
-
-  const inputIds = idsParam.split(',').map(id => id.trim()).filter(Boolean);
 
   if (inputIds.length < 2) {
     return c.json({ success: false, error: 'At least 2 memory IDs are required' }, 400);
@@ -113,6 +103,25 @@ app.get('/', async (c) => {
   };
 
   return c.json(response);
+}
+
+app.get('/', async (c) => {
+  const idsParam = c.req.query('ids');
+  const limit = parseInt(c.req.query('limit') || '5', 10);
+
+  if (!idsParam) {
+    return c.json({ success: false, error: 'ids query parameter is required' }, 400);
+  }
+
+  const inputIds = idsParam.split(',').map(id => id.trim()).filter(Boolean);
+  return handleBetween(c, inputIds, limit);
+});
+
+app.post('/', async (c) => {
+  const body = await c.req.json<{ memory_ids: string[]; limit?: number }>();
+  const inputIds = body.memory_ids || [];
+  const limit = body.limit ?? 5;
+  return handleBetween(c, inputIds, limit);
 });
 
 /**
